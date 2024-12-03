@@ -29,7 +29,7 @@ impl Default for Options {
             num_playlists: 5,
             max_parts_per_segment: 128,
             max_parted_segments: 32,
-            segment_min_ms: 10_000,
+            segment_min_ms: 1500,
             buffer_size_kb: 800,
             init_size_kb: 5,
         }
@@ -41,6 +41,7 @@ pub struct Playlists {
     m3u8_cache: Arc<M3u8Cache>,
     playlists: Mutex<BTreeMap<u64, M3u8Manifest>>,
     active: AtomicUsize,
+    options: Options,
 }
 
 impl Playlists {
@@ -54,6 +55,7 @@ impl Playlists {
                 m3u8_cache: Arc::clone(&m3u8_cache),
                 playlists: Mutex::new(BTreeMap::new()),
                 active: AtomicUsize::new(0),
+                options,
             }),
             Arc::clone(&fmp4_cache),
             Arc::clone(&m3u8_cache),
@@ -88,7 +90,7 @@ impl Playlists {
         let (m3u8, seg, seq, idx, new_seg) = {
             let playlist: &mut M3u8Manifest = playlists
                 .entry(stream_id)
-                .or_insert_with(|| M3u8Manifest::new(Options::default()));
+                .or_insert_with(|| M3u8Manifest::new(self.options));
             playlist.add_part(fmp4.duration, fmp4.key)
         };
 
