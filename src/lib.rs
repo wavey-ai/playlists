@@ -29,7 +29,7 @@ impl Default for Options {
             num_playlists: 5,
             max_parts_per_segment: 128,
             max_parted_segments: 32,
-            segment_min_ms: 1500,
+            segment_min_ms: 10_000,
             buffer_size_kb: 800,
             init_size_kb: 5,
         }

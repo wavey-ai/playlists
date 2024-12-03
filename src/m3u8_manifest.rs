@@ -51,7 +51,6 @@ impl M3u8Manifest {
 
     pub fn add_part(&mut self, duration: u32, key: bool) -> (Bytes, usize, usize, usize, bool) {
         let mut new_seg = false;
-        dbg!(self.options.segment_min_ms);
         if key && (self.seg_dur) >= self.options.segment_min_ms {
             self.seg_durs.push(self.seg_dur);
             self.seg_id += 1;
@@ -164,7 +163,7 @@ impl M3u8Manifest {
         let max_duration = durs.iter().max().cloned().unwrap_or(0);
         let part_target = max_duration as f64 / 1000.0;
 
-        let part_hold_back = part_target * 30 as f64;
+        let part_hold_back = part_target * 3 as f64;
         let can_skip_until = target_duration * 6;
 
         ph.push_str("#EXTM3U\n");
