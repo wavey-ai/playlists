@@ -106,6 +106,15 @@ impl Fmp4Cache {
         Ok(())
     }
 
+    pub fn last(&self, stream_id: u64) -> Option<usize> {
+        let idxs_lock = self.idxs.read().unwrap();
+        if let Some(last) = idxs_lock.get(&stream_id) {
+            return Some(*last);
+        } else {
+            return None;
+        }
+    }
+
     pub fn get(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
         let idxs_lock = self.idxs.read().unwrap();
         if let Some(last) = idxs_lock.get(&stream_id) {
