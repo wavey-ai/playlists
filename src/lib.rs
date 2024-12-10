@@ -37,7 +37,7 @@ impl Default for Options {
 }
 
 pub struct Playlists {
-    fmp4_cache: Arc<Fmp4Cache>,
+    pub fmp4_cache: Arc<Fmp4Cache>,
     m3u8_cache: Arc<M3u8Cache>,
     playlists: Mutex<BTreeMap<u64, M3u8Manifest>>,
     active: AtomicUsize,

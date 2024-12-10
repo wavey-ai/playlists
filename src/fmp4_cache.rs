@@ -90,6 +90,14 @@ impl Fmp4Cache {
         idxs_lock.remove(&stream_id);
     }
 
+    pub fn append(&self, stream_id: u64, data_bytes: Bytes) -> Result<(), &'static str> {
+        if let Some(idx) = self.last(stream_id) {
+            self.add(stream_id, idx + 1, data_bytes)
+        } else {
+            self.add(stream_id, 1, data_bytes)
+        }
+    }
+
     pub fn add(&self, stream_id: u64, id: usize, data_bytes: Bytes) -> Result<(), &'static str> {
         let offsets_lock = self.offsets.write().unwrap();
         if !offsets_lock.contains_key(&stream_id) {
