@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Options {
     pub max_segments: usize,
     pub num_playlists: usize,
