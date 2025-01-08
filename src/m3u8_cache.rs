@@ -1,5 +1,6 @@
 use crate::Options;
 
+use crate::CacheError;
 use bytes::{BufMut, Bytes, BytesMut};
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -9,22 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex, RwLock,
 };
-use thiserror::Error;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
-
-#[derive(Error, Debug)]
-pub enum M3u8CacheError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Index out of bounds")]
-    IndexOutOfBounds,
-    #[error("Stream not found")]
-    StreamNotFound,
-    #[error("Buffer overflow")]
-    BufferOverflow,
-    #[error("Arithmetic overflow")]
-    ArithmeticOverflow,
-}
 
 pub struct M3u8Cache {
     buffer: Vec<RwLock<Bytes>>,
@@ -91,13 +77,13 @@ impl M3u8Cache {
             .map(|n| self.last_part[n].load(Ordering::Acquire))
     }
 
-    fn add_stream_id(&self, stream_id: u64) -> Result<(), M3u8CacheError> {
+    fn add_stream_id(&self, stream_id: u64) -> Result<(), CacheError> {
         let _lock = self.stream_id_mutex.lock().unwrap();
         let idx = self.offset.load(Ordering::Acquire);
         let next_offset = idx
             .checked_add(1)
             .and_then(|n| Some(n % self.options.num_playlists))
-            .ok_or(M3u8CacheError::ArithmeticOverflow)?;
+            .ok_or(CacheError::ArithmeticOverflow)?;
 
         {
             let mut lock = self.offsets.write().unwrap();
@@ -111,7 +97,7 @@ impl M3u8Cache {
             .options
             .max_segments
             .checked_mul(idx)
-            .ok_or(M3u8CacheError::ArithmeticOverflow)?;
+            .ok_or(CacheError::ArithmeticOverflow)?;
         for n in seg_idx..(seg_idx + self.options.max_segments) {
             self.seg_parts[n].store(0, Ordering::Release);
         }
@@ -125,41 +111,41 @@ impl M3u8Cache {
         lock.remove(&stream_id);
     }
 
-    fn set_last_seg(&self, stream_id: u64, id: usize) -> Result<(), M3u8CacheError> {
+    fn set_last_seg(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
         if let Some(n) = self.offset(stream_id) {
             self.last_seg[n].store(id, Ordering::Release);
             Ok(())
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
-    fn set_last_part(&self, stream_id: u64, id: usize) -> Result<(), M3u8CacheError> {
+    fn set_last_part(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
         if let Some(n) = self.offset(stream_id) {
             self.last_part[n].store(id, Ordering::Release);
             Ok(())
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
-    pub fn set_init(&self, stream_id: u64, data_bytes: Bytes) -> Result<(), M3u8CacheError> {
+    pub fn set_init(&self, stream_id: u64, data_bytes: Bytes) -> Result<(), CacheError> {
         if let Some(n) = self.offset(stream_id) {
             let mut inits_lock = self.inits[n].write().unwrap();
             *inits_lock = data_bytes;
             Ok(())
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
-    pub fn get_init(&self, stream_id: u64) -> Result<Bytes, M3u8CacheError> {
+    pub fn get_init(&self, stream_id: u64) -> Result<Bytes, CacheError> {
         if let Some(n) = self.offset(stream_id) {
             let lock = &self.inits[n];
             let data = lock.read().unwrap();
             Ok(data.clone())
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
@@ -170,7 +156,7 @@ impl M3u8Cache {
         seq: usize,
         idx: usize,
         data: Bytes,
-    ) -> Result<u64, M3u8CacheError> {
+    ) -> Result<u64, CacheError> {
         if self.offset(stream_id).is_none() {
             self.add_stream_id(stream_id)?;
         }
@@ -205,12 +191,12 @@ impl M3u8Cache {
         stream_id: u64,
         segment_id: usize,
         part_id: usize,
-    ) -> Result<(), M3u8CacheError> {
+    ) -> Result<(), CacheError> {
         if let Ok(idx) = self.calculate_seg_index(
             stream_id,
             segment_id
                 .checked_sub(1)
-                .ok_or(M3u8CacheError::ArithmeticOverflow)?,
+                .ok_or(CacheError::ArithmeticOverflow)?,
         ) {
             self.seg_parts[idx].store(part_id, Ordering::Release);
         }
@@ -230,7 +216,7 @@ impl M3u8Cache {
         }
     }
 
-    fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, M3u8CacheError> {
+    fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data)?;
         Ok(encoder.finish()?)
@@ -248,20 +234,16 @@ impl M3u8Cache {
         false
     }
 
-    fn calculate_seg_index(
-        &self,
-        stream_id: u64,
-        segment_id: usize,
-    ) -> Result<usize, M3u8CacheError> {
+    fn calculate_seg_index(&self, stream_id: u64, segment_id: usize) -> Result<usize, CacheError> {
         if let Some(offset) = self.offset(stream_id) {
             let segments_per_stream = self.options.max_segments;
             let wrapped_segment_idx = segment_id % segments_per_stream;
             offset
                 .checked_mul(segments_per_stream)
                 .and_then(|result| result.checked_add(wrapped_segment_idx))
-                .ok_or(M3u8CacheError::ArithmeticOverflow)
+                .ok_or(CacheError::ArithmeticOverflow)
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
@@ -270,7 +252,7 @@ impl M3u8Cache {
         stream_id: u64,
         segment_id: usize,
         seq: usize,
-    ) -> Result<Option<usize>, M3u8CacheError> {
+    ) -> Result<Option<usize>, CacheError> {
         if segment_id == 0 {
             return Ok(None);
         }
@@ -280,7 +262,7 @@ impl M3u8Cache {
             let segments_per_stream = self.options.max_segments;
 
             if seq >= parts_per_segment {
-                return Err(M3u8CacheError::IndexOutOfBounds);
+                return Err(CacheError::IndexOutOfBounds);
             }
 
             // Calculate the wrapped segment index
@@ -290,19 +272,19 @@ impl M3u8Cache {
             let stream_index = wrapped_segment_idx
                 .checked_mul(parts_per_segment)
                 .and_then(|result| result.checked_add(seq))
-                .ok_or(M3u8CacheError::ArithmeticOverflow)?;
+                .ok_or(CacheError::ArithmeticOverflow)?;
 
             // Calculate the global index
             let global_index = offset
                 .checked_mul(segments_per_stream * parts_per_segment)
                 .and_then(|result| result.checked_add(stream_index))
-                .ok_or(M3u8CacheError::ArithmeticOverflow)?;
+                .ok_or(CacheError::ArithmeticOverflow)?;
 
             // Ensure the global index wraps within the total buffer size
             let total_buffer_size = self.buffer.len();
             Ok(Some(global_index % total_buffer_size))
         } else {
-            Err(M3u8CacheError::StreamNotFound)
+            Err(CacheError::StreamNotFound)
         }
     }
 
@@ -310,14 +292,14 @@ impl M3u8Cache {
         &self,
         stream_id: u64,
         segment_id: usize,
-    ) -> Result<Option<(usize, usize)>, M3u8CacheError> {
+    ) -> Result<Option<(usize, usize)>, CacheError> {
         if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
             let b = self.seg_parts[idx].load(Ordering::Acquire);
             if let Ok(prev_idx) = self.calculate_seg_index(
                 stream_id,
                 segment_id
                     .checked_sub(1)
-                    .ok_or(M3u8CacheError::ArithmeticOverflow)?,
+                    .ok_or(CacheError::ArithmeticOverflow)?,
             ) {
                 let a = self.seg_parts[prev_idx].load(Ordering::Acquire);
                 if a < b {
@@ -329,15 +311,15 @@ impl M3u8Cache {
         Ok(None)
     }
 
-    fn get_bytes(&self, data: &Bytes) -> Result<(Bytes, usize, u64), M3u8CacheError> {
+    fn get_bytes(&self, data: &Bytes) -> Result<(Bytes, usize, u64), CacheError> {
         if data.len() < 16 {
-            return Err(M3u8CacheError::BufferOverflow);
+            return Err(CacheError::BufferOverflow);
         }
         let seg_id = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
         let data_size = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
         let h = u64::from_be_bytes(data[8..16].try_into().unwrap());
         if data.len() < 12 + data_size {
-            return Err(M3u8CacheError::BufferOverflow);
+            return Err(CacheError::BufferOverflow);
         }
         let payload = data.slice(16..16 + data_size);
         Ok((payload, seg_id, h))
@@ -348,7 +330,7 @@ impl M3u8Cache {
         stream_id: u64,
         segment_id: usize,
         part_idx: usize,
-    ) -> Result<Option<(Bytes, u64)>, M3u8CacheError> {
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
         if self.is_included(stream_id, segment_id, part_idx) {
             if let Some(idx) = self.calculate_index(stream_id, segment_id, part_idx)? {
                 let lock = self.buffer[idx].read().unwrap();
@@ -367,7 +349,7 @@ impl M3u8Cache {
             Ok(None)
         }
     }
-    pub fn last(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, M3u8CacheError> {
+    pub fn last(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
         if let (Some(last_seg), Some(last_part)) =
             (self.last_seg(stream_id), self.last_part(stream_id))
         {

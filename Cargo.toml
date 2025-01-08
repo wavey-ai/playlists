@@ -13,3 +13,4 @@ access-unit = { git = "ssh://git@github.com/wavey-ai/access-unit.git" }
 tracing = "0.1.40"
 thiserror = "1.0.64"
 tokio = { version = "1.42.0", features = ["full"] }
+dashmap = "6.1.0"

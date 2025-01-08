@@ -9,7 +9,22 @@ use m3u8_manifest::M3u8Manifest;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 use tracing::info;
+
+#[derive(Error, Debug)]
+pub enum CacheError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Index out of bounds")]
+    IndexOutOfBounds,
+    #[error("Stream not found")]
+    StreamNotFound,
+    #[error("Buffer overflow")]
+    BufferOverflow,
+    #[error("Arithmetic overflow")]
+    ArithmeticOverflow,
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Options {
@@ -101,7 +116,7 @@ impl Playlists {
         if let Some(init) = fmp4.init {
             self.m3u8_cache.set_init(stream_id, init);
         }
-        self.fmp4_cache.add(stream_id, seq as usize, fmp4.data);
+        //self.fmp4_cache.add(stream_id, seq as usize, fmp4.data);
         self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8);
 
         true
