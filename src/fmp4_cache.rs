@@ -118,8 +118,18 @@ impl Fmp4Cache {
         Ok(())
     }
 
-    pub fn last(&self, stream_id: usize) -> Option<usize> {
-        let val = self.idxs[stream_id].load(Ordering::Acquire);
+    pub async fn get_last(&self, stream_idx: usize) -> Option<(usize, Bytes, u64)> {
+        if let Some(id) = self.last(stream_idx) {
+            if let Some((bytes, h)) = self.get(stream_idx, id).await {
+                return Some((id, bytes, h));
+            }
+        }
+
+        None
+    }
+
+    pub fn last(&self, stream_idx: usize) -> Option<usize> {
+        let val = self.idxs[stream_idx].load(Ordering::Acquire);
 
         Some(val)
     }
