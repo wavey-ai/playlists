@@ -1,9 +1,9 @@
-pub mod fmp4_cache;
+pub mod chunk_cache;
 pub mod m3u8_cache;
 pub mod m3u8_manifest;
 
 use access_unit::Fmp4;
-use fmp4_cache::Fmp4Cache;
+use chunk_cache::ChunkCache;
 use m3u8_cache::M3u8Cache;
 use m3u8_manifest::M3u8Manifest;
 use std::collections::BTreeMap;
@@ -52,7 +52,7 @@ impl Default for Options {
 }
 
 pub struct Playlists {
-    pub fmp4_cache: Arc<Fmp4Cache>,
+    pub chunk_cache: Arc<ChunkCache>,
     m3u8_cache: Arc<M3u8Cache>,
     playlists: Mutex<BTreeMap<u64, M3u8Manifest>>,
     active: AtomicUsize,
@@ -60,19 +60,19 @@ pub struct Playlists {
 }
 
 impl Playlists {
-    pub fn new(options: Options) -> (Arc<Self>, Arc<Fmp4Cache>, Arc<M3u8Cache>) {
-        let fmp4_cache = Arc::new(Fmp4Cache::new(options));
+    pub fn new(options: Options) -> (Arc<Self>, Arc<ChunkCache>, Arc<M3u8Cache>) {
+        let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
 
         (
             Arc::new(Self {
-                fmp4_cache: Arc::clone(&fmp4_cache),
+                chunk_cache: Arc::clone(&chunk_cache),
                 m3u8_cache: Arc::clone(&m3u8_cache),
                 playlists: Mutex::new(BTreeMap::new()),
                 active: AtomicUsize::new(0),
                 options,
             }),
-            Arc::clone(&fmp4_cache),
+            Arc::clone(&chunk_cache),
             Arc::clone(&m3u8_cache),
         )
     }
@@ -82,19 +82,32 @@ impl Playlists {
     }
 
     pub fn fin(&self, id: u64) {
-        let mut playlists = self.playlists.lock().unwrap();
-        if playlists.remove(&id).is_some() {
+        let removed = {
+            let mut playlists = self.playlists.lock().unwrap();
+            playlists.remove(&id).is_some()
+        };
+        if removed {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
         self.m3u8_cache.zero_stream_id(id);
-        self.fmp4_cache.zero_stream_id(id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let chunk_cache = Arc::clone(&self.chunk_cache);
+            let _ = handle.spawn(async move {
+                chunk_cache.zero_stream_id(id).await;
+            });
+        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(self.chunk_cache.zero_stream_id(id));
+        }
     }
 
     pub fn add(&self, stream_id: u64, fmp4: Fmp4) -> bool {
         let mut playlists = self.playlists.lock().unwrap();
 
         if !playlists.contains_key(&stream_id) {
-            if self.active.load(Ordering::SeqCst) >= self.fmp4_cache.options.num_playlists {
+            if self.active.load(Ordering::SeqCst) >= self.chunk_cache.options.num_playlists {
                 return false;
             }
 
@@ -114,11 +127,52 @@ impl Playlists {
         }
 
         if let Some(init) = fmp4.init {
-            self.m3u8_cache.set_init(stream_id, init);
+            let _ = self.m3u8_cache.set_init(stream_id, init);
         }
         //self.fmp4_cache.add(stream_id, seq as usize, fmp4.data);
-        self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8);
+        let _ = self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8);
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn test_fin_clears_chunk_cache_entry() {
+        let options = Options::default();
+        let (playlists, chunk_cache, _m3u8_cache) = Playlists::new(options);
+        let stream_id = 101;
+
+        let fmp4 = Fmp4 {
+            init: None,
+            key: true,
+            data: Bytes::from_static(b"test"),
+            duration: 500,
+        };
+        assert!(playlists.add(stream_id, fmp4));
+        assert_eq!(playlists.active(), 1);
+
+        let _ = chunk_cache.add_stream_id(stream_id).await;
+        assert!(chunk_cache.get_stream_idx(stream_id).await.is_some());
+
+        playlists.fin(stream_id);
+        assert_eq!(playlists.active(), 0);
+
+        let cleared = timeout(Duration::from_millis(200), async {
+            loop {
+                if chunk_cache.get_stream_idx(stream_id).await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(cleared.is_ok());
     }
 }

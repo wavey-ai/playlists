@@ -1,4 +1,4 @@
-# M3U8 Playlists & LL-HLS Cache
+# Playlists & Chunk Cache
 
 ## Overview
 
@@ -8,7 +8,7 @@ with minimal contention.
 
 Components
 
-* Fmp4Cache – fixed-size circular buffer of `bytes::Bytes` slots
+* ChunkCache – fixed-size circular buffer of `bytes::Bytes` slots
 * M3u8Cache – companion buffer that stores compressed playlist data and
   initialisation fragments
 * M3u8Manifest – manifest builder that rolls segments and parts following the
@@ -20,7 +20,7 @@ blocking I/O.
 
 ## Architecture
 
-Fmp4Cache layout
+ChunkCache layout
     num_playlists × max_segments × max_parts_per_segment slots
         slot = size(u32) | hash(u64) | payload
 
@@ -33,7 +33,7 @@ M3u8Cache layout
 
 ## Generic nature
 
-Fmp4Cache stores raw `bytes::Bytes`.  The cache never parses or validates the
+ChunkCache stores raw `bytes::Bytes`.  The cache never parses or validates the
 content, so it can be reused for protobuf blobs, encrypted chunks, telemetry
 frames, or any other byte slice.
 

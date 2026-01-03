@@ -1,21 +1,23 @@
-use crate::CacheError;
 use crate::Options;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::stream;
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
-pub struct Fmp4Cache {
+pub struct ChunkCache {
     buffer: Vec<RwLock<Bytes>>,
     idxs: Vec<AtomicUsize>,
     offsets: RwLock<HashMap<u64, usize>>,
     idx: AtomicUsize,
+    new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
+    new_playlist_rx: Mutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
     pub options: Options,
 }
 
-impl Fmp4Cache {
+impl ChunkCache {
     pub fn new(options: Options) -> Self {
         let num_playlists: usize = options.num_playlists;
 
@@ -27,14 +29,21 @@ impl Fmp4Cache {
             .map(|_| RwLock::new(buffer_repeat_value.clone()))
             .collect();
         let idxs = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
+        let (new_playlist_tx, new_playlist_rx) = mpsc::unbounded_channel();
 
         Self {
             buffer,
             idxs,
             offsets: RwLock::new(HashMap::new()),
             idx: AtomicUsize::new(0),
+            new_playlist_tx,
+            new_playlist_rx: Mutex::new(Some(new_playlist_rx)),
             options,
         }
+    }
+
+    pub fn take_new_playlists_rx(&self) -> Option<mpsc::UnboundedReceiver<(u64, usize)>> {
+        self.new_playlist_rx.lock().unwrap().take()
     }
 
     pub async fn get_or_create_stream_idx(&self, stream_id: u64) -> usize {
@@ -46,9 +55,15 @@ impl Fmp4Cache {
     }
 
     pub async fn add_stream_id(&self, stream_id: u64) -> usize {
-        let idx = self.idx.fetch_add(1, Ordering::SeqCst) % self.options.num_playlists;
         let mut lock = self.offsets.write().await;
+        if let Some(idx) = lock.get(&stream_id).copied() {
+            return idx;
+        }
+
+        let idx = self.idx.fetch_add(1, Ordering::SeqCst) % self.options.num_playlists;
         lock.insert(stream_id, idx);
+        drop(lock);
+        let _ = self.new_playlist_tx.send((stream_id, idx));
         idx
     }
 
@@ -163,7 +178,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::task;
-    use tokio::time::{sleep, Duration, Instant};
+    use tokio::time::{timeout, Duration, Instant};
 
     #[tokio::test]
     async fn test_append_and_last() {
@@ -177,7 +192,7 @@ mod tests {
         );
 
         let options = Options::default();
-        let cache = Arc::new(Fmp4Cache::new(options));
+        let cache = Arc::new(ChunkCache::new(options));
         let read_count = Arc::new(AtomicU64::new(0));
         let write_count = Arc::new(AtomicU64::new(0));
 
@@ -240,5 +255,70 @@ mod tests {
             "Average reads per write: {:.2}",
             total_reads as f64 / (total_writes as f64).max(1.0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_new_playlist_notification_sent() {
+        let options = Options::default();
+        let cache = ChunkCache::new(options);
+        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+
+        let idx = cache.add_stream_id(42).await;
+        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
+
+        assert_eq!(stream_id, 42);
+        assert_eq!(notified_idx, idx);
+    }
+
+    #[tokio::test]
+    async fn test_no_notification_for_existing_stream_id() {
+        let options = Options::default();
+        let cache = ChunkCache::new(options);
+        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+
+        let _ = cache.add_stream_id(7).await;
+        let _ = rx.recv().await.expect("missing initial notification");
+
+        let _ = cache.add_stream_id(7).await;
+        let recv = timeout(Duration::from_millis(50), rx.recv()).await;
+
+        assert!(recv.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take_new_playlists_rx_single_use() {
+        let options = Options::default();
+        let cache = ChunkCache::new(options);
+        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+
+        assert!(cache.take_new_playlists_rx().is_none());
+
+        let idx = cache.add_stream_id(13).await;
+        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
+
+        assert_eq!(stream_id, 13);
+        assert_eq!(notified_idx, idx);
+    }
+
+    #[tokio::test]
+    async fn test_notification_after_zero_stream_id() {
+        let options = Options::default();
+        let cache = ChunkCache::new(options);
+        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+
+        let first_idx = cache.add_stream_id(9).await;
+        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
+
+        assert_eq!(stream_id, 9);
+        assert_eq!(notified_idx, first_idx);
+
+        cache.zero_stream_id(9).await;
+
+        let second_idx = cache.add_stream_id(9).await;
+        let (stream_id, notified_idx) =
+            rx.recv().await.expect("missing notification after reset");
+
+        assert_eq!(stream_id, 9);
+        assert_eq!(notified_idx, second_idx);
     }
 }

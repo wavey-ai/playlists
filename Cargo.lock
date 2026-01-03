@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "access-unit"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd0230fb1468c55c51dc2e04af9c8e206217f1f94a04422d0bf442478e492153"
+checksum = "0215e41d6f07cabff62f495445aca5a6d50d497989b7b2718563750b319103ef"
 dependencies = [
  "bytes",
 ]
