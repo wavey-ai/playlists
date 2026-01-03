@@ -258,6 +258,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_concurrent_read_write() {
+        const TEST_DURATION_SECS: u64 = 5;
+        const NUM_STREAMS: usize = 8;
+
+        println!("\n=== Concurrent ChunkCache Benchmark ===");
+        println!("Duration: {}s, Streams: {} (1 writer + 2 readers each)", TEST_DURATION_SECS, NUM_STREAMS);
+
+        let mut options = Options::default();
+        options.num_playlists = NUM_STREAMS;
+        options.buffer_size_kb = 64;
+        options.max_parts_per_segment = 10000;
+        let cache = Arc::new(ChunkCache::new(options));
+
+        let read_count = Arc::new(AtomicU64::new(0));
+        let write_count = Arc::new(AtomicU64::new(0));
+        let read_bytes = Arc::new(AtomicU64::new(0));
+        let write_bytes = Arc::new(AtomicU64::new(0));
+
+        // Pre-create streams
+        for i in 0..NUM_STREAMS {
+            cache.get_or_create_stream_idx(i as u64).await;
+            // Seed with initial data so readers have something
+            cache.append(i, Bytes::from(vec![0u8; 64 * 1024])).await.ok();
+        }
+
+        let mut handles = Vec::new();
+
+        // Each stream gets 1 writer
+        for stream_idx in 0..NUM_STREAMS {
+            let cache_clone = Arc::clone(&cache);
+            let write_count_clone = Arc::clone(&write_count);
+            let write_bytes_clone = Arc::clone(&write_bytes);
+
+            handles.push(task::spawn(async move {
+                let start = Instant::now();
+                let data = Bytes::from(vec![0xABu8; 64 * 1024]); // 64KB chunks
+
+                while start.elapsed().as_secs() < TEST_DURATION_SECS {
+                    if cache_clone.append(stream_idx, data.clone()).await.is_ok() {
+                        write_count_clone.fetch_add(1, Ordering::Relaxed);
+                        write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        // Each stream gets 2 readers
+        for stream_idx in 0..NUM_STREAMS {
+            for _ in 0..2 {
+                let cache_clone = Arc::clone(&cache);
+                let read_count_clone = Arc::clone(&read_count);
+                let read_bytes_clone = Arc::clone(&read_bytes);
+
+                handles.push(task::spawn(async move {
+                    let start = Instant::now();
+                    let mut slot = 1usize;
+
+                    while start.elapsed().as_secs() < TEST_DURATION_SECS {
+                        if let Some((bytes, _hash)) = cache_clone.get(stream_idx, slot).await {
+                            read_count_clone.fetch_add(1, Ordering::Relaxed);
+                            read_bytes_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            // Move to next slot, wrap around
+                            if let Some(last) = cache_clone.last(stream_idx) {
+                                slot = if slot >= last { 1 } else { slot + 1 };
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let total_reads = read_count.load(Ordering::Relaxed);
+        let total_writes = write_count.load(Ordering::Relaxed);
+        let total_read_bytes = read_bytes.load(Ordering::Relaxed);
+        let total_write_bytes = write_bytes.load(Ordering::Relaxed);
+
+        let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
+        let writes_per_sec = total_writes as f64 / TEST_DURATION_SECS as f64;
+        let read_throughput_mb = (total_read_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
+        let write_throughput_mb = (total_write_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
+
+        println!("\n=== Results ===");
+        println!("Writers: {} streams", NUM_STREAMS);
+        println!("Readers: {} total ({} per stream)", NUM_STREAMS * 2, 2);
+        println!("Write: {:.0}/s ({:.0} MB/s)", writes_per_sec, write_throughput_mb);
+        println!("Read:  {:.0}/s ({:.0} MB/s)", reads_per_sec, read_throughput_mb);
+        println!("Combined throughput: {:.0} MB/s", read_throughput_mb + write_throughput_mb);
+    }
+
+    #[tokio::test]
     async fn test_new_playlist_notification_sent() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
