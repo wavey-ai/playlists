@@ -352,6 +352,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_massive_concurrent_reads() {
+        const TEST_DURATION_SECS: u64 = 3;
+        const NUM_READERS: usize = 1000;
+        const STREAM_ID: u64 = 1;
+
+        println!("\n=== Massive Concurrent Reads Benchmark ===");
+        println!("Duration: {}s, Readers: {}, Writers: 1", TEST_DURATION_SECS, NUM_READERS);
+
+        let options = Options::default();
+        let cache = Arc::new(ChunkCache::new(options));
+        let read_count = Arc::new(AtomicU64::new(0));
+        let write_count = Arc::new(AtomicU64::new(0));
+
+        let stream_idx = cache.get_or_create_stream_idx(STREAM_ID).await;
+        // Seed with data
+        for i in 1..=100 {
+            cache.add(stream_idx, i, Bytes::from(vec![0xABu8; 1024])).await.ok();
+        }
+
+        let mut handles = Vec::new();
+
+        // Single writer
+        let cache_clone = Arc::clone(&cache);
+        let write_count_clone = Arc::clone(&write_count);
+        handles.push(task::spawn(async move {
+            let start = Instant::now();
+            let data = Bytes::from(vec![0xCDu8; 1024]);
+            while start.elapsed().as_secs() < TEST_DURATION_SECS {
+                cache_clone.append(stream_idx, data.clone()).await.ok();
+                write_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        // Many concurrent readers
+        for _ in 0..NUM_READERS {
+            let cache_clone = Arc::clone(&cache);
+            let read_count_clone = Arc::clone(&read_count);
+
+            handles.push(task::spawn(async move {
+                let start = Instant::now();
+                let mut slot = 1usize;
+                while start.elapsed().as_secs() < TEST_DURATION_SECS {
+                    if cache_clone.get(stream_idx, slot).await.is_some() {
+                        read_count_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    slot = (slot % 100) + 1;
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let total_reads = read_count.load(Ordering::Relaxed);
+        let total_writes = write_count.load(Ordering::Relaxed);
+        let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
+
+        println!("\n=== Results ===");
+        println!("Concurrent readers: {}", NUM_READERS);
+        println!("Total reads: {} ({:.1}M/s)", total_reads, reads_per_sec / 1_000_000.0);
+        println!("Total writes: {}", total_writes);
+        println!("Reads per reader: {:.0}", total_reads as f64 / NUM_READERS as f64);
+    }
+
+    #[tokio::test]
     async fn test_new_playlist_notification_sent() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
