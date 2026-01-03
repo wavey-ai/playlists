@@ -43,3 +43,31 @@ Operation                  Complexity   Details
 append / add               O(1)         one atomic + one write-lock
 get / last                 O(1)         one atomic + one read-lock
 playlist rollover          O(S)         zero-fill S = max_segments × max_parts_per_segment
+
+### Benchmarks (Apple Silicon)
+
+Single-stream sequential writes:
+```
+Slot size: 64 KB
+Throughput: ~1390 MB/s
+```
+
+Concurrent multi-stream (8 streams, 1 writer + 2 readers each):
+```
+Write:  1864 MB/s (29,827 ops/s)
+Read:   3966 MB/s (63,461 ops/s)
+Combined: 5830 MB/s
+```
+
+Massive concurrent reads (1000 readers, 1 writer):
+```
+Read:  22.1M ops/s
+Write: 22K ops/s (concurrent)
+```
+
+ChunkCache scales to millions of concurrent reads because:
+
+- Pre-allocated ring buffers (no malloc per write)
+- Per-slot RwLock (readers only contend on same slot, not globally)
+- Lock-free `last()` via atomic load
+- Zero-copy reads via `Bytes::slice()`
