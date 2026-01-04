@@ -1,5 +1,7 @@
 # Playlists & Chunk Cache
 
+[![CI](https://github.com/wavey-ai/playlists/actions/workflows/ci.yml/badge.svg)](https://github.com/wavey-ai/playlists/actions/workflows/ci.yml)
+
 ## Overview
 
 This crate offers a high-throughput, lock-efficient ring buffer for Low-Latency HLS
