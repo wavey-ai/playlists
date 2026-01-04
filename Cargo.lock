@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "access-unit"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0215e41d6f07cabff62f495445aca5a6d50d497989b7b2718563750b319103ef"
+checksum = "089654a0182818690a0efe33f1c8fde8d0cee83a1dd043b6d358525857d1b169"
 dependencies = [
  "bytes",
 ]
@@ -492,7 +492,7 @@ checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
 name = "playlists"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "access-unit",
  "bytes",
