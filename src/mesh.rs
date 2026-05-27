@@ -394,17 +394,22 @@ impl FecSender {
 
 struct FecReceiver {
     blocks: HashMap<(SocketAddr, u32), Decoder>,
+    completed: HashSet<(SocketAddr, u32)>,
 }
 
 impl FecReceiver {
     fn new() -> Self {
         Self {
             blocks: HashMap::new(),
+            completed: HashSet::new(),
         }
     }
 
     fn push(&mut self, peer: SocketAddr, bytes: &[u8]) -> Option<Bytes> {
         let header = FecHeader::decode(bytes)?;
+        if self.completed.contains(&(peer, header.block_id)) {
+            return None;
+        }
         let packet = EncodingPacket::deserialize(&bytes[FEC_HEADER_LEN..]);
         let decoder = self
             .blocks
@@ -412,14 +417,20 @@ impl FecReceiver {
             .or_insert_with(|| Decoder::new(header.oti()));
         let decoded = decoder.decode(packet)?;
         self.blocks.remove(&(peer, header.block_id));
+        self.completed.insert((peer, header.block_id));
         self.prune(peer, header.block_id);
         Some(Bytes::from(decoded))
     }
 
     fn prune(&mut self, peer: SocketAddr, current_block_id: u32) {
+        if current_block_id < 32 {
+            return;
+        }
         let cutoff = current_block_id.wrapping_sub(32);
         self.blocks
             .retain(|(candidate_peer, block_id), _| *candidate_peer != peer || *block_id >= cutoff);
+        self.completed
+            .retain(|(candidate_peer, block_id)| *candidate_peer != peer || *block_id >= cutoff);
     }
 }
 
@@ -695,5 +706,27 @@ mod tests {
         assert!(mesh_b.peers().await.contains(&addr_a));
         mesh_a.shutdown();
         mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_ignores_completed_block_repairs() {
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let mut sender = FecSender::new(2, DEFAULT_SYMBOL_SIZE);
+        let mut receiver = FecReceiver::new();
+
+        sender.send(&tx, rx_addr, b"mesh-frame").await.unwrap();
+
+        let mut buf = vec![0u8; 65_536];
+        let mut decoded = Vec::new();
+        for _ in 0..3 {
+            let (len, peer) = rx.recv_from(&mut buf).await.unwrap();
+            if let Some(frame) = receiver.push(peer, &buf[..len]) {
+                decoded.push(frame);
+            }
+        }
+
+        assert_eq!(decoded, vec![Bytes::from_static(b"mesh-frame")]);
     }
 }
