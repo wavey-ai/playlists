@@ -315,6 +315,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "raptorq",
  "thiserror",
  "tls-helpers",
  "tokio",
@@ -339,6 +340,12 @@ checksum = "0e4dccaaaf89514f546c693ddc140f729f958c247918a13380cccc6078391acc"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "redox_syscall"

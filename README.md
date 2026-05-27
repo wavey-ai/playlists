@@ -15,6 +15,8 @@ Components
   initialisation fragments
 * M3u8Manifest – manifest builder that rolls segments and parts following the
   LL-HLS draft spec
+* CacheMesh – UDP/RaptorQ-FEC peer discovery and cache-slot replication for
+  local multi-region HLS prototypes
 * Playlists – ties the two caches together and tracks active live streams
 
 All code is asynchronous (Tokio), uses only RwLock plus atomics, and performs no
@@ -38,6 +40,39 @@ M3u8Cache layout
 ChunkCache stores raw `bytes::Bytes`.  The cache never parses or validates the
 content, so it can be reused for protobuf blobs, encrypted chunks, telemetry
 frames, or any other byte slice.
+
+## Cache mesh prototype
+
+`playlists::mesh` can bind a UDP socket, discover configured peer caches with
+FEC-protected hello frames, and copy `ChunkCache` slots by stable `stream_id`.
+This is intended for local AV mesh prototyping where one region ingests media
+and other regions need to serve the same HLS parts from their own local cache.
+
+```rust
+use playlists::{
+    chunk_cache::ChunkCache,
+    mesh::{CacheMesh, CacheMeshConfig},
+    Options,
+};
+use std::{net::SocketAddr, sync::Arc};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let cache = Arc::new(ChunkCache::new(Options::default()));
+let peer: SocketAddr = "127.0.0.1:9201".parse()?;
+let config = CacheMeshConfig::new("uk-1", "uk", "127.0.0.1:9101".parse()?)
+    .with_peer(peer);
+let mesh = CacheMesh::new(cache.clone(), config).start().await?;
+
+cache.add_for_stream_id(1, 0, "part bytes".into()).await?;
+mesh.shutdown();
+# Ok(())
+# }
+```
+
+The current implementation is deliberately simple: static seed peers bootstrap
+discovery, and remotely replicated slots are not re-forwarded. That is enough
+for the first two-region local prototype and keeps the cache API independent of
+any specific media protocol.
 
 ## Performance
 

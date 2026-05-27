@@ -72,6 +72,29 @@ impl ChunkCache {
         lock.get(&stream_id).copied()
     }
 
+    pub async fn stream_ids(&self) -> Vec<(u64, usize)> {
+        let lock = self.offsets.read().await;
+        lock.iter()
+            .map(|(stream_id, idx)| (*stream_id, *idx))
+            .collect()
+    }
+
+    pub async fn add_for_stream_id(
+        &self,
+        stream_id: u64,
+        id: usize,
+        data_bytes: Bytes,
+    ) -> Result<usize, &'static str> {
+        let stream_idx = self.get_or_create_stream_idx(stream_id).await;
+        self.add(stream_idx, id, data_bytes).await?;
+        Ok(stream_idx)
+    }
+
+    pub async fn get_for_stream_id(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
+        let stream_idx = self.get_stream_idx(stream_id).await?;
+        self.get(stream_idx, id).await
+    }
+
     pub async fn set(&self, stream_idx: usize, id: usize, data: Bytes) -> Result<(), &'static str> {
         let h = const_xxh3(&data);
         let mut packet = BytesMut::new();
@@ -263,7 +286,10 @@ mod tests {
         const NUM_STREAMS: usize = 8;
 
         println!("\n=== Concurrent ChunkCache Benchmark ===");
-        println!("Duration: {}s, Streams: {} (1 writer + 2 readers each)", TEST_DURATION_SECS, NUM_STREAMS);
+        println!(
+            "Duration: {}s, Streams: {} (1 writer + 2 readers each)",
+            TEST_DURATION_SECS, NUM_STREAMS
+        );
 
         let mut options = Options::default();
         options.num_playlists = NUM_STREAMS;
@@ -280,7 +306,10 @@ mod tests {
         for i in 0..NUM_STREAMS {
             cache.get_or_create_stream_idx(i as u64).await;
             // Seed with initial data so readers have something
-            cache.append(i, Bytes::from(vec![0u8; 64 * 1024])).await.ok();
+            cache
+                .append(i, Bytes::from(vec![0u8; 64 * 1024]))
+                .await
+                .ok();
         }
 
         let mut handles = Vec::new();
@@ -340,15 +369,26 @@ mod tests {
 
         let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
         let writes_per_sec = total_writes as f64 / TEST_DURATION_SECS as f64;
-        let read_throughput_mb = (total_read_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
-        let write_throughput_mb = (total_write_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
+        let read_throughput_mb =
+            (total_read_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
+        let write_throughput_mb =
+            (total_write_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
 
         println!("\n=== Results ===");
         println!("Writers: {} streams", NUM_STREAMS);
         println!("Readers: {} total ({} per stream)", NUM_STREAMS * 2, 2);
-        println!("Write: {:.0}/s ({:.0} MB/s)", writes_per_sec, write_throughput_mb);
-        println!("Read:  {:.0}/s ({:.0} MB/s)", reads_per_sec, read_throughput_mb);
-        println!("Combined throughput: {:.0} MB/s", read_throughput_mb + write_throughput_mb);
+        println!(
+            "Write: {:.0}/s ({:.0} MB/s)",
+            writes_per_sec, write_throughput_mb
+        );
+        println!(
+            "Read:  {:.0}/s ({:.0} MB/s)",
+            reads_per_sec, read_throughput_mb
+        );
+        println!(
+            "Combined throughput: {:.0} MB/s",
+            read_throughput_mb + write_throughput_mb
+        );
     }
 
     #[tokio::test]
@@ -358,7 +398,10 @@ mod tests {
         const STREAM_ID: u64 = 1;
 
         println!("\n=== Massive Concurrent Reads Benchmark ===");
-        println!("Duration: {}s, Readers: {}, Writers: 1", TEST_DURATION_SECS, NUM_READERS);
+        println!(
+            "Duration: {}s, Readers: {}, Writers: 1",
+            TEST_DURATION_SECS, NUM_READERS
+        );
 
         let options = Options::default();
         let cache = Arc::new(ChunkCache::new(options));
@@ -368,7 +411,10 @@ mod tests {
         let stream_idx = cache.get_or_create_stream_idx(STREAM_ID).await;
         // Seed with data
         for i in 1..=100 {
-            cache.add(stream_idx, i, Bytes::from(vec![0xABu8; 1024])).await.ok();
+            cache
+                .add(stream_idx, i, Bytes::from(vec![0xABu8; 1024]))
+                .await
+                .ok();
         }
 
         let mut handles = Vec::new();
@@ -412,16 +458,25 @@ mod tests {
 
         println!("\n=== Results ===");
         println!("Concurrent readers: {}", NUM_READERS);
-        println!("Total reads: {} ({:.1}M/s)", total_reads, reads_per_sec / 1_000_000.0);
+        println!(
+            "Total reads: {} ({:.1}M/s)",
+            total_reads,
+            reads_per_sec / 1_000_000.0
+        );
         println!("Total writes: {}", total_writes);
-        println!("Reads per reader: {:.0}", total_reads as f64 / NUM_READERS as f64);
+        println!(
+            "Reads per reader: {:.0}",
+            total_reads as f64 / NUM_READERS as f64
+        );
     }
 
     #[tokio::test]
     async fn test_new_playlist_notification_sent() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
-        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+        let mut rx = cache
+            .take_new_playlists_rx()
+            .expect("receiver already taken");
 
         let idx = cache.add_stream_id(42).await;
         let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
@@ -434,7 +489,9 @@ mod tests {
     async fn test_no_notification_for_existing_stream_id() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
-        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+        let mut rx = cache
+            .take_new_playlists_rx()
+            .expect("receiver already taken");
 
         let _ = cache.add_stream_id(7).await;
         let _ = rx.recv().await.expect("missing initial notification");
@@ -449,7 +506,9 @@ mod tests {
     async fn test_take_new_playlists_rx_single_use() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
-        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+        let mut rx = cache
+            .take_new_playlists_rx()
+            .expect("receiver already taken");
 
         assert!(cache.take_new_playlists_rx().is_none());
 
@@ -464,7 +523,9 @@ mod tests {
     async fn test_notification_after_zero_stream_id() {
         let options = Options::default();
         let cache = ChunkCache::new(options);
-        let mut rx = cache.take_new_playlists_rx().expect("receiver already taken");
+        let mut rx = cache
+            .take_new_playlists_rx()
+            .expect("receiver already taken");
 
         let first_idx = cache.add_stream_id(9).await;
         let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
@@ -475,8 +536,7 @@ mod tests {
         cache.zero_stream_id(9).await;
 
         let second_idx = cache.add_stream_id(9).await;
-        let (stream_id, notified_idx) =
-            rx.recv().await.expect("missing notification after reset");
+        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification after reset");
 
         assert_eq!(stream_id, 9);
         assert_eq!(notified_idx, second_idx);

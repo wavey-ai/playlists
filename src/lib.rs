@@ -1,6 +1,7 @@
 pub mod chunk_cache;
 pub mod m3u8_cache;
 pub mod m3u8_manifest;
+pub mod mesh;
 
 use access_unit::Fmp4;
 use chunk_cache::ChunkCache;
