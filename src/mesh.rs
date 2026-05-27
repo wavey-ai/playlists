@@ -21,6 +21,7 @@ const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(20);
+const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
 
 #[derive(Debug)]
 pub enum MeshError {
@@ -358,8 +359,12 @@ struct FecSender {
 
 impl FecSender {
     fn new(repair_symbols: u32, symbol_size: u16) -> Self {
+        Self::with_initial_block_id(repair_symbols, symbol_size, 0)
+    }
+
+    fn with_initial_block_id(repair_symbols: u32, symbol_size: u16, initial_block_id: u32) -> Self {
         Self {
-            next_block_id: 0,
+            next_block_id: initial_block_id,
             repair_symbols,
             symbol_size,
         }
@@ -560,7 +565,11 @@ async fn sync_task(
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut sender = FecSender::new(config.repair_symbols, config.symbol_size);
+    let mut sender = FecSender::with_initial_block_id(
+        config.repair_symbols,
+        config.symbol_size,
+        CHUNK_BLOCK_ID_BASE,
+    );
     let mut sent: HashMap<(u64, usize), usize> = HashMap::new();
     let mut interval = tokio::time::interval(config.sync_interval);
 
