@@ -3,6 +3,8 @@ use crate::Options;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 
+const GAP_DURATION_MS: u32 = 4_000;
+
 pub struct M3u8Manifest {
     dur: u32,
     seq: u32,
@@ -91,8 +93,9 @@ impl M3u8Manifest {
         if segs.len() < 7 {
             for _ in 0..(7 - segs.len()) {
                 gaps += 1;
-                ps.push_str("#EXT-X-GAP\n#EXTINF:4.00000,\ngap.mp4\n");
-                pt += Duration::milliseconds(1000);
+                let secs = GAP_DURATION_MS as f64 / 1000.0;
+                ps.push_str(&format!("#EXT-X-GAP\n#EXTINF:{:.5},\ngap.mp4\n", secs));
+                pt += Duration::milliseconds(GAP_DURATION_MS as i64);
             }
         }
 
@@ -149,9 +152,15 @@ impl M3u8Manifest {
 
         let target_duration = segs
             .iter()
-            .map(|(_, duration)| (*duration as f64 / 1000.0).round() as u32)
+            .map(|(_, duration)| ms_to_target_duration(*duration))
             .max()
-            .unwrap_or(0);
+            .unwrap_or_else(|| ms_to_target_duration(self.options.segment_min_ms))
+            .max(if gaps > 0 {
+                ms_to_target_duration(GAP_DURATION_MS)
+            } else {
+                1
+            })
+            .max(1);
 
         let mut duration_counts = std::collections::HashMap::new();
         for parts in &self.seg_parts {
@@ -160,7 +169,12 @@ impl M3u8Manifest {
             }
         }
 
-        let max_duration = durs.iter().max().cloned().unwrap_or(0);
+        let max_duration = durs
+            .iter()
+            .max()
+            .cloned()
+            .unwrap_or(self.options.segment_min_ms)
+            .max(1);
         let part_target = max_duration as f64 / 1000.0;
 
         let part_hold_back = part_target * 3 as f64;
@@ -184,5 +198,24 @@ impl M3u8Manifest {
         ph.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
 
         format!("{}{}", ph, ps).into()
+    }
+}
+
+fn ms_to_target_duration(ms: u32) -> u32 {
+    ((u64::from(ms) + 999) / 1000).max(1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_live_manifest_has_valid_positive_targets() {
+        let manifest = String::from_utf8(M3u8Manifest::new(Options::default()).m3u8().to_vec())
+            .expect("manifest utf8");
+
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:4"));
+        assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=1.50000"));
+        assert!(manifest.contains("PART-HOLD-BACK=4.50000"));
     }
 }
