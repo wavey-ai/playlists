@@ -33,6 +33,7 @@ pub struct M3u8Manifest {
     seg_id: u32,
     seg_durs: Vec<u32>,
     seg_parts: Vec<Vec<PartInfo>>,
+    part_target_ms: u32,
     start_time: DateTime<Utc>,
     idx: u32,
     options: Options,
@@ -55,6 +56,7 @@ impl M3u8Manifest {
             seg_id: 1,
             seg_durs: Vec::new(),
             seg_parts,
+            part_target_ms: 0,
             start_time: Utc::now(),
             idx: 0,
             options,
@@ -136,6 +138,7 @@ impl M3u8Manifest {
         self.seq += 1;
         self.dur += duration;
         self.seg_dur += duration;
+        self.part_target_ms = self.part_target_ms.max(duration);
         let byte_range = byte_range.or_else(|| MediaByteRange::new(byte_len?, self.seg_byte_len));
         if let Some(range) = byte_range {
             self.seg_byte_len = self
@@ -216,6 +219,7 @@ impl M3u8Manifest {
             open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.duration_ms);
             append_part_line(&mut ps, self.seg_id, p);
         }
+        append_preload_hint(&mut ps, self.seg_id, &self.seg_parts[seg_index]);
 
         let target_duration = segs
             .iter()
@@ -229,19 +233,12 @@ impl M3u8Manifest {
             })
             .max(1);
 
-        let mut duration_counts = std::collections::HashMap::new();
-        for parts in &self.seg_parts {
-            for part in parts {
-                *duration_counts.entry(part.duration_ms).or_insert(0) += 1;
-            }
+        let max_duration = if self.part_target_ms == 0 {
+            self.options.segment_min_ms
+        } else {
+            self.part_target_ms
         }
-
-        let max_duration = durs
-            .iter()
-            .max()
-            .cloned()
-            .unwrap_or(self.options.segment_min_ms)
-            .max(1);
+        .max(1);
         let part_target = max_duration as f64 / 1000.0;
 
         let part_hold_back = part_target * 3_f64;
@@ -313,6 +310,16 @@ fn append_segment_byte_range(playlist: &mut String, parts: &[PartInfo]) {
     if length > 0 {
         playlist.push_str(&format!("#EXT-X-BYTERANGE:{length}@{offset}\n"));
     }
+}
+
+fn append_preload_hint(playlist: &mut String, segment_id: u32, parts: &[PartInfo]) {
+    let Some((offset, length)) = segment_byte_range(parts) else {
+        return;
+    };
+    let start = offset.saturating_add(length);
+    playlist.push_str(&format!(
+        "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s{segment_id}.mp4\",BYTERANGE-START={start}\n"
+    ));
 }
 
 fn segment_byte_range(parts: &[PartInfo]) -> Option<(u64, u64)> {
@@ -457,5 +464,8 @@ mod tests {
         assert!(playlist.contains("URI=\"s1.mp4\",BYTERANGE=\"80@120\""));
         assert!(playlist.contains("#EXT-X-BYTERANGE:200@0\ns1.mp4"));
         assert!(playlist.contains("URI=\"s2.mp4\",BYTERANGE=\"40@0\",INDEPENDENT=YES"));
+        assert!(
+            playlist.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s2.mp4\",BYTERANGE-START=40")
+        );
     }
 }

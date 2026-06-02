@@ -26,6 +26,7 @@ pub struct M3u8Cache {
     seg_parts: Vec<AtomicUsize>,
     last_seg: Vec<AtomicUsize>,
     last_part: Vec<AtomicUsize>,
+    last_seq: Vec<AtomicUsize>,
     generations: Vec<AtomicUsize>,
     inits: Vec<RwLock<Bytes>>,
     offsets: RwLock<BTreeMap<u64, usize>>,
@@ -56,6 +57,7 @@ impl M3u8Cache {
         let num_playlists = options.num_playlists;
         let last_seg = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
         let last_part = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
+        let last_seq = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
         let generations = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
         let inits = (0..num_playlists)
             .map(|_| RwLock::new(init_repeat_value.clone()))
@@ -66,6 +68,7 @@ impl M3u8Cache {
             seg_parts,
             last_seg,
             last_part,
+            last_seq,
             generations,
             inits,
             offsets: RwLock::new(BTreeMap::new()),
@@ -94,6 +97,11 @@ impl M3u8Cache {
     fn last_part(&self, stream_id: u64) -> Option<usize> {
         self.offset(stream_id)
             .map(|n| self.last_part[n].load(Ordering::Acquire))
+    }
+
+    fn last_seq(&self, stream_id: u64) -> Option<usize> {
+        self.offset(stream_id)
+            .map(|n| self.last_seq[n].load(Ordering::Acquire))
     }
 
     pub fn last_position(&self, stream_id: u64) -> Option<(usize, usize)> {
@@ -126,6 +134,7 @@ impl M3u8Cache {
 
         self.set_last_seg(stream_id, 0)?;
         self.set_last_part(stream_id, 0)?;
+        self.set_last_seq(stream_id, 0)?;
 
         let seg_idx = self
             .options
@@ -154,6 +163,7 @@ impl M3u8Cache {
     fn reset_stream_idx(&self, idx: usize) -> Result<(), CacheError> {
         self.last_seg[idx].store(0, Ordering::Release);
         self.last_part[idx].store(0, Ordering::Release);
+        self.last_seq[idx].store(0, Ordering::Release);
         let next = self.generations[idx]
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
@@ -184,6 +194,15 @@ impl M3u8Cache {
     fn set_last_part(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
         if let Some(n) = self.offset(stream_id) {
             self.last_part[n].store(id, Ordering::Release);
+            Ok(())
+        } else {
+            Err(CacheError::StreamNotFound)
+        }
+    }
+
+    fn set_last_seq(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
+        if let Some(n) = self.offset(stream_id) {
+            self.last_seq[n].store(id, Ordering::Release);
             Ok(())
         } else {
             Err(CacheError::StreamNotFound)
@@ -257,6 +276,7 @@ impl M3u8Cache {
         }
         self.set_last_seg(stream_id, segment_id)?;
         self.set_last_part(stream_id, idx)?;
+        self.set_last_seq(stream_id, seq)?;
 
         Ok(h)
     }
@@ -400,7 +420,13 @@ impl M3u8Cache {
         segment_id: usize,
     ) -> Result<Option<(usize, usize)>, CacheError> {
         if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
-            let b = self.seg_parts[idx].load(Ordering::Acquire);
+            let mut b = self.seg_parts[idx].load(Ordering::Acquire);
+            if b == 0 && self.last_seg(stream_id) == Some(segment_id) {
+                b = self
+                    .last_seq(stream_id)
+                    .and_then(|last_seq| last_seq.checked_add(1))
+                    .ok_or(CacheError::ArithmeticOverflow)?;
+            }
             if let Ok(prev_idx) = self.calculate_seg_index(
                 stream_id,
                 segment_id
@@ -685,6 +711,23 @@ mod tests {
             .add(7, 12, 1, 1, Bytes::from_static(b"second"))
             .unwrap();
         assert_eq!(cache.last_position(7), Some((12, 1)));
+    }
+
+    #[test]
+    fn exposes_current_open_segment_part_range() {
+        let cache = M3u8Cache::new(Options::default());
+
+        cache
+            .add(7, 4, 24, 0, Bytes::from_static(b"closed-4"))
+            .unwrap();
+        cache
+            .add(7, 5, 25, 0, Bytes::from_static(b"open-5-a"))
+            .unwrap();
+        cache
+            .add(7, 5, 26, 1, Bytes::from_static(b"open-5-b"))
+            .unwrap();
+
+        assert_eq!(cache.get_idxs(7, 5).unwrap(), Some((25, 27)));
     }
 
     #[test]
