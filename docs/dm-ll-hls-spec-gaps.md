@@ -4,7 +4,7 @@ Status: Draft
 Date: 2026-06-02
 Source reviewed: `draft-pantos-hls-rfc8216bis-22`, dated 2026-05-01, from the user-provided text.
 Local HTTP layer reviewed: current working tree of `/Users/jamie/wavey.ai/web-services`, specifically the workspace manifest, `upload-response/Cargo.toml`, `hls/src/lib.rs`, `web-service/src/http_range.rs`, and the OBS LL-HLS example.
-Implementation status updated: 2026-06-02 after playlist byte-range and open-parent serving fixes.
+Implementation status updated: 2026-06-02 after playlist byte-range, open-parent serving, fixed target-duration, and Advance Part Limit fixes.
 
 ## Context
 
@@ -220,9 +220,9 @@ The HLS handler rejects `_HLS_part` without `_HLS_msn` with `400`, and rejects n
 
 For stale requests, the handler returns the latest playlist or latest delta rather than reconstructing an older playlist containing the requested MSN (`hls/src/lib.rs`, lines 426-437 and 456-466).
 
-For future requests, the handler polls for the requested snapshot until it is available or until an 18-second timeout returns `503` (`hls/src/lib.rs`, lines 441-480). The local tests explicitly expect a request for `_HLS_msn=140` when the latest cached MSN is `137` to wait and return `200`, not `400` (`hls/src/lib.rs`, lines 920-945). The tests also expect high part-index requests to wait for that part or resolve on the next segment, not immediately return `400` (`hls/src/lib.rs`, lines 948-1019).
+For future requests within the draft's allowed look-ahead, the handler polls for the requested snapshot until it is available or until an 18-second timeout returns `503` (`hls/src/lib.rs`, lines 441-480). Requests with `_HLS_msn` more than the current last MSN plus two now return `400`. Requests with `_HLS_part` beyond the current last part by more than the Advance Part Limit now return `400`; for sub-second parts, the limit is computed as `ceil(3 / PART-TARGET)`.
 
-Verified implication: this confirms Gap 4. The draft says servers SHOULD immediately return Bad Request when `_HLS_msn` is more than the current last MSN plus two, or `_HLS_part` exceeds the Advance Part Limit. The local code currently waits for availability instead, so it deviates from a SHOULD-level recommendation and should be documented if retained.
+Verified implication: the local code now follows the draft's SHOULD-level Bad Request recommendation for too-far-ahead MSN and part requests. The remaining policy gap is stale-window behavior: the handler serves the latest playlist rather than reconstructing an older playlist containing an MSN that has already fallen out of the retained window.
 
 ### D. Delta-update behavior is narrower than the draft's full surface
 
@@ -252,16 +252,23 @@ The generated LL-HLS playlist can advertise an open parent segment URI such as `
 
 Verified implication: the playlist cache now tracks the latest global part sequence separately from the latest part index, and exposes the current open parent range as `[previous_boundary, latest_seq + 1)`. This prevents valid byte-range requests for the live parent resource from returning `404` solely because the parent segment has not closed yet.
 
+### H. Target duration is configured, stable, and no longer derived from the retained window
+
+The manifest builder no longer pads startup playlists with synthetic `EXT-X-GAP` media segments and no longer derives `EXT-X-TARGETDURATION` from whatever segments happen to be retained. It uses the configured target duration for the whole live playlist lifetime.
+
+Verified implication: this aligns with the draft rule that the `EXT-X-TARGETDURATION` value in a Media Playlist MUST NOT change. It also prevents retained-window churn from changing `CAN-SKIP-UNTIL`, `HOLD-BACK`, and player reload cadence.
+
 ## Implementation Watch List
 
 For any server or manifest builder targeting this draft:
 
 - Do not assume an `upload-response` feature named `hls`; current local HLS routing lives in the `hls` crate.
 - Do not advertise `CAN-BLOCK-RELOAD` unless the playlist endpoint implements `_HLS_msn` and `_HLS_part` blocking semantics.
-- Reject `_HLS_msn` values more than the current last MSN plus two. The exact Advance Part Limit for `_HLS_part` still needs a policy that accounts for low part targets such as 50-67 ms without false `400` responses.
+- Reject `_HLS_msn` values more than the current last MSN plus two, and reject `_HLS_part` values beyond the current last part by more than the Advance Part Limit. This is implemented in `hls`.
 - Do not advertise `CAN-SKIP-UNTIL` unless delta updates are implemented and preserve all state needed by unskipped media.
 - Do not treat `_HLS_skip=v2` as equivalent to `YES` unless Date Range skipping is intentionally unsupported and the response is known to be safe.
 - Emit `EXT-X-PART-INF` whenever `EXT-X-PART` is present.
 - Treat `PART-TARGET` as effectively immutable unless the final RFC/draft explicitly allows mutation.
 - Include `EXT-X-PRELOAD-HINT` for live playlists with parts if the goal is compliance with the Low-Latency Server Configuration Profile. This is implemented for generated byte-ranged fMP4 playlists.
 - Use complete byte-range semantics for parts and hints; avoid omitted offsets unless the previous part range is unambiguous and belongs to the same parent resource.
+- Keep `EXT-X-TARGETDURATION` configured and stable; do not derive it from the retained window.

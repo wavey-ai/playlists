@@ -3,8 +3,6 @@ use crate::Options;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 
-const GAP_DURATION_MS: u32 = 4_000;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaByteRange {
     pub length: u64,
@@ -92,6 +90,17 @@ impl M3u8Manifest {
         res
     }
 
+    fn segment_start_time(&self, segment_id: u32) -> DateTime<Utc> {
+        let skipped_ms = self
+            .seg_durs
+            .iter()
+            .take(segment_id.saturating_sub(1) as usize)
+            .fold(0_i64, |total, duration| {
+                total.saturating_add(i64::from(*duration))
+            });
+        self.start_time + Duration::milliseconds(skipped_ms)
+    }
+
     pub fn add_part(&mut self, duration: u32, key: bool) -> (Bytes, usize, usize, usize, bool) {
         self.add_part_with_byte_range(duration, key, None)
     }
@@ -167,71 +176,47 @@ impl M3u8Manifest {
         let mut ph = String::new();
         let mut ps = String::new();
 
-        let mut pt = self.start_time;
-
         let segs = self.full_segments();
 
-        let mut gaps = 0;
         let mut segment_durations = Vec::new();
-        if segs.len() < 7 {
-            for _ in 0..(7 - segs.len()) {
-                gaps += 1;
-                let secs = GAP_DURATION_MS as f64 / 1000.0;
-                ps.push_str(&format!("#EXT-X-GAP\n#EXTINF:{secs:.5},\ngap.mp4\n"));
-                pt += Duration::milliseconds(GAP_DURATION_MS as i64);
-                segment_durations.push(GAP_DURATION_MS);
-            }
-        }
+        let mut pt = segs
+            .first()
+            .map(|(segment_id, _)| self.segment_start_time(*segment_id))
+            .unwrap_or_else(|| self.segment_start_time(self.seg_id));
 
-        let mut durs = Vec::new();
-
-        for (i, seg) in segs.iter().enumerate() {
+        for seg in &segs {
             let segment_parts = &self.seg_parts[seg.0 as usize % self.options.max_segments];
-            if gaps + i <= 4 {
-                let secs = seg.1 as f64 / 1000.0;
-                ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
-                append_segment_byte_range(&mut ps, segment_parts);
-                ps.push_str(&format!("s{}.mp4\n", seg.0));
-                pt += Duration::milliseconds(seg.1 as i64);
-                segment_durations.push(seg.1);
-            } else {
-                ps.push_str(&format!(
-                    "#EXT-X-PROGRAM-DATE-TIME:{}\n",
-                    pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                ));
-                for p in segment_parts {
-                    durs.push(p.duration_ms);
-                    append_part_line(&mut ps, seg.0, p);
-                }
-                let secs = seg.1 as f64 / 1000.0;
-                ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
-                append_segment_byte_range(&mut ps, segment_parts);
-                ps.push_str(&format!("s{}.mp4\n", seg.0));
-                pt += Duration::milliseconds(seg.1 as i64);
-                segment_durations.push(seg.1);
+            ps.push_str(&format!(
+                "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+                pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ));
+            for p in segment_parts {
+                append_part_line(&mut ps, seg.0, p);
             }
+            let secs = seg.1 as f64 / 1000.0;
+            ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
+            append_segment_byte_range(&mut ps, segment_parts);
+            ps.push_str(&format!("s{}.mp4\n", seg.0));
+            pt += Duration::milliseconds(seg.1 as i64);
+            segment_durations.push(seg.1);
         }
 
         let mut open_parent_duration_ms = 0_u32;
         let seg_index = self.seg_id as usize % self.options.max_segments;
-        for p in &self.seg_parts[seg_index] {
-            durs.push(p.duration_ms);
-            open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.duration_ms);
-            append_part_line(&mut ps, self.seg_id, p);
+        let open_parts = &self.seg_parts[seg_index];
+        if !open_parts.is_empty() {
+            ps.push_str(&format!(
+                "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+                pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ));
+            for p in open_parts {
+                open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.duration_ms);
+                append_part_line(&mut ps, self.seg_id, p);
+            }
         }
-        append_preload_hint(&mut ps, self.seg_id, &self.seg_parts[seg_index]);
+        append_preload_hint(&mut ps, self.seg_id, open_parts);
 
-        let target_duration = segs
-            .iter()
-            .map(|(_, duration)| ms_to_target_duration(*duration))
-            .max()
-            .unwrap_or_else(|| ms_to_target_duration(self.options.segment_min_ms))
-            .max(if gaps > 0 {
-                ms_to_target_duration(GAP_DURATION_MS)
-            } else {
-                1
-            })
-            .max(1);
+        let target_duration = ms_to_target_duration(self.options.target_duration_ms);
 
         let max_duration = if self.part_target_ms == 0 {
             self.options.segment_min_ms
@@ -271,10 +256,10 @@ impl M3u8Manifest {
             ));
         }
 
-        let mut seq = self.seg_id;
-        if self.seg_id > 7 {
-            seq = self.seg_id - 7
-        }
+        let seq = segs
+            .first()
+            .map(|(segment_id, _)| *segment_id)
+            .unwrap_or(self.seg_id);
         ph.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={part_target:.5}\n"));
         ph.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
         ph.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
@@ -363,9 +348,10 @@ mod tests {
         let manifest = String::from_utf8(M3u8Manifest::new(Options::default()).m3u8().to_vec())
             .expect("manifest utf8");
 
-        assert!(manifest.contains("#EXT-X-TARGETDURATION:4"));
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:6"));
         assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=1.50000"));
         assert!(manifest.contains("PART-HOLD-BACK=4.50000"));
+        assert!(!manifest.contains("gap.mp4"));
         assert!(!manifest.contains("CAN-SKIP-UNTIL"));
         assert!(!manifest.contains("#EXT-X-PRELOAD-HINT"));
     }
@@ -375,6 +361,7 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 10,
             segment_min_ms: 1000,
+            target_duration_ms: 1000,
             ..Options::default()
         });
 
@@ -391,6 +378,7 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 7,
             segment_min_ms: 1000,
+            target_duration_ms: 1000,
             ..Options::default()
         });
 
@@ -405,12 +393,12 @@ mod tests {
     #[test]
     fn emitted_ll_hls_controls_are_internally_consistent() {
         let mut manifest = M3u8Manifest::new(Options {
-            max_segments: 10,
+            max_segments: 64,
             segment_min_ms: 1000,
             ..Options::default()
         });
 
-        for _ in 0..12 {
+        for _ in 0..48 {
             manifest.add_part(1000, true);
         }
 
@@ -443,6 +431,21 @@ mod tests {
         {
             assert!(line.contains("DURATION="));
             assert!(line.contains("URI=\"p"));
+        }
+    }
+
+    #[test]
+    fn target_duration_is_configured_and_stable() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 16,
+            segment_min_ms: 200,
+            target_duration_ms: 6000,
+            ..Options::default()
+        });
+
+        for duration in [200, 300, 100, 400, 250, 150] {
+            let playlist = String::from_utf8(manifest.add_part(duration, true).0.to_vec()).unwrap();
+            assert!(playlist.contains("#EXT-X-TARGETDURATION:6"));
         }
     }
 
