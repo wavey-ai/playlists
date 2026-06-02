@@ -601,6 +601,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_heavy_workload_handles_thousands_more_reads_than_writes() {
+        const READERS: usize = 64;
+        const READS_PER_READER: usize = 4096;
+        const WRITES: usize = 8;
+        const STREAM_ID: u64 = 1;
+
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 64,
+            ..Options::default()
+        };
+        let cache = Arc::new(ChunkCache::new(options));
+        let stream_idx = cache.add_stream_id(STREAM_ID).await;
+        cache
+            .add(stream_idx, 0, Bytes::from_static(b"seed"))
+            .await
+            .unwrap();
+
+        let read_count = Arc::new(AtomicU64::new(0));
+        let write_count = Arc::new(AtomicU64::new(1));
+        let mut handles = Vec::new();
+
+        for _ in 0..READERS {
+            let cache = Arc::clone(&cache);
+            let read_count = Arc::clone(&read_count);
+            handles.push(task::spawn(async move {
+                for _ in 0..READS_PER_READER {
+                    let (bytes, hash) = cache.get(stream_idx, 0).await.expect("seed slot");
+                    assert_eq!(bytes, Bytes::from_static(b"seed"));
+                    assert_ne!(hash, 0);
+                    read_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        let writer_cache = Arc::clone(&cache);
+        let writer_count = Arc::clone(&write_count);
+        handles.push(task::spawn(async move {
+            for id in 1..=WRITES {
+                writer_cache
+                    .add(stream_idx, id, Bytes::from(vec![id as u8; 128]))
+                    .await
+                    .unwrap();
+                writer_count.fetch_add(1, Ordering::Relaxed);
+                task::yield_now().await;
+            }
+        }));
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let total_reads = read_count.load(Ordering::Relaxed);
+        let total_writes = write_count.load(Ordering::Relaxed);
+        assert_eq!(total_reads, (READERS * READS_PER_READER) as u64);
+        assert_eq!(total_writes, (WRITES + 1) as u64);
+        assert!(
+            total_reads / total_writes >= 10_000,
+            "expected at least 10k reads per write, got {total_reads}/{total_writes}"
+        );
+        assert_eq!(
+            cache.get(stream_idx, WRITES).await.unwrap().0,
+            Bytes::from(vec![WRITES as u8; 128])
+        );
+    }
+
+    #[tokio::test]
     async fn test_new_playlist_notification_sent() {
         let options = Options::default();
         let cache = ChunkCache::new(options);

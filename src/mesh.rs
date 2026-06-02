@@ -23,6 +23,7 @@ const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(20);
 const REQUEST_BLOCK_ID_BASE: u32 = 1 << 30;
 const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
+const MAX_GOSSIP_PEERS: usize = 256;
 
 #[derive(Debug)]
 pub enum MeshError {
@@ -189,6 +190,13 @@ impl CacheMeshHandle {
         self.peers.read().await.iter().copied().collect()
     }
 
+    pub async fn add_peer(&self, peer: SocketAddr) -> bool {
+        if peer == self.local_addr {
+            return false;
+        }
+        self.peers.write().await.insert(peer)
+    }
+
     pub async fn request_replica(
         &self,
         stream_id: u64,
@@ -228,6 +236,7 @@ enum MeshFrame {
     Hello {
         node_id: String,
         region: String,
+        peers: Vec<SocketAddr>,
     },
     Chunk {
         node_id: String,
@@ -243,10 +252,15 @@ enum MeshFrame {
 }
 
 impl MeshFrame {
-    fn hello(node_id: impl Into<String>, region: impl Into<String>) -> Self {
+    fn hello_with_peers(
+        node_id: impl Into<String>,
+        region: impl Into<String>,
+        peers: Vec<SocketAddr>,
+    ) -> Self {
         Self::Hello {
             node_id: node_id.into(),
             region: region.into(),
+            peers,
         }
     }
 
@@ -285,16 +299,29 @@ impl MeshFrame {
         out.put_slice(FRAME_MAGIC);
         out.put_u8(FRAME_VERSION);
         match self {
-            Self::Hello { region, .. } => {
+            Self::Hello { region, peers, .. } => {
                 let region = region.as_bytes();
                 if region.len() > u16::MAX as usize {
                     return Err(MeshError::InvalidFrame("region too long"));
+                }
+                if peers.len() > MAX_GOSSIP_PEERS {
+                    return Err(MeshError::InvalidFrame("too many gossip peers"));
                 }
                 out.put_u8(FRAME_HELLO);
                 out.put_u16(node_id.len() as u16);
                 out.put_slice(node_id);
                 out.put_u16(region.len() as u16);
                 out.put_slice(region);
+                out.put_u16(peers.len() as u16);
+                for peer in peers {
+                    let peer = peer.to_string();
+                    let peer = peer.as_bytes();
+                    if peer.len() > u16::MAX as usize {
+                        return Err(MeshError::InvalidFrame("gossip peer addr too long"));
+                    }
+                    out.put_u16(peer.len() as u16);
+                    out.put_slice(peer);
+                }
             }
             Self::Chunk {
                 stream_id,
@@ -346,10 +373,31 @@ impl MeshFrame {
         match kind {
             FRAME_HELLO => {
                 let region = read_string(&mut buf)?;
+                let mut peers = Vec::new();
                 if buf.has_remaining() {
-                    return Err(MeshError::InvalidFrame("trailing hello bytes"));
+                    if buf.remaining() < 2 {
+                        return Err(MeshError::InvalidFrame("truncated hello peer count"));
+                    }
+                    let peer_count = buf.get_u16() as usize;
+                    if peer_count > MAX_GOSSIP_PEERS {
+                        return Err(MeshError::InvalidFrame("too many gossip peers"));
+                    }
+                    peers.reserve(peer_count);
+                    for _ in 0..peer_count {
+                        let peer = read_string(&mut buf)?
+                            .parse::<SocketAddr>()
+                            .map_err(|_| MeshError::InvalidFrame("invalid gossip peer addr"))?;
+                        peers.push(peer);
+                    }
+                    if buf.has_remaining() {
+                        return Err(MeshError::InvalidFrame("trailing hello bytes"));
+                    }
                 }
-                Ok(Self::Hello { node_id, region })
+                Ok(Self::Hello {
+                    node_id,
+                    region,
+                    peers,
+                })
             }
             FRAME_CHUNK => {
                 if buf.remaining() < 20 {
@@ -517,9 +565,27 @@ struct FrameHandler<'a> {
 
 async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<'_>) {
     match frame {
-        MeshFrame::Hello { node_id, region } => {
-            handler.peers.write().await.insert(peer);
-            debug!(node_id, region, peer = %peer, "cache mesh peer discovered");
+        MeshFrame::Hello {
+            node_id,
+            region,
+            peers,
+        } => {
+            let mut discovered = 0usize;
+            {
+                let mut peer_set = handler.peers.write().await;
+                if peer_set.insert(peer) {
+                    discovered = discovered.saturating_add(1);
+                }
+                for advertised_peer in peers {
+                    if advertised_peer == peer || advertised_peer == handler.config.bind_addr {
+                        continue;
+                    }
+                    if peer_set.insert(advertised_peer) {
+                        discovered = discovered.saturating_add(1);
+                    }
+                }
+            }
+            debug!(node_id, region, peer = %peer, discovered, "cache mesh peer discovered");
         }
         MeshFrame::Chunk {
             node_id,
@@ -637,14 +703,24 @@ async fn announce_task(
                 return;
             }
             _ = interval.tick() => {
-                let frame = match MeshFrame::hello(config.node_id.clone(), config.region.clone()).encode() {
+                let current_peers = peers.read().await.iter().copied().collect::<Vec<_>>();
+                let advertised_peers = current_peers
+                    .iter()
+                    .copied()
+                    .take(MAX_GOSSIP_PEERS)
+                    .collect::<Vec<_>>();
+                let frame = match MeshFrame::hello_with_peers(
+                    config.node_id.clone(),
+                    config.region.clone(),
+                    advertised_peers,
+                )
+                .encode() {
                     Ok(frame) => frame,
                     Err(err) => {
                         error!(error = %err, "cache mesh hello encode failed");
                         continue;
                     }
                 };
-                let current_peers = peers.read().await.iter().copied().collect::<Vec<_>>();
                 for peer in current_peers {
                     if let Err(err) = sender.send(&socket, peer, &frame).await {
                         debug!(peer = %peer, error = %err, "cache mesh hello send failed");
@@ -741,8 +817,15 @@ mod tests {
     use tokio::time::{timeout, Instant};
 
     fn loopback_addr() -> SocketAddr {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.local_addr().unwrap()
+        static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(25_000);
+
+        loop {
+            let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            if std::net::UdpSocket::bind(addr).is_ok() {
+                return addr;
+            }
+        }
     }
 
     #[test]
@@ -752,10 +835,29 @@ mod tests {
         let decoded = MeshFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
 
-        let frame = MeshFrame::hello("us", "us-east");
+        let frame = MeshFrame::hello_with_peers("us", "us-east", Vec::new());
         let encoded = frame.encode().unwrap();
         let decoded = MeshFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
+
+        let peer: SocketAddr = "127.0.0.1:9911".parse().unwrap();
+        let frame = MeshFrame::hello_with_peers("us", "us-east", vec![peer]);
+        let encoded = frame.encode().unwrap();
+        let decoded = MeshFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+
+        let mut legacy_hello = BytesMut::new();
+        legacy_hello.put_slice(FRAME_MAGIC);
+        legacy_hello.put_u8(FRAME_VERSION);
+        legacy_hello.put_u8(FRAME_HELLO);
+        legacy_hello.put_u16(2);
+        legacy_hello.put_slice(b"uk");
+        legacy_hello.put_u16(7);
+        legacy_hello.put_slice(b"uk-west");
+        assert_eq!(
+            MeshFrame::decode(&legacy_hello).unwrap(),
+            MeshFrame::hello_with_peers("uk", "uk-west", Vec::new())
+        );
 
         let frame = MeshFrame::replica_request("jp", 42, 3);
         let encoded = frame.encode().unwrap();
@@ -822,6 +924,67 @@ mod tests {
         assert!(mesh_b.peers().await.contains(&addr_a));
         mesh_a.shutdown();
         mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cache_mesh_gossips_peer_addresses_from_seed_node() {
+        let addr_a = loopback_addr();
+        let addr_b = loopback_addr();
+        let addr_c = loopback_addr();
+
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+
+        let cache_a = Arc::new(ChunkCache::new(options));
+        let cache_b = Arc::new(ChunkCache::new(options));
+        let cache_c = Arc::new(ChunkCache::new(options));
+
+        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a).with_peer(addr_b);
+        config_a.announce_interval = Duration::from_millis(20);
+        config_a.sync_interval = Duration::from_secs(60);
+        let mut config_b = CacheMeshConfig::new("us", "us", addr_b)
+            .with_peer(addr_a)
+            .with_peer(addr_c);
+        config_b.announce_interval = Duration::from_millis(20);
+        config_b.sync_interval = Duration::from_secs(60);
+        let mut config_c = CacheMeshConfig::new("jp", "jp", addr_c).with_peer(addr_b);
+        config_c.announce_interval = Duration::from_millis(20);
+        config_c.sync_interval = Duration::from_secs(60);
+
+        let mesh_a = CacheMesh::new(Arc::clone(&cache_a), config_a)
+            .start()
+            .await
+            .unwrap();
+        let mesh_b = CacheMesh::new(Arc::clone(&cache_b), config_b)
+            .start()
+            .await
+            .unwrap();
+        let mesh_c = CacheMesh::new(Arc::clone(&cache_c), config_c)
+            .start()
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let peers_a = mesh_a.peers().await;
+                let peers_c = mesh_c.peers().await;
+                if peers_a.contains(&addr_c) && peers_c.contains(&addr_a) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        mesh_a.shutdown();
+        mesh_b.shutdown();
+        mesh_c.shutdown();
     }
 
     #[tokio::test]

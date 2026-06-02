@@ -43,10 +43,11 @@ frames, or any other byte slice.
 
 ## Cache mesh prototype
 
-`playlists::mesh` can bind a UDP socket, discover configured peer caches with
-FEC-protected hello frames, and copy `ChunkCache` slots by stable `stream_id`.
-This is intended for local AV mesh prototyping where one region ingests media
-and other regions need to serve the same HLS parts from their own local cache.
+`playlists::mesh` can bind a UDP socket, discover configured or broadcast peer
+caches with FEC-protected hello frames, gossip known peer addresses, and copy
+`ChunkCache` slots by stable `stream_id`. This is intended for local AV mesh
+prototyping where one region ingests media and other regions need to serve the
+same HLS parts from their own local cache.
 
 ```rust
 use playlists::{
@@ -69,10 +70,11 @@ mesh.shutdown();
 # }
 ```
 
-The current implementation is deliberately simple: static seed peers bootstrap
-discovery, and remotely replicated slots are not re-forwarded. That is enough
-for the first two-region local prototype and keeps the cache API independent of
-any specific media protocol.
+The current implementation is deliberately simple: static seed peers or a
+caller-provided private-subnet discovery path bootstrap discovery, mesh `HELLO`
+frames gossip known peer addresses, and remotely replicated slots are not
+re-forwarded. That is enough for the first regional prototype and keeps the
+cache API independent of any specific media protocol.
 
 ## Performance
 
