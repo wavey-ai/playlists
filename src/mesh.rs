@@ -1,10 +1,11 @@
 use crate::chunk_cache::ChunkCache;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
+use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecError};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -12,20 +13,21 @@ use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
 
 const FRAME_MAGIC: &[u8; 8] = b"PLMESH1\0";
-const FEC_MAGIC: &[u8; 8] = b"PLFEC1\0\0";
 const FRAME_VERSION: u8 = 1;
 const FRAME_HELLO: u8 = 1;
 const FRAME_CHUNK: u8 = 2;
-const FEC_HEADER_LEN: usize = 18;
+const FRAME_REPLICA_REQUEST: u8 = 3;
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(20);
+const REQUEST_BLOCK_ID_BASE: u32 = 1 << 30;
 const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
 
 #[derive(Debug)]
 pub enum MeshError {
     Io(std::io::Error),
+    Fec(DatagramFecError),
     InvalidFrame(&'static str),
     InvalidUtf8(std::str::Utf8Error),
     Cache(&'static str),
@@ -35,6 +37,7 @@ impl fmt::Display for MeshError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "io error: {err}"),
+            Self::Fec(err) => write!(f, "fec error: {err}"),
             Self::InvalidFrame(msg) => write!(f, "invalid mesh frame: {msg}"),
             Self::InvalidUtf8(err) => write!(f, "invalid utf-8 in mesh frame: {err}"),
             Self::Cache(err) => write!(f, "cache error: {err}"),
@@ -47,6 +50,12 @@ impl Error for MeshError {}
 impl From<std::io::Error> for MeshError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<DatagramFecError> for MeshError {
+    fn from(value: DatagramFecError) -> Self {
+        Self::Fec(value)
     }
 }
 
@@ -122,7 +131,7 @@ impl CacheMesh {
             Arc::clone(&self.cache),
             Arc::clone(&peers),
             Arc::clone(&remote_slots),
-            self.config.node_id.clone(),
+            self.config.clone(),
             shutdown_rx.clone(),
         ));
         tokio::spawn(announce_task(
@@ -132,7 +141,7 @@ impl CacheMesh {
             shutdown_rx.clone(),
         ));
         tokio::spawn(sync_task(
-            socket,
+            Arc::clone(&socket),
             self.cache,
             Arc::clone(&peers),
             remote_slots,
@@ -150,6 +159,11 @@ impl CacheMesh {
         Ok(CacheMeshHandle {
             shutdown_tx,
             peers,
+            socket,
+            node_id: self.config.node_id,
+            repair_symbols: self.config.repair_symbols,
+            symbol_size: self.config.symbol_size,
+            request_block_id: Arc::new(AtomicU32::new(REQUEST_BLOCK_ID_BASE)),
             local_addr,
         })
     }
@@ -158,6 +172,11 @@ impl CacheMesh {
 pub struct CacheMeshHandle {
     shutdown_tx: watch::Sender<()>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    socket: Arc<UdpSocket>,
+    node_id: String,
+    repair_symbols: u32,
+    symbol_size: u16,
+    request_block_id: Arc<AtomicU32>,
     local_addr: SocketAddr,
 }
 
@@ -168,6 +187,29 @@ impl CacheMeshHandle {
 
     pub async fn peers(&self) -> Vec<SocketAddr> {
         self.peers.read().await.iter().copied().collect()
+    }
+
+    pub async fn request_replica(
+        &self,
+        stream_id: u64,
+        from_slot: usize,
+    ) -> Result<usize, MeshError> {
+        let peers = self.peers().await;
+        if peers.is_empty() {
+            return Ok(0);
+        }
+
+        let block_id = self.request_block_id.fetch_add(1, Ordering::Relaxed);
+        let mut sender =
+            FecSender::with_initial_block_id(self.repair_symbols, self.symbol_size, block_id);
+        let frame = MeshFrame::replica_request(self.node_id.clone(), stream_id, from_slot as u64)
+            .encode()?;
+        let mut sent = 0usize;
+        for peer in peers {
+            sender.send(&self.socket, peer, &frame).await?;
+            sent = sent.saturating_add(1);
+        }
+        Ok(sent)
     }
 
     pub fn shutdown(&self) {
@@ -193,6 +235,11 @@ enum MeshFrame {
         slot_id: u64,
         payload: Bytes,
     },
+    ReplicaRequest {
+        node_id: String,
+        stream_id: u64,
+        from_slot: u64,
+    },
 }
 
 impl MeshFrame {
@@ -212,9 +259,19 @@ impl MeshFrame {
         }
     }
 
+    fn replica_request(node_id: impl Into<String>, stream_id: u64, from_slot: u64) -> Self {
+        Self::ReplicaRequest {
+            node_id: node_id.into(),
+            stream_id,
+            from_slot,
+        }
+    }
+
     fn node_id(&self) -> &str {
         match self {
-            Self::Hello { node_id, .. } | Self::Chunk { node_id, .. } => node_id,
+            Self::Hello { node_id, .. }
+            | Self::Chunk { node_id, .. }
+            | Self::ReplicaRequest { node_id, .. } => node_id,
         }
     }
 
@@ -255,6 +312,17 @@ impl MeshFrame {
                 out.put_u64(*slot_id);
                 out.put_u32(payload.len() as u32);
                 out.put_slice(payload);
+            }
+            Self::ReplicaRequest {
+                stream_id,
+                from_slot,
+                ..
+            } => {
+                out.put_u8(FRAME_REPLICA_REQUEST);
+                out.put_u16(node_id.len() as u16);
+                out.put_slice(node_id);
+                out.put_u64(*stream_id);
+                out.put_u64(*from_slot);
             }
         }
         Ok(out.freeze())
@@ -301,6 +369,18 @@ impl MeshFrame {
                     payload,
                 })
             }
+            FRAME_REPLICA_REQUEST => {
+                if buf.remaining() != 16 {
+                    return Err(MeshError::InvalidFrame("replica request header mismatch"));
+                }
+                let stream_id = buf.get_u64();
+                let from_slot = buf.get_u64();
+                Ok(Self::ReplicaRequest {
+                    node_id,
+                    stream_id,
+                    from_slot,
+                })
+            }
             _ => Err(MeshError::InvalidFrame("unknown frame kind")),
         }
     }
@@ -319,42 +399,8 @@ fn read_string(buf: &mut &[u8]) -> Result<String, MeshError> {
     Ok(value)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FecHeader {
-    block_id: u32,
-    transfer_length: u32,
-    symbol_size: u16,
-}
-
-impl FecHeader {
-    fn encode(&self, out: &mut BytesMut) {
-        out.put_slice(FEC_MAGIC);
-        out.put_u32(self.block_id);
-        out.put_u32(self.transfer_length);
-        out.put_u16(self.symbol_size);
-    }
-
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < FEC_HEADER_LEN || &bytes[..FEC_MAGIC.len()] != FEC_MAGIC {
-            return None;
-        }
-        let mut buf = &bytes[FEC_MAGIC.len()..FEC_HEADER_LEN];
-        Some(Self {
-            block_id: buf.get_u32(),
-            transfer_length: buf.get_u32(),
-            symbol_size: buf.get_u16(),
-        })
-    }
-
-    fn oti(&self) -> ObjectTransmissionInformation {
-        ObjectTransmissionInformation::with_defaults(self.transfer_length as u64, self.symbol_size)
-    }
-}
-
 struct FecSender {
-    next_block_id: u32,
-    repair_symbols: u32,
-    symbol_size: u16,
+    encoder: DatagramFecEncoder,
 }
 
 impl FecSender {
@@ -363,11 +409,11 @@ impl FecSender {
     }
 
     fn with_initial_block_id(repair_symbols: u32, symbol_size: u16, initial_block_id: u32) -> Self {
-        Self {
-            next_block_id: initial_block_id,
-            repair_symbols,
-            symbol_size,
-        }
+        let encoder = DatagramFecEncoder::new()
+            .with_repair_symbols(repair_symbols)
+            .with_symbol_size(symbol_size)
+            .with_initial_block_id(initial_block_id);
+        Self { encoder }
     }
 
     async fn send(
@@ -376,66 +422,28 @@ impl FecSender {
         peer: SocketAddr,
         frame: &[u8],
     ) -> Result<(), MeshError> {
-        let encoder = Encoder::with_defaults(frame, self.symbol_size);
-        let packets = encoder.get_encoded_packets(self.repair_symbols);
-        let header = FecHeader {
-            block_id: self.next_block_id,
-            transfer_length: frame.len() as u32,
-            symbol_size: self.symbol_size,
-        };
-
-        for packet in packets {
-            let packet = packet.serialize();
-            let mut out = BytesMut::with_capacity(FEC_HEADER_LEN + packet.len());
-            header.encode(&mut out);
-            out.put_slice(&packet);
-            socket.send_to(&out, peer).await?;
+        for packet in self.encoder.encode_object(frame)? {
+            socket.send_to(&packet, peer).await?;
         }
 
-        self.next_block_id = self.next_block_id.wrapping_add(1);
         Ok(())
     }
 }
 
 struct FecReceiver {
-    blocks: HashMap<(SocketAddr, u32), Decoder>,
-    completed: HashSet<(SocketAddr, u32)>,
+    decoders: HashMap<SocketAddr, DatagramFecDecoder>,
 }
 
 impl FecReceiver {
     fn new() -> Self {
         Self {
-            blocks: HashMap::new(),
-            completed: HashSet::new(),
+            decoders: HashMap::new(),
         }
     }
 
     fn push(&mut self, peer: SocketAddr, bytes: &[u8]) -> Option<Bytes> {
-        let header = FecHeader::decode(bytes)?;
-        if self.completed.contains(&(peer, header.block_id)) {
-            return None;
-        }
-        let packet = EncodingPacket::deserialize(&bytes[FEC_HEADER_LEN..]);
-        let decoder = self
-            .blocks
-            .entry((peer, header.block_id))
-            .or_insert_with(|| Decoder::new(header.oti()));
-        let decoded = decoder.decode(packet)?;
-        self.blocks.remove(&(peer, header.block_id));
-        self.completed.insert((peer, header.block_id));
-        self.prune(peer, header.block_id);
-        Some(Bytes::from(decoded))
-    }
-
-    fn prune(&mut self, peer: SocketAddr, current_block_id: u32) {
-        if current_block_id < 32 {
-            return;
-        }
-        let cutoff = current_block_id.wrapping_sub(32);
-        self.blocks
-            .retain(|(candidate_peer, block_id), _| *candidate_peer != peer || *block_id >= cutoff);
-        self.completed
-            .retain(|(candidate_peer, block_id)| *candidate_peer != peer || *block_id >= cutoff);
+        let decoder = self.decoders.entry(peer).or_default();
+        decoder.push_datagram(bytes).ok().flatten().map(Bytes::from)
     }
 }
 
@@ -444,10 +452,15 @@ async fn receive_task(
     cache: Arc<ChunkCache>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    node_id: String,
+    config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut receiver = FecReceiver::new();
+    let mut reply_sender = FecSender::with_initial_block_id(
+        config.repair_symbols,
+        config.symbol_size,
+        REQUEST_BLOCK_ID_BASE.saturating_add(1 << 20),
+    );
     let mut buf = vec![0u8; 65_536];
 
     loop {
@@ -470,10 +483,21 @@ async fn receive_task(
                 };
                 match MeshFrame::decode(&decoded) {
                     Ok(frame) => {
-                        if frame.node_id() == node_id {
+                        if frame.node_id() == config.node_id {
                             continue;
                         }
-                        handle_frame(frame, peer, &cache, &peers, &remote_slots).await;
+                        handle_frame(
+                            frame,
+                            peer,
+                            FrameHandler {
+                                socket: &socket,
+                                cache: &cache,
+                                peers: &peers,
+                                remote_slots: &remote_slots,
+                                config: &config,
+                                reply_sender: &mut reply_sender,
+                            },
+                        ).await;
                     }
                     Err(err) => warn!(peer = %peer, error = %err, "cache mesh frame decode failed"),
                 }
@@ -482,16 +506,19 @@ async fn receive_task(
     }
 }
 
-async fn handle_frame(
-    frame: MeshFrame,
-    peer: SocketAddr,
-    cache: &Arc<ChunkCache>,
-    peers: &Arc<RwLock<HashSet<SocketAddr>>>,
-    remote_slots: &Arc<RwLock<HashSet<(u64, usize)>>>,
-) {
+struct FrameHandler<'a> {
+    socket: &'a Arc<UdpSocket>,
+    cache: &'a Arc<ChunkCache>,
+    peers: &'a Arc<RwLock<HashSet<SocketAddr>>>,
+    remote_slots: &'a Arc<RwLock<HashSet<(u64, usize)>>>,
+    config: &'a CacheMeshConfig,
+    reply_sender: &'a mut FecSender,
+}
+
+async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<'_>) {
     match frame {
         MeshFrame::Hello { node_id, region } => {
-            peers.write().await.insert(peer);
+            handler.peers.write().await.insert(peer);
             debug!(node_id, region, peer = %peer, "cache mesh peer discovered");
         }
         MeshFrame::Chunk {
@@ -507,7 +534,11 @@ async fn handle_frame(
                 );
                 return;
             };
-            if let Err(err) = cache.add_for_stream_id(stream_id, slot_id, payload).await {
+            if let Err(err) = handler
+                .cache
+                .add_for_stream_id(stream_id, slot_id, payload)
+                .await
+            {
                 warn!(
                     node_id,
                     stream_id,
@@ -517,10 +548,77 @@ async fn handle_frame(
                 );
                 return;
             }
-            remote_slots.write().await.insert((stream_id, slot_id));
+            handler
+                .remote_slots
+                .write()
+                .await
+                .insert((stream_id, slot_id));
             debug!(node_id, stream_id, slot_id, "cache mesh slot applied");
         }
+        MeshFrame::ReplicaRequest {
+            node_id,
+            stream_id,
+            from_slot,
+        } => {
+            handler.peers.write().await.insert(peer);
+            if let Err(err) = serve_replica_request(
+                handler.socket,
+                handler.cache,
+                handler.reply_sender,
+                handler.config,
+                peer,
+                stream_id,
+                from_slot,
+            )
+            .await
+            {
+                debug!(
+                    requester = node_id,
+                    peer = %peer,
+                    stream_id,
+                    error = %err,
+                    "cache mesh replica request could not be served"
+                );
+            }
+        }
     }
+}
+
+async fn serve_replica_request(
+    socket: &UdpSocket,
+    cache: &ChunkCache,
+    sender: &mut FecSender,
+    config: &CacheMeshConfig,
+    peer: SocketAddr,
+    stream_id: u64,
+    from_slot: u64,
+) -> Result<usize, MeshError> {
+    let Some(stream_idx) = cache.get_stream_idx(stream_id).await else {
+        return Ok(0);
+    };
+    let Some(last) = cache.last(stream_idx) else {
+        return Ok(0);
+    };
+    let from_slot = usize::try_from(from_slot).unwrap_or(usize::MAX);
+    if from_slot > last {
+        return Ok(0);
+    }
+    let from_slot = from_slot.max(cache.retained_start(last));
+    let mut sent = 0usize;
+    for slot_id in from_slot..=last {
+        let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+            continue;
+        };
+        if hash == 0 && payload.is_empty() {
+            continue;
+        }
+        let frame = MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
+            .encode()?;
+        sender.send(socket, peer, &frame).await?;
+        sent = sent.saturating_add(1);
+    }
+    debug!(peer = %peer, stream_id, sent, "cache mesh replica request served");
+    Ok(sent)
 }
 
 async fn announce_task(
@@ -589,11 +687,13 @@ async fn sync_task(
                     let Some(last) = cache.last(stream_idx) else {
                         continue;
                     };
+                    let retained_start = cache.retained_start(last);
                     let next = sent
                         .get(&(stream_id, stream_idx))
                         .copied()
                         .and_then(|slot| slot.checked_add(1))
-                        .unwrap_or(0);
+                        .unwrap_or(retained_start)
+                        .max(retained_start);
                     if next > last {
                         continue;
                     }
@@ -656,6 +756,11 @@ mod tests {
         let encoded = frame.encode().unwrap();
         let decoded = MeshFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
+
+        let frame = MeshFrame::replica_request("jp", 42, 3);
+        let encoded = frame.encode().unwrap();
+        let decoded = MeshFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded, frame);
     }
 
     #[tokio::test]
@@ -663,11 +768,13 @@ mod tests {
         let addr_a = loopback_addr();
         let addr_b = loopback_addr();
 
-        let mut options = Options::default();
-        options.num_playlists = 4;
-        options.max_segments = 1;
-        options.max_parts_per_segment = 16;
-        options.buffer_size_kb = 4;
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
 
         let cache_a = Arc::new(ChunkCache::new(options));
         let cache_b = Arc::new(ChunkCache::new(options));
@@ -713,6 +820,67 @@ mod tests {
 
         assert!(mesh_a.peers().await.contains(&addr_b));
         assert!(mesh_b.peers().await.contains(&addr_a));
+        mesh_a.shutdown();
+        mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cache_mesh_replica_request_fetches_stream_on_demand() {
+        let addr_a = loopback_addr();
+        let addr_b = loopback_addr();
+
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+
+        let cache_a = Arc::new(ChunkCache::new(options));
+        let cache_b = Arc::new(ChunkCache::new(options));
+
+        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a).with_peer(addr_b);
+        config_a.sync_interval = Duration::from_secs(60);
+        let mut config_b = CacheMeshConfig::new("jp", "jp", addr_b).with_peer(addr_a);
+        config_b.sync_interval = Duration::from_secs(60);
+
+        let mesh_a = CacheMesh::new(Arc::clone(&cache_a), config_a)
+            .start()
+            .await
+            .unwrap();
+        let mesh_b = CacheMesh::new(Arc::clone(&cache_b), config_b)
+            .start()
+            .await
+            .unwrap();
+
+        cache_a
+            .add_for_stream_id(707, 0, Bytes::from_static(b"warm-part-0"))
+            .await
+            .unwrap();
+        cache_a
+            .add_for_stream_id(707, 1, Bytes::from_static(b"warm-part-1"))
+            .await
+            .unwrap();
+
+        let requested = mesh_b.request_replica(707, 0).await.unwrap();
+        assert_eq!(requested, 1);
+
+        timeout(Duration::from_secs(2), async {
+            let start = Instant::now();
+            loop {
+                if let Some((bytes, _hash)) = cache_b.get_for_stream_id(707, 1).await {
+                    if bytes == Bytes::from_static(b"warm-part-1") {
+                        break;
+                    }
+                }
+                assert!(start.elapsed() < Duration::from_secs(2));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
         mesh_a.shutdown();
         mesh_b.shutdown();
     }

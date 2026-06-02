@@ -52,6 +52,17 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    pub(crate) fn normalized(mut self) -> Self {
+        self.max_segments = self.max_segments.max(1);
+        self.num_playlists = self.num_playlists.max(1);
+        self.max_parts_per_segment = self.max_parts_per_segment.max(1);
+        self.max_parted_segments = self.max_parted_segments.max(1);
+        self.segment_min_ms = self.segment_min_ms.max(1);
+        self
+    }
+}
+
 pub struct Playlists {
     pub chunk_cache: Arc<ChunkCache>,
     m3u8_cache: Arc<M3u8Cache>,
@@ -62,6 +73,7 @@ pub struct Playlists {
 
 impl Playlists {
     pub fn new(options: Options) -> (Arc<Self>, Arc<ChunkCache>, Arc<M3u8Cache>) {
+        let options = options.normalized();
         let chunk_cache = Arc::new(ChunkCache::new(options));
         let m3u8_cache = Arc::new(M3u8Cache::new(options));
 
@@ -91,17 +103,7 @@ impl Playlists {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
         self.m3u8_cache.zero_stream_id(id);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let chunk_cache = Arc::clone(&self.chunk_cache);
-            let _ = handle.spawn(async move {
-                chunk_cache.zero_stream_id(id).await;
-            });
-        } else if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            rt.block_on(self.chunk_cache.zero_stream_id(id));
-        }
+        self.chunk_cache.zero_stream_id_sync(id);
     }
 
     pub fn add(&self, stream_id: u64, fmp4: Fmp4) -> bool {
@@ -122,18 +124,21 @@ impl Playlists {
                 .or_insert_with(|| M3u8Manifest::new(self.options));
             playlist.add_part(fmp4.duration, fmp4.key)
         };
+        drop(playlists);
 
         if new_seg {
             info!("PLAY:UP active={}", self.active());
+        }
+
+        if fmp4.init.is_some() {
+            let _ = self.m3u8_cache.ensure_stream_id(stream_id);
         }
 
         if let Some(init) = fmp4.init {
             let _ = self.m3u8_cache.set_init(stream_id, init);
         }
         //self.fmp4_cache.add(stream_id, seq as usize, fmp4.data);
-        let _ = self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8);
-
-        true
+        self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8).is_ok()
     }
 }
 
