@@ -3,6 +3,8 @@ use crate::Options;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 
+const GAP_DURATION_MS: u32 = 4_000;
+
 pub struct M3u8Manifest {
     dur: u32,
     seq: u32,
@@ -17,6 +19,7 @@ pub struct M3u8Manifest {
 
 impl M3u8Manifest {
     pub fn new(options: Options) -> Self {
+        let options = options.normalized();
         let seg_parts_size = options.max_segments;
         let mut seg_parts = Vec::with_capacity(seg_parts_size);
         for _ in 0..seg_parts_size {
@@ -57,7 +60,7 @@ impl M3u8Manifest {
             self.seg_dur = 0;
             self.idx = 0;
 
-            let seg_index = (self.seg_id as usize % self.options.max_segments as usize) as usize;
+            let seg_index = self.seg_id as usize % self.options.max_segments;
             self.seg_parts[seg_index].clear();
             new_seg = true;
         }
@@ -66,7 +69,7 @@ impl M3u8Manifest {
         self.seq += 1;
         self.dur += duration;
         self.seg_dur += duration;
-        let seg_index = (self.seg_id as usize % self.options.max_segments as usize) as usize;
+        let seg_index = self.seg_id as usize % self.options.max_segments;
 
         self.seg_parts[seg_index].push((self.seq, duration, key));
 
@@ -91,8 +94,9 @@ impl M3u8Manifest {
         if segs.len() < 7 {
             for _ in 0..(7 - segs.len()) {
                 gaps += 1;
-                ps.push_str("#EXT-X-GAP\n#EXTINF:4.00000,\ngap.mp4\n");
-                pt += Duration::milliseconds(1000);
+                let secs = GAP_DURATION_MS as f64 / 1000.0;
+                ps.push_str(&format!("#EXT-X-GAP\n#EXTINF:{secs:.5},\ngap.mp4\n"));
+                pt += Duration::milliseconds(GAP_DURATION_MS as i64);
             }
         }
 
@@ -101,7 +105,7 @@ impl M3u8Manifest {
         for (i, seg) in segs.iter().enumerate() {
             if gaps + i <= 4 {
                 let secs = seg.1 as f64 / 1000.0;
-                ps.push_str(&format!("#EXTINF:{:.5},\n", secs));
+                ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
             } else {
@@ -109,10 +113,10 @@ impl M3u8Manifest {
                     "#EXT-X-PROGRAM-DATE-TIME:{}\n",
                     pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 ));
-                for p in &self.seg_parts[seg.0 as usize % self.options.max_segments as usize] {
+                for p in &self.seg_parts[seg.0 as usize % self.options.max_segments] {
                     durs.push(p.1);
                     let secs = p.1 as f64 / 1000.0;
-                    let mut str = format!("#EXT-X-PART:DURATION={:.5},URI=\"p{}.mp4\"", secs, p.0);
+                    let mut str = format!("#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"", p.0);
                     if p.2 {
                         str += ",INDEPENDENT=YES\n"
                     } else {
@@ -121,18 +125,18 @@ impl M3u8Manifest {
                     ps.push_str(&str);
                 }
                 let secs = seg.1 as f64 / 1000.0;
-                ps.push_str(&format!("#EXTINF:{:.5},\n", secs));
+                ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
             }
         }
 
         let mut id = 0;
-        let seg_index = (self.seg_id as usize % self.options.max_segments as usize) as usize;
+        let seg_index = self.seg_id as usize % self.options.max_segments;
         for p in &self.seg_parts[seg_index] {
             durs.push(p.1);
             let secs = p.1 as f64 / 1000.0;
-            let mut str = format!("#EXT-X-PART:DURATION={:.5},URI=\"p{}.mp4\"", secs, p.0);
+            let mut str = format!("#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"", p.0);
             if p.2 {
                 str += ",INDEPENDENT=YES\n"
             } else {
@@ -149,9 +153,15 @@ impl M3u8Manifest {
 
         let target_duration = segs
             .iter()
-            .map(|(_, duration)| (*duration as f64 / 1000.0).round() as u32)
+            .map(|(_, duration)| ms_to_target_duration(*duration))
             .max()
-            .unwrap_or(0);
+            .unwrap_or_else(|| ms_to_target_duration(self.options.segment_min_ms))
+            .max(if gaps > 0 {
+                ms_to_target_duration(GAP_DURATION_MS)
+            } else {
+                1
+            })
+            .max(1);
 
         let mut duration_counts = std::collections::HashMap::new();
         for parts in &self.seg_parts {
@@ -160,15 +170,20 @@ impl M3u8Manifest {
             }
         }
 
-        let max_duration = durs.iter().max().cloned().unwrap_or(0);
+        let max_duration = durs
+            .iter()
+            .max()
+            .cloned()
+            .unwrap_or(self.options.segment_min_ms)
+            .max(1);
         let part_target = max_duration as f64 / 1000.0;
 
-        let part_hold_back = part_target * 3 as f64;
+        let part_hold_back = part_target * 3_f64;
         let can_skip_until = target_duration * 6;
 
         ph.push_str("#EXTM3U\n");
         ph.push_str("#EXT-X-VERSION:9\n");
-        ph.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
+        ph.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
 
         ph.push_str(&format!(
             "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5},CAN-SKIP-UNTIL={:.5}\n",
@@ -179,10 +194,29 @@ impl M3u8Manifest {
         if self.seg_id > 7 {
             seq = self.seg_id - 7
         }
-        ph.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={:.5}\n", part_target));
-        ph.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", seq));
+        ph.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={part_target:.5}\n"));
+        ph.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
         ph.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
 
-        format!("{}{}", ph, ps).into()
+        format!("{ph}{ps}").into()
+    }
+}
+
+fn ms_to_target_duration(ms: u32) -> u32 {
+    u64::from(ms).div_ceil(1000).max(1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_live_manifest_has_valid_positive_targets() {
+        let manifest = String::from_utf8(M3u8Manifest::new(Options::default()).m3u8().to_vec())
+            .expect("manifest utf8");
+
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:4"));
+        assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=1.50000"));
+        assert!(manifest.contains("PART-HOLD-BACK=4.50000"));
     }
 }

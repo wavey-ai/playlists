@@ -1,43 +1,66 @@
 use crate::Options;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
+const EMPTY_LAST: usize = usize::MAX;
+
 pub struct ChunkCache {
     buffer: Vec<RwLock<Bytes>>,
+    slot_ids: Vec<AtomicUsize>,
+    slot_generations: Vec<AtomicUsize>,
+    slot_hashes: Vec<AtomicU64>,
     idxs: Vec<AtomicUsize>,
-    offsets: RwLock<HashMap<u64, usize>>,
+    next_ids: Vec<AtomicUsize>,
+    generations: Vec<AtomicUsize>,
+    offsets: StdRwLock<HashMap<u64, usize>>,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
-    new_playlist_rx: Mutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
+    new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
     pub options: Options,
 }
 
 impl ChunkCache {
     pub fn new(options: Options) -> Self {
+        let options = options.normalized();
         let num_playlists: usize = options.num_playlists;
 
-        let buffer_size_bytes = options.buffer_size_kb * 1024;
-        let buffer_repeat_value = Bytes::from(vec![0u8; buffer_size_bytes]);
-        let buffer_size =
-            options.num_playlists * options.max_parts_per_segment * options.max_segments;
+        let buffer_size = options
+            .num_playlists
+            .checked_mul(options.max_parts_per_segment)
+            .and_then(|n| n.checked_mul(options.max_segments))
+            .expect("chunk cache buffer size overflow");
         let buffer = (0..buffer_size)
-            .map(|_| RwLock::new(buffer_repeat_value.clone()))
+            .map(|_| RwLock::new(Bytes::new()))
             .collect();
-        let idxs = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
+        let slot_ids = (0..buffer_size)
+            .map(|_| AtomicUsize::new(EMPTY_LAST))
+            .collect();
+        let slot_generations = (0..buffer_size).map(|_| AtomicUsize::new(0)).collect();
+        let slot_hashes = (0..buffer_size).map(|_| AtomicU64::new(0)).collect();
+        let idxs = (0..num_playlists)
+            .map(|_| AtomicUsize::new(EMPTY_LAST))
+            .collect();
+        let next_ids = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
+        let generations = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
         let (new_playlist_tx, new_playlist_rx) = mpsc::unbounded_channel();
 
         Self {
             buffer,
+            slot_ids,
+            slot_generations,
+            slot_hashes,
             idxs,
-            offsets: RwLock::new(HashMap::new()),
+            next_ids,
+            generations,
+            offsets: StdRwLock::new(HashMap::new()),
             idx: AtomicUsize::new(0),
             new_playlist_tx,
-            new_playlist_rx: Mutex::new(Some(new_playlist_rx)),
+            new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
             options,
         }
     }
@@ -55,12 +78,19 @@ impl ChunkCache {
     }
 
     pub async fn add_stream_id(&self, stream_id: u64) -> usize {
-        let mut lock = self.offsets.write().await;
+        let mut lock = self.offsets.write().unwrap();
         if let Some(idx) = lock.get(&stream_id).copied() {
             return idx;
         }
 
         let idx = self.idx.fetch_add(1, Ordering::SeqCst) % self.options.num_playlists;
+        if let Some(previous_stream_id) = lock
+            .iter()
+            .find_map(|(candidate, mapped_idx)| (*mapped_idx == idx).then_some(*candidate))
+        {
+            lock.remove(&previous_stream_id);
+        }
+        self.reset_stream_idx(idx);
         lock.insert(stream_id, idx);
         drop(lock);
         let _ = self.new_playlist_tx.send((stream_id, idx));
@@ -68,12 +98,12 @@ impl ChunkCache {
     }
 
     pub async fn get_stream_idx(&self, stream_id: u64) -> Option<usize> {
-        let lock = self.offsets.read().await;
+        let lock = self.offsets.read().unwrap();
         lock.get(&stream_id).copied()
     }
 
     pub async fn stream_ids(&self) -> Vec<(u64, usize)> {
-        let lock = self.offsets.read().await;
+        let lock = self.offsets.read().unwrap();
         lock.iter()
             .map(|(stream_id, idx)| (*stream_id, *idx))
             .collect()
@@ -85,63 +115,73 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<usize, &'static str> {
-        let stream_idx = self.get_or_create_stream_idx(stream_id).await;
-        self.add(stream_idx, id, data_bytes).await?;
+        let _ = self.get_or_create_stream_idx(stream_id).await;
+        let (stream_idx, generation) = self
+            .stream_generation_for_id(stream_id)
+            .ok_or("Stream not found")?;
+        self.add_with_generation(stream_idx, generation, id, data_bytes)
+            .await?;
         Ok(stream_idx)
     }
 
     pub async fn get_for_stream_id(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
-        let stream_idx = self.get_stream_idx(stream_id).await?;
-        self.get(stream_idx, id).await
+        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
+        self.get_with_generation(stream_idx, generation, id).await
     }
 
     pub async fn set(&self, stream_idx: usize, id: usize, data: Bytes) -> Result<(), &'static str> {
-        let h = const_xxh3(&data);
-        let mut packet = BytesMut::new();
-        packet.put_u32(data.len() as u32);
-        packet.put_u64(h);
-        packet.put(data);
+        let generation = self
+            .generation(stream_idx)
+            .ok_or("Stream index out of bounds")?;
+        self.set_with_generation(stream_idx, generation, id, data)
+            .await
+    }
 
-        let idx = self.offset(stream_idx, id);
+    async fn set_with_generation(
+        &self,
+        stream_idx: usize,
+        generation: usize,
+        id: usize,
+        data: Bytes,
+    ) -> Result<(), &'static str> {
+        let idx = self
+            .offset(stream_idx, id)
+            .ok_or("Stream index out of bounds")?;
+        let h = const_xxh3(&data);
+
         let mut lock = self.buffer[idx].write().await;
-        *lock = packet.freeze();
+        *lock = data;
+        self.slot_ids[idx].store(id, Ordering::Release);
+        self.slot_generations[idx].store(generation, Ordering::Release);
+        self.slot_hashes[idx].store(h, Ordering::Release);
         Ok(())
     }
 
-    fn get_bytes(&self, data: &Bytes) -> Result<(Bytes, u64), &'static str> {
-        if data.len() < 12 {
-            return Err("Invalid data format");
-        }
-        let data_size = u32::from_be_bytes(data[0..4].try_into().unwrap());
-        let h = u64::from_be_bytes(data[4..12].try_into().unwrap());
-        if data.len() < 12 + data_size as usize {
-            return Err("Invalid data size");
-        }
-        let payload = data.slice(12..12 + data_size as usize);
-        Ok((payload, h))
+    pub async fn zero_stream_id(&self, stream_id: u64) {
+        self.zero_stream_id_sync(stream_id);
     }
 
-    pub async fn zero_stream_id(&self, stream_id: u64) {
-        let mut offsets_lock = self.offsets.write().await;
+    pub fn zero_stream_id_sync(&self, stream_id: u64) {
+        let mut offsets_lock = self.offsets.write().unwrap();
         if let Some(offset) = offsets_lock.remove(&stream_id) {
-            let sub_buffer_size = self.options.max_parts_per_segment * self.options.max_segments;
-            let start_idx = offset * sub_buffer_size;
-            let end_idx = start_idx + sub_buffer_size;
-            drop(offsets_lock);
-
-            for idx in start_idx..end_idx {
-                let mut buffer_lock = self.buffer[idx].write().await;
-                *buffer_lock = Bytes::from(vec![0u8; self.options.buffer_size_kb * 1024]);
-            }
+            self.reset_stream_idx(offset);
         }
     }
 
     pub async fn append(&self, stream_idx: usize, data_bytes: Bytes) -> Result<(), &'static str> {
-        if let Some(idx) = self.last(stream_idx) {
-            self.add(stream_idx, idx + 1, data_bytes).await
-        } else {
-            self.add(stream_idx, 1, data_bytes).await
+        let generation = self
+            .generation(stream_idx)
+            .ok_or("Stream index out of bounds")?;
+        let next_id = self
+            .next_ids
+            .get(stream_idx)
+            .ok_or("Stream index out of bounds")?;
+        let id = next_id.fetch_add(1, Ordering::AcqRel);
+        if id == EMPTY_LAST {
+            return Err("Stream id overflow");
         }
+        self.add_with_generation(stream_idx, generation, id, data_bytes)
+            .await
     }
 
     pub async fn add(
@@ -150,8 +190,27 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<(), &'static str> {
-        self.set(stream_idx, id, data_bytes).await?;
-        self.idxs[stream_idx].store(id, Ordering::Release);
+        let generation = self
+            .generation(stream_idx)
+            .ok_or("Stream index out of bounds")?;
+        self.add_with_generation(stream_idx, generation, id, data_bytes)
+            .await
+    }
+
+    async fn add_with_generation(
+        &self,
+        stream_idx: usize,
+        generation: usize,
+        id: usize,
+        data_bytes: Bytes,
+    ) -> Result<(), &'static str> {
+        self.set_with_generation(stream_idx, generation, id, data_bytes)
+            .await?;
+        if self.generation(stream_idx) != Some(generation) {
+            return Err("Stream index changed");
+        }
+        self.advance_next_id(stream_idx, id.saturating_add(1));
+        self.publish_last(stream_idx, id);
 
         Ok(())
     }
@@ -167,31 +226,108 @@ impl ChunkCache {
     }
 
     pub fn last(&self, stream_idx: usize) -> Option<usize> {
-        let val = self.idxs[stream_idx].load(Ordering::Acquire);
-
-        Some(val)
+        let val = self.idxs.get(stream_idx)?.load(Ordering::Acquire);
+        (val != EMPTY_LAST).then_some(val)
     }
 
     pub async fn get(&self, stream_idx: usize, id: usize) -> Option<(Bytes, u64)> {
-        if let Some(last) = self.last(stream_idx) {
-            if id > last {
-                return None;
-            }
-        } else {
-            return None;
-        }
-
-        let idx = self.offset(stream_idx, id);
-        let bytes = self.buffer[idx].read().await;
-        self.get_bytes(&bytes).ok()
+        let generation = self.generation(stream_idx)?;
+        self.get_with_generation(stream_idx, generation, id).await
     }
 
-    fn offset(&self, stream_idx: usize, id: usize) -> usize {
+    async fn get_with_generation(
+        &self,
+        stream_idx: usize,
+        generation: usize,
+        id: usize,
+    ) -> Option<(Bytes, u64)> {
+        let idx = self.offset(stream_idx, id)?;
+        let bytes = self.buffer[idx].read().await;
+        let stored_id = self.slot_ids[idx].load(Ordering::Acquire);
+        let stored_generation = self.slot_generations[idx].load(Ordering::Acquire);
+        let hash = self.slot_hashes[idx].load(Ordering::Acquire);
+        if stored_id == id && stored_generation == generation {
+            Some((bytes.clone(), hash))
+        } else {
+            None
+        }
+    }
+
+    pub fn retained_start(&self, last: usize) -> usize {
+        last.saturating_sub(self.stream_capacity().saturating_sub(1))
+    }
+
+    fn stream_capacity(&self) -> usize {
+        self.options.max_parts_per_segment * self.options.max_segments
+    }
+
+    fn generation(&self, stream_idx: usize) -> Option<usize> {
+        self.generations
+            .get(stream_idx)
+            .map(|generation| generation.load(Ordering::Acquire))
+    }
+
+    fn stream_generation_for_id(&self, stream_id: u64) -> Option<(usize, usize)> {
+        let lock = self.offsets.read().unwrap();
+        let stream_idx = lock.get(&stream_id).copied()?;
+        let generation = self.generation(stream_idx)?;
+        Some((stream_idx, generation))
+    }
+
+    fn reset_stream_idx(&self, stream_idx: usize) {
+        if let Some(last) = self.idxs.get(stream_idx) {
+            last.store(EMPTY_LAST, Ordering::Release);
+        }
+        if let Some(next_id) = self.next_ids.get(stream_idx) {
+            next_id.store(1, Ordering::Release);
+        }
+        if let Some(generation) = self.generations.get(stream_idx) {
+            let next = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            if next == 0 {
+                generation.store(1, Ordering::Release);
+            }
+        }
+    }
+
+    fn offset(&self, stream_idx: usize, id: usize) -> Option<usize> {
+        if stream_idx >= self.options.num_playlists {
+            return None;
+        }
         let sub_buffer_size = self.options.max_parts_per_segment * self.options.max_segments;
         stream_idx
             .checked_mul(sub_buffer_size)
             .and_then(|result| result.checked_add(id % sub_buffer_size))
-            .unwrap_or(0)
+            .filter(|idx| *idx < self.buffer.len())
+    }
+
+    fn advance_next_id(&self, stream_idx: usize, next: usize) {
+        let Some(next_id) = self.next_ids.get(stream_idx) else {
+            return;
+        };
+        let mut current = next_id.load(Ordering::Acquire);
+        while current < next {
+            match next_id.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn publish_last(&self, stream_idx: usize, id: usize) {
+        let Some(last) = self.idxs.get(stream_idx) else {
+            return;
+        };
+        let mut current = last.load(Ordering::Acquire);
+        loop {
+            if current != EMPTY_LAST && current >= id {
+                return;
+            }
+            match last.compare_exchange_weak(current, id, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -209,10 +345,7 @@ mod tests {
         const NUM_READERS: usize = 1;
         const STREAM_ID: u64 = 1;
 
-        println!(
-            "Starting max read test for {}s, {} readers",
-            TEST_DURATION_SECS, NUM_READERS
-        );
+        println!("Starting max read test for {TEST_DURATION_SECS}s, {NUM_READERS} readers");
 
         let options = Options::default();
         let cache = Arc::new(ChunkCache::new(options));
@@ -229,7 +362,7 @@ mod tests {
             let handle = task::spawn(async move {
                 let start = Instant::now();
                 while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                    if let Some(_) = cache_clone.last(stream_idx) {
+                    if cache_clone.last(stream_idx).is_some() {
                         read_count_clone.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -270,10 +403,10 @@ mod tests {
         let writes_per_sec = total_writes as f64 / TEST_DURATION_SECS as f64;
 
         println!("\n=== Test Results ===");
-        println!("Total reads: {}", total_reads);
-        println!("Total writes: {}", total_writes);
-        println!("Reads/second: {:.2}", reads_per_sec);
-        println!("Writes/second: {:.2}", writes_per_sec);
+        println!("Total reads: {total_reads}");
+        println!("Total writes: {total_writes}");
+        println!("Reads/second: {reads_per_sec:.2}");
+        println!("Writes/second: {writes_per_sec:.2}");
         println!(
             "Average reads per write: {:.2}",
             total_reads as f64 / (total_writes as f64).max(1.0)
@@ -287,14 +420,15 @@ mod tests {
 
         println!("\n=== Concurrent ChunkCache Benchmark ===");
         println!(
-            "Duration: {}s, Streams: {} (1 writer + 2 readers each)",
-            TEST_DURATION_SECS, NUM_STREAMS
+            "Duration: {TEST_DURATION_SECS}s, Streams: {NUM_STREAMS} (1 writer + 2 readers each)"
         );
 
-        let mut options = Options::default();
-        options.num_playlists = NUM_STREAMS;
-        options.buffer_size_kb = 64;
-        options.max_parts_per_segment = 10000;
+        let options = Options {
+            num_playlists: NUM_STREAMS,
+            buffer_size_kb: 64,
+            max_parts_per_segment: 10000,
+            ..Options::default()
+        };
         let cache = Arc::new(ChunkCache::new(options));
 
         let read_count = Arc::new(AtomicU64::new(0));
@@ -375,16 +509,10 @@ mod tests {
             (total_write_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
 
         println!("\n=== Results ===");
-        println!("Writers: {} streams", NUM_STREAMS);
+        println!("Writers: {NUM_STREAMS} streams");
         println!("Readers: {} total ({} per stream)", NUM_STREAMS * 2, 2);
-        println!(
-            "Write: {:.0}/s ({:.0} MB/s)",
-            writes_per_sec, write_throughput_mb
-        );
-        println!(
-            "Read:  {:.0}/s ({:.0} MB/s)",
-            reads_per_sec, read_throughput_mb
-        );
+        println!("Write: {writes_per_sec:.0}/s ({write_throughput_mb:.0} MB/s)");
+        println!("Read:  {reads_per_sec:.0}/s ({read_throughput_mb:.0} MB/s)");
         println!(
             "Combined throughput: {:.0} MB/s",
             read_throughput_mb + write_throughput_mb
@@ -398,10 +526,7 @@ mod tests {
         const STREAM_ID: u64 = 1;
 
         println!("\n=== Massive Concurrent Reads Benchmark ===");
-        println!(
-            "Duration: {}s, Readers: {}, Writers: 1",
-            TEST_DURATION_SECS, NUM_READERS
-        );
+        println!("Duration: {TEST_DURATION_SECS}s, Readers: {NUM_READERS}, Writers: 1");
 
         let options = Options::default();
         let cache = Arc::new(ChunkCache::new(options));
@@ -440,10 +565,16 @@ mod tests {
                 let start = Instant::now();
                 let mut slot = 1usize;
                 while start.elapsed().as_secs() < TEST_DURATION_SECS {
+                    if let Some(last) = cache_clone.last(stream_idx) {
+                        let retained_start = cache_clone.retained_start(last);
+                        if slot < retained_start || slot > last {
+                            slot = retained_start;
+                        }
+                    }
                     if cache_clone.get(stream_idx, slot).await.is_some() {
                         read_count_clone.fetch_add(1, Ordering::Relaxed);
                     }
-                    slot = (slot % 100) + 1;
+                    slot = slot.saturating_add(1);
                 }
             }));
         }
@@ -457,13 +588,12 @@ mod tests {
         let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
 
         println!("\n=== Results ===");
-        println!("Concurrent readers: {}", NUM_READERS);
+        println!("Concurrent readers: {NUM_READERS}");
         println!(
-            "Total reads: {} ({:.1}M/s)",
-            total_reads,
+            "Total reads: {total_reads} ({:.1}M/s)",
             reads_per_sec / 1_000_000.0
         );
-        println!("Total writes: {}", total_writes);
+        println!("Total writes: {total_writes}");
         println!(
             "Reads per reader: {:.0}",
             total_reads as f64 / NUM_READERS as f64
@@ -540,5 +670,114 @@ mod tests {
 
         assert_eq!(stream_id, 9);
         assert_eq!(notified_idx, second_idx);
+    }
+
+    #[tokio::test]
+    async fn old_logical_ids_do_not_read_overwritten_slots() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 2,
+            ..Options::default()
+        };
+        let cache = ChunkCache::new(options);
+        let stream_idx = cache.add_stream_id(1).await;
+
+        cache
+            .add(stream_idx, 0, Bytes::from_static(b"slot-0"))
+            .await
+            .unwrap();
+        cache
+            .add(stream_idx, 1, Bytes::from_static(b"slot-1"))
+            .await
+            .unwrap();
+        cache
+            .add(stream_idx, 2, Bytes::from_static(b"slot-2"))
+            .await
+            .unwrap();
+
+        assert!(cache.get(stream_idx, 0).await.is_none());
+        assert_eq!(
+            cache.get(stream_idx, 2).await.unwrap().0,
+            Bytes::from_static(b"slot-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_stream_slot_does_not_expose_previous_stream_data() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        };
+        let cache = ChunkCache::new(options);
+
+        let first_idx = cache.add_stream_id(1).await;
+        cache
+            .add_for_stream_id(1, 0, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+
+        let second_idx = cache.add_stream_id(2).await;
+        assert_eq!(first_idx, second_idx);
+        assert!(cache.get_for_stream_id(1, 0).await.is_none());
+        assert!(cache.get_for_stream_id(2, 0).await.is_none());
+
+        cache
+            .add_for_stream_id(2, 0, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_for_stream_id(2, 0).await.unwrap().0,
+            Bytes::from_static(b"second")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stream_idx_is_rejected_without_panic() {
+        let cache = ChunkCache::new(Options::default());
+
+        assert!(cache.last(usize::MAX).is_none());
+        assert!(cache.get(usize::MAX, 0).await.is_none());
+        assert!(cache
+            .add(usize::MAX, 0, Bytes::from_static(b"bad"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_publish_unique_monotonic_ids() {
+        const WRITERS: usize = 8;
+        const WRITES_PER_WRITER: usize = 32;
+
+        let cache = Arc::new(ChunkCache::new(Options::default()));
+        let stream_idx = cache.add_stream_id(1).await;
+        let mut handles = Vec::new();
+
+        for _ in 0..WRITERS {
+            let cache = Arc::clone(&cache);
+            handles.push(task::spawn(async move {
+                for _ in 0..WRITES_PER_WRITER {
+                    cache
+                        .append(stream_idx, Bytes::from_static(b"part"))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let expected_last = WRITERS * WRITES_PER_WRITER;
+        assert_eq!(cache.last(stream_idx), Some(expected_last));
+        for id in 1..=expected_last {
+            assert_eq!(
+                cache.get(stream_idx, id).await.unwrap().0,
+                Bytes::from_static(b"part")
+            );
+        }
     }
 }

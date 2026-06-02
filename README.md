@@ -26,7 +26,7 @@ blocking I/O.
 
 ChunkCache layout
     num_playlists × max_segments × max_parts_per_segment slots
-        slot = size(u32) | hash(u64) | payload
+        slot = atomic logical id + atomic generation + atomic hash + payload
 
 M3u8Cache layout
     identical shape, but payload is gzip-compressed playlist data
