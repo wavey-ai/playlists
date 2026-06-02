@@ -122,7 +122,7 @@ impl Playlists {
             let playlist: &mut M3u8Manifest = playlists
                 .entry(stream_id)
                 .or_insert_with(|| M3u8Manifest::new(self.options));
-            playlist.add_part(fmp4.duration, fmp4.key)
+            playlist.add_part_with_byte_len(fmp4.duration, fmp4.key, fmp4.data.len())
         };
         drop(playlists);
 

@@ -5,13 +5,34 @@ use chrono::{DateTime, Duration, Utc};
 
 const GAP_DURATION_MS: u32 = 4_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaByteRange {
+    pub length: u64,
+    pub offset: u64,
+}
+
+impl MediaByteRange {
+    pub fn new(length: u64, offset: u64) -> Option<Self> {
+        (length > 0).then_some(Self { length, offset })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PartInfo {
+    sequence: u32,
+    duration_ms: u32,
+    independent: bool,
+    byte_range: Option<MediaByteRange>,
+}
+
 pub struct M3u8Manifest {
     dur: u32,
     seq: u32,
     seg_dur: u32,
+    seg_byte_len: u64,
     seg_id: u32,
     seg_durs: Vec<u32>,
-    seg_parts: Vec<Vec<(u32, u32, bool)>>,
+    seg_parts: Vec<Vec<PartInfo>>,
     start_time: DateTime<Utc>,
     idx: u32,
     options: Options,
@@ -30,6 +51,7 @@ impl M3u8Manifest {
             dur: 0,
             seq: 0,
             seg_dur: 0,
+            seg_byte_len: 0,
             seg_id: 1,
             seg_durs: Vec::new(),
             seg_parts,
@@ -69,11 +91,40 @@ impl M3u8Manifest {
     }
 
     pub fn add_part(&mut self, duration: u32, key: bool) -> (Bytes, usize, usize, usize, bool) {
+        self.add_part_with_byte_range(duration, key, None)
+    }
+
+    pub fn add_part_with_byte_len(
+        &mut self,
+        duration: u32,
+        key: bool,
+        byte_len: usize,
+    ) -> (Bytes, usize, usize, usize, bool) {
+        self.add_part_inner(duration, key, None, Some(byte_len as u64))
+    }
+
+    pub fn add_part_with_byte_range(
+        &mut self,
+        duration: u32,
+        key: bool,
+        byte_range: Option<MediaByteRange>,
+    ) -> (Bytes, usize, usize, usize, bool) {
+        self.add_part_inner(duration, key, byte_range, None)
+    }
+
+    fn add_part_inner(
+        &mut self,
+        duration: u32,
+        key: bool,
+        byte_range: Option<MediaByteRange>,
+        byte_len: Option<u64>,
+    ) -> (Bytes, usize, usize, usize, bool) {
         let mut new_seg = false;
         if key && (self.seg_dur) >= self.options.segment_min_ms {
             self.seg_durs.push(self.seg_dur);
             self.seg_id += 1;
             self.seg_dur = 0;
+            self.seg_byte_len = 0;
             self.idx = 0;
 
             let seg_index = self.seg_id as usize % self.options.max_segments;
@@ -85,9 +136,20 @@ impl M3u8Manifest {
         self.seq += 1;
         self.dur += duration;
         self.seg_dur += duration;
+        let byte_range = byte_range.or_else(|| MediaByteRange::new(byte_len?, self.seg_byte_len));
+        if let Some(range) = byte_range {
+            self.seg_byte_len = self
+                .seg_byte_len
+                .max(range.offset.saturating_add(range.length));
+        }
         let seg_index = self.seg_id as usize % self.options.max_segments;
 
-        self.seg_parts[seg_index].push((self.seq, duration, key));
+        self.seg_parts[seg_index].push(PartInfo {
+            sequence: self.seq,
+            duration_ms: duration,
+            independent: key,
+            byte_range,
+        });
 
         (
             self.m3u8(),
@@ -121,9 +183,11 @@ impl M3u8Manifest {
         let mut durs = Vec::new();
 
         for (i, seg) in segs.iter().enumerate() {
+            let segment_parts = &self.seg_parts[seg.0 as usize % self.options.max_segments];
             if gaps + i <= 4 {
                 let secs = seg.1 as f64 / 1000.0;
                 ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
+                append_segment_byte_range(&mut ps, segment_parts);
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
                 segment_durations.push(seg.1);
@@ -132,19 +196,13 @@ impl M3u8Manifest {
                     "#EXT-X-PROGRAM-DATE-TIME:{}\n",
                     pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 ));
-                for p in &self.seg_parts[seg.0 as usize % self.options.max_segments] {
-                    durs.push(p.1);
-                    let secs = p.1 as f64 / 1000.0;
-                    let mut str = format!("#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"", p.0);
-                    if p.2 {
-                        str += ",INDEPENDENT=YES\n"
-                    } else {
-                        str += "\n"
-                    }
-                    ps.push_str(&str);
+                for p in segment_parts {
+                    durs.push(p.duration_ms);
+                    append_part_line(&mut ps, seg.0, p);
                 }
                 let secs = seg.1 as f64 / 1000.0;
                 ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
+                append_segment_byte_range(&mut ps, segment_parts);
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
                 segment_durations.push(seg.1);
@@ -154,16 +212,9 @@ impl M3u8Manifest {
         let mut open_parent_duration_ms = 0_u32;
         let seg_index = self.seg_id as usize % self.options.max_segments;
         for p in &self.seg_parts[seg_index] {
-            durs.push(p.1);
-            open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.1);
-            let secs = p.1 as f64 / 1000.0;
-            let mut str = format!("#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"", p.0);
-            if p.2 {
-                str += ",INDEPENDENT=YES\n"
-            } else {
-                str += "\n"
-            }
-            ps.push_str(&str);
+            durs.push(p.duration_ms);
+            open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.duration_ms);
+            append_part_line(&mut ps, self.seg_id, p);
         }
 
         let target_duration = segs
@@ -180,8 +231,8 @@ impl M3u8Manifest {
 
         let mut duration_counts = std::collections::HashMap::new();
         for parts in &self.seg_parts {
-            for &(_, duration, _) in parts {
-                *duration_counts.entry(duration).or_insert(0) += 1;
+            for part in parts {
+                *duration_counts.entry(part.duration_ms).or_insert(0) += 1;
             }
         }
 
@@ -233,6 +284,44 @@ impl M3u8Manifest {
 
         format!("{ph}{ps}").into()
     }
+}
+
+fn append_part_line(playlist: &mut String, segment_id: u32, part: &PartInfo) {
+    let secs = part.duration_ms as f64 / 1000.0;
+    let mut line = if let Some(byte_range) = part.byte_range {
+        format!(
+            "#EXT-X-PART:DURATION={secs:.5},URI=\"s{segment_id}.mp4\",BYTERANGE=\"{}@{}\"",
+            byte_range.length, byte_range.offset
+        )
+    } else {
+        format!(
+            "#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"",
+            part.sequence
+        )
+    };
+    if part.independent {
+        line.push_str(",INDEPENDENT=YES");
+    }
+    line.push('\n');
+    playlist.push_str(&line);
+}
+
+fn append_segment_byte_range(playlist: &mut String, parts: &[PartInfo]) {
+    let Some((offset, length)) = segment_byte_range(parts) else {
+        return;
+    };
+    if length > 0 {
+        playlist.push_str(&format!("#EXT-X-BYTERANGE:{length}@{offset}\n"));
+    }
+}
+
+fn segment_byte_range(parts: &[PartInfo]) -> Option<(u64, u64)> {
+    let first = parts.first()?.byte_range?;
+    let end = parts.iter().try_fold(first.offset, |_, part| {
+        let range = part.byte_range?;
+        Some(range.offset.saturating_add(range.length))
+    })?;
+    Some((first.offset, end.saturating_sub(first.offset)))
 }
 
 fn ms_to_target_duration(ms: u32) -> u32 {
@@ -348,5 +437,25 @@ mod tests {
             assert!(line.contains("DURATION="));
             assert!(line.contains("URI=\"p"));
         }
+    }
+
+    #[test]
+    fn emits_raw_media_byte_ranges_when_part_sizes_are_known() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 10,
+            segment_min_ms: 200,
+            ..Options::default()
+        });
+
+        manifest.add_part_with_byte_len(100, true, 120);
+        manifest.add_part_with_byte_len(100, false, 80);
+        manifest.add_part_with_byte_len(100, true, 40);
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+
+        assert!(playlist.contains("URI=\"s1.mp4\",BYTERANGE=\"120@0\",INDEPENDENT=YES"));
+        assert!(playlist.contains("URI=\"s1.mp4\",BYTERANGE=\"80@120\""));
+        assert!(playlist.contains("#EXT-X-BYTERANGE:200@0\ns1.mp4"));
+        assert!(playlist.contains("URI=\"s2.mp4\",BYTERANGE=\"40@0\",INDEPENDENT=YES"));
     }
 }
