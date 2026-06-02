@@ -621,9 +621,14 @@ fn parse_media_timeline(lines: &[&str]) -> (Vec<MediaSegmentBlock>, usize, u64) 
 }
 
 fn is_segment_scoped_tag(line: &str) -> bool {
-    line.starts_with("#EXT-X-GAP")
-        || line.starts_with("#EXT-X-PROGRAM-DATE-TIME:")
+    line.starts_with("#EXT-X-BITRATE:")
+        || line.starts_with("#EXT-X-BYTERANGE:")
+        || line.starts_with("#EXT-X-DISCONTINUITY")
+        || line.starts_with("#EXT-X-GAP")
+        || line.starts_with("#EXT-X-KEY:")
+        || line.starts_with("#EXT-X-MAP:")
         || line.starts_with("#EXT-X-PART:")
+        || line.starts_with("#EXT-X-PROGRAM-DATE-TIME:")
 }
 
 fn is_uri_line(line: &str) -> bool {
@@ -763,6 +768,47 @@ mod tests {
         assert!(!delta.contains("s5.mp4"));
         assert!(delta.contains("s6.mp4"));
         assert!(delta.contains("#EXT-X-PART:"));
+    }
+
+    #[test]
+    fn delta_update_preserves_state_for_first_retained_segment() {
+        let playlist = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:9\n",
+            "#EXT-X-TARGETDURATION:1\n",
+            "#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=3.00000\n",
+            "#EXT-X-MEDIA-SEQUENCE:1\n",
+            "#EXTINF:1.00000,\n",
+            "s1.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s2.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s3.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s4.mp4\n",
+            "#EXT-X-DISCONTINUITY\n",
+            "#EXT-X-MAP:URI=\"init5.mp4\"\n",
+            "#EXT-X-KEY:METHOD=NONE\n",
+            "#EXT-X-BITRATE:800\n",
+            "#EXT-X-BYTERANGE:10@40\n",
+            "#EXTINF:1.00000,\n",
+            "s5.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s6.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s7.mp4\n",
+            "#EXTINF:1.00000,\n",
+            "s8.mp4\n",
+        );
+
+        let delta = playlist_delta_update(playlist).expect("delta update");
+
+        assert!(delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=4"));
+        assert!(!delta.contains("s4.mp4"));
+        assert!(delta.contains("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init5.mp4\""));
+        assert!(delta.contains("#EXT-X-KEY:METHOD=NONE"));
+        assert!(delta.contains("#EXT-X-BITRATE:800"));
+        assert!(delta.contains("#EXT-X-BYTERANGE:10@40\n#EXTINF:1.00000,\ns5.mp4"));
     }
 
     #[test]

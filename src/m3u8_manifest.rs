@@ -23,6 +23,33 @@ struct PartInfo {
     byte_range: Option<MediaByteRange>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenditionReport {
+    pub uri: String,
+    pub last_msn: Option<u32>,
+    pub last_part: Option<u32>,
+}
+
+impl RenditionReport {
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            last_msn: None,
+            last_part: None,
+        }
+    }
+
+    pub fn with_last_msn(mut self, last_msn: u32) -> Self {
+        self.last_msn = Some(last_msn);
+        self
+    }
+
+    pub fn with_last_part(mut self, last_part: u32) -> Self {
+        self.last_part = Some(last_part);
+        self
+    }
+}
+
 pub struct M3u8Manifest {
     dur: u32,
     seq: u32,
@@ -34,6 +61,7 @@ pub struct M3u8Manifest {
     start_time: DateTime<Utc>,
     idx: u32,
     options: Options,
+    rendition_reports: Vec<RenditionReport>,
 }
 
 impl M3u8Manifest {
@@ -56,7 +84,12 @@ impl M3u8Manifest {
             start_time: Utc::now(),
             idx: 0,
             options,
+            rendition_reports: Vec::new(),
         }
+    }
+
+    pub fn set_rendition_reports(&mut self, reports: Vec<RenditionReport>) {
+        self.rendition_reports = reports;
     }
 
     fn retained_segment_limit(&self) -> u32 {
@@ -212,6 +245,7 @@ impl M3u8Manifest {
             }
         }
         append_preload_hint(&mut ps, self.seg_id, open_parts);
+        append_rendition_reports(&mut ps, &self.rendition_reports);
 
         let target_duration = ms_to_target_duration(self.options.target_duration_ms);
         let part_target = self.options.part_target_ms as f64 / 1000.0;
@@ -302,6 +336,32 @@ fn append_preload_hint(playlist: &mut String, segment_id: u32, parts: &[PartInfo
             "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p{next_part_sequence}.mp4\"\n"
         ));
     }
+}
+
+fn append_rendition_reports(playlist: &mut String, reports: &[RenditionReport]) {
+    for report in reports {
+        if !valid_quoted_string_value(&report.uri) {
+            continue;
+        }
+
+        playlist.push_str("#EXT-X-RENDITION-REPORT:URI=\"");
+        playlist.push_str(&report.uri);
+        playlist.push('"');
+
+        if let Some(last_msn) = report.last_msn {
+            playlist.push_str(&format!(",LAST-MSN={last_msn}"));
+        }
+        if let Some(last_part) = report.last_part {
+            playlist.push_str(&format!(",LAST-PART={last_part}"));
+        }
+        playlist.push('\n');
+    }
+}
+
+fn valid_quoted_string_value(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| matches!(byte, b'"' | b'\n' | b'\r'))
 }
 
 fn segment_byte_range(parts: &[PartInfo]) -> Option<(u64, u64)> {
@@ -467,6 +527,24 @@ mod tests {
             assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.50000"));
             assert!(playlist.contains("PART-HOLD-BACK=1.50000"));
         }
+    }
+
+    #[test]
+    fn emits_rendition_reports_for_peer_ll_hls_playlists() {
+        let mut manifest = M3u8Manifest::new(Options::default());
+        manifest.set_rendition_reports(vec![
+            RenditionReport::new("720p/stream.m3u8")
+                .with_last_msn(42)
+                .with_last_part(3),
+            RenditionReport::new("audio/stream.m3u8").with_last_msn(41),
+        ]);
+        manifest.add_part(500, true);
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+
+        assert!(playlist
+            .contains("#EXT-X-RENDITION-REPORT:URI=\"720p/stream.m3u8\",LAST-MSN=42,LAST-PART=3"));
+        assert!(playlist.contains("#EXT-X-RENDITION-REPORT:URI=\"audio/stream.m3u8\",LAST-MSN=41"));
     }
 
     #[test]
