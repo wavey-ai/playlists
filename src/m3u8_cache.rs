@@ -2,6 +2,7 @@ use crate::Options;
 
 use crate::CacheError;
 use bytes::{BufMut, Bytes, BytesMut};
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::collections::BTreeMap;
@@ -13,6 +14,12 @@ use std::sync::{
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 const M3U8_HEADER_LEN: usize = 24;
+
+#[derive(Debug, Clone, Copy)]
+struct MediaSegmentBlock {
+    start: usize,
+    duration_ms: u64,
+}
 
 pub struct M3u8Cache {
     buffer: Vec<RwLock<Bytes>>,
@@ -299,6 +306,25 @@ impl M3u8Cache {
         Ok(encoder.finish()?)
     }
 
+    fn decompress_data(&self, data: &[u8]) -> Result<String, CacheError> {
+        let mut decoder = GzDecoder::new(data);
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded)?;
+        Ok(decoded)
+    }
+
+    fn delta_from_gzip(&self, data: &Bytes) -> Result<Option<(Bytes, u64)>, CacheError> {
+        let playlist = self.decompress_data(data)?;
+        let Some(delta) = playlist_delta_update(&playlist) else {
+            return Ok(None);
+        };
+        let h = const_xxh3(delta.as_bytes());
+        Ok(Some((
+            Bytes::from(self.compress_data(delta.as_bytes())?),
+            h,
+        )))
+    }
+
     fn is_included(&self, stream_id: u64, segment_id: usize, part_idx: usize) -> bool {
         if let (Some(last_seg), Some(last_part)) =
             (self.last_seg(stream_id), self.last_part(stream_id))
@@ -436,6 +462,19 @@ impl M3u8Cache {
             Ok(None)
         }
     }
+
+    pub fn get_delta(
+        &self,
+        stream_id: u64,
+        segment_id: usize,
+        part_idx: usize,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        let Some((data, _)) = self.get(stream_id, segment_id, part_idx)? else {
+            return Ok(None);
+        };
+        self.delta_from_gzip(&data)
+    }
+
     pub fn last(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
         if let (Some(last_seg), Some(last_part)) =
             (self.last_seg(stream_id), self.last_part(stream_id))
@@ -458,11 +497,158 @@ impl M3u8Cache {
             Ok(None)
         }
     }
+
+    pub fn last_delta(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
+        let Some((data, _)) = self.last(stream_id)? else {
+            return Ok(None);
+        };
+        self.delta_from_gzip(&data)
+    }
+}
+
+fn playlist_delta_update(playlist: &str) -> Option<String> {
+    if playlist.contains("#EXT-X-ENDLIST") || playlist.contains("#EXT-X-SKIP:") {
+        return None;
+    }
+
+    let skip_boundary_ms = parse_can_skip_until_ms(playlist)?;
+    let lines: Vec<&str> = playlist.lines().collect();
+    let (blocks, trailing_start, trailing_part_duration_ms) = parse_media_timeline(&lines);
+    let insert_at = blocks
+        .first()
+        .map(|block| block.start)
+        .unwrap_or(trailing_start);
+
+    let total_parent_duration_ms = blocks
+        .iter()
+        .map(|block| block.duration_ms)
+        .fold(trailing_part_duration_ms, u64::saturating_add);
+
+    let mut skipped_segments = 0;
+    let mut elapsed_ms = 0_u64;
+    for block in &blocks {
+        elapsed_ms = elapsed_ms.saturating_add(block.duration_ms);
+        if total_parent_duration_ms.saturating_sub(elapsed_ms) > skip_boundary_ms {
+            skipped_segments += 1;
+        } else {
+            break;
+        }
+    }
+
+    let retained_at = blocks
+        .get(skipped_segments)
+        .map(|block| block.start)
+        .unwrap_or(trailing_start);
+
+    let mut delta = String::new();
+    push_lines(&mut delta, &lines[..insert_at]);
+    delta.push_str(&format!(
+        "#EXT-X-SKIP:SKIPPED-SEGMENTS={skipped_segments}\n"
+    ));
+    push_lines(&mut delta, &lines[retained_at..]);
+    Some(delta)
+}
+
+fn parse_can_skip_until_ms(playlist: &str) -> Option<u64> {
+    playlist
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#EXT-X-SERVER-CONTROL:")
+                .and_then(|attributes| parse_attribute_value(attributes, "CAN-SKIP-UNTIL"))
+        })
+        .and_then(|seconds| seconds.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds * 1000.0).round() as u64)
+}
+
+fn parse_media_timeline(lines: &[&str]) -> (Vec<MediaSegmentBlock>, usize, u64) {
+    let mut blocks = Vec::new();
+    let mut current_start = None;
+    let mut current_duration_ms = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if is_segment_scoped_tag(line) {
+            current_start.get_or_insert(idx);
+        }
+
+        if let Some(duration_ms) = parse_extinf_duration_ms(line) {
+            current_start.get_or_insert(idx);
+            current_duration_ms = Some(duration_ms);
+        }
+
+        if is_uri_line(line) {
+            if let (Some(start), Some(duration_ms)) =
+                (current_start.take(), current_duration_ms.take())
+            {
+                blocks.push(MediaSegmentBlock { start, duration_ms });
+            }
+        }
+    }
+
+    let trailing_start = current_start.unwrap_or(lines.len());
+    let trailing_part_duration_ms = lines[trailing_start..]
+        .iter()
+        .filter_map(|line| parse_part_duration_ms(line))
+        .fold(0_u64, u64::saturating_add);
+
+    (blocks, trailing_start, trailing_part_duration_ms)
+}
+
+fn is_segment_scoped_tag(line: &str) -> bool {
+    line.starts_with("#EXT-X-GAP")
+        || line.starts_with("#EXT-X-PROGRAM-DATE-TIME:")
+        || line.starts_with("#EXT-X-PART:")
+}
+
+fn is_uri_line(line: &str) -> bool {
+    !line.is_empty() && !line.starts_with('#')
+}
+
+fn parse_extinf_duration_ms(line: &str) -> Option<u64> {
+    line.strip_prefix("#EXTINF:")
+        .and_then(|value| value.split_once(',').map(|(duration, _)| duration))
+        .and_then(parse_duration_ms)
+}
+
+fn parse_part_duration_ms(line: &str) -> Option<u64> {
+    line.strip_prefix("#EXT-X-PART:")
+        .and_then(|attributes| parse_attribute_value(attributes, "DURATION"))
+        .and_then(parse_duration_ms)
+}
+
+fn parse_duration_ms(value: &str) -> Option<u64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (seconds * 1000.0).round() as u64)
+}
+
+fn parse_attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
+    attributes.split(',').find_map(|attribute| {
+        let (attribute_name, value) = attribute.split_once('=')?;
+        (attribute_name == name).then_some(value.trim_matches('"'))
+    })
+}
+
+fn push_lines(output: &mut String, lines: &[&str]) {
+    for line in lines {
+        output.push_str(line);
+        output.push('\n');
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m3u8_manifest::M3u8Manifest;
+
+    fn decompress(data: &[u8]) -> String {
+        let mut decoder = GzDecoder::new(data);
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).unwrap();
+        decoded
+    }
 
     #[test]
     fn reused_stream_slot_does_not_expose_previous_playlist_data() {
@@ -499,6 +685,57 @@ mod tests {
             .add(7, 12, 1, 1, Bytes::from_static(b"second"))
             .unwrap();
         assert_eq!(cache.last_position(7), Some((12, 1)));
+    }
+
+    #[test]
+    fn delta_update_replaces_segments_older_than_skip_boundary() {
+        let options = Options {
+            max_segments: 10,
+            segment_min_ms: 1000,
+            ..Options::default()
+        };
+        let cache = M3u8Cache::new(options);
+        let mut manifest = M3u8Manifest::new(options);
+        let mut latest = None;
+
+        for _ in 0..12 {
+            latest = Some(manifest.add_part(1000, true));
+        }
+
+        let (playlist, segment_id, seq, idx, _) = latest.unwrap();
+        cache.add(1, segment_id, seq, idx, playlist).unwrap();
+
+        let (delta, _) = cache.last_delta(1).unwrap().unwrap();
+        let delta = decompress(&delta);
+
+        assert!(delta.contains("#EXT-X-VERSION:9"));
+        assert!(delta.contains("#EXT-X-SERVER-CONTROL:"));
+        assert!(delta.contains("CAN-SKIP-UNTIL=6.00000"));
+        assert!(delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"));
+        assert_eq!(delta.matches("#EXT-X-SKIP:").count(), 1);
+        assert!(!delta.contains("s3.mp4"));
+        assert!(!delta.contains("s4.mp4"));
+        assert!(!delta.contains("s5.mp4"));
+        assert!(delta.contains("s6.mp4"));
+        assert!(delta.contains("#EXT-X-PART:"));
+    }
+
+    #[test]
+    fn delta_update_is_not_generated_without_can_skip_until() {
+        let cache = M3u8Cache::new(Options::default());
+        cache
+            .add(
+                1,
+                1,
+                1,
+                0,
+                Bytes::from_static(
+                    b"#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES\n",
+                ),
+            )
+            .unwrap();
+
+        assert!(cache.last_delta(1).unwrap().is_none());
     }
 
     #[test]

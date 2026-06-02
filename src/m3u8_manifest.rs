@@ -39,8 +39,24 @@ impl M3u8Manifest {
         }
     }
 
+    fn retained_segment_limit(&self) -> u32 {
+        self.options
+            .max_segments
+            .saturating_sub(1)
+            .min(u32::MAX as usize) as u32
+    }
+
     fn full_segments(&self) -> Vec<(u32, u32)> {
-        let start = if self.seg_id <= 7 { 1 } else { self.seg_id - 7 };
+        let retained_segments = self.retained_segment_limit();
+        if retained_segments == 0 {
+            return Vec::new();
+        }
+
+        let start = if self.seg_id <= retained_segments {
+            1
+        } else {
+            self.seg_id - retained_segments
+        };
 
         let len = self.seg_id - start;
         let mut res = Vec::with_capacity(len as usize);
@@ -91,12 +107,14 @@ impl M3u8Manifest {
         let segs = self.full_segments();
 
         let mut gaps = 0;
+        let mut segment_durations = Vec::new();
         if segs.len() < 7 {
             for _ in 0..(7 - segs.len()) {
                 gaps += 1;
                 let secs = GAP_DURATION_MS as f64 / 1000.0;
                 ps.push_str(&format!("#EXT-X-GAP\n#EXTINF:{secs:.5},\ngap.mp4\n"));
                 pt += Duration::milliseconds(GAP_DURATION_MS as i64);
+                segment_durations.push(GAP_DURATION_MS);
             }
         }
 
@@ -108,6 +126,7 @@ impl M3u8Manifest {
                 ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
+                segment_durations.push(seg.1);
             } else {
                 ps.push_str(&format!(
                     "#EXT-X-PROGRAM-DATE-TIME:{}\n",
@@ -128,13 +147,15 @@ impl M3u8Manifest {
                 ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
                 ps.push_str(&format!("s{}.mp4\n", seg.0));
                 pt += Duration::milliseconds(seg.1 as i64);
+                segment_durations.push(seg.1);
             }
         }
 
-        let mut id = 0;
+        let mut open_parent_duration_ms = 0_u32;
         let seg_index = self.seg_id as usize % self.options.max_segments;
         for p in &self.seg_parts[seg_index] {
             durs.push(p.1);
+            open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.1);
             let secs = p.1 as f64 / 1000.0;
             let mut str = format!("#EXT-X-PART:DURATION={secs:.5},URI=\"p{}.mp4\"", p.0);
             if p.2 {
@@ -143,13 +164,7 @@ impl M3u8Manifest {
                 str += "\n"
             }
             ps.push_str(&str);
-            id = p.0;
         }
-
-        ps.push_str(&format!(
-            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p{}.mp4\"\n",
-            id + 1
-        ));
 
         let target_duration = segs
             .iter()
@@ -180,15 +195,33 @@ impl M3u8Manifest {
 
         let part_hold_back = part_target * 3_f64;
         let can_skip_until = target_duration * 6;
+        let can_skip_until_ms = can_skip_until.saturating_mul(1000);
+        let can_skip = segment_durations
+            .first()
+            .map(|first_duration| {
+                let retained_ms: u32 = segment_durations
+                    .iter()
+                    .copied()
+                    .fold(open_parent_duration_ms, u32::saturating_add);
+                retained_ms.saturating_sub(*first_duration) > can_skip_until_ms
+            })
+            .unwrap_or(false);
 
         ph.push_str("#EXTM3U\n");
         ph.push_str("#EXT-X-VERSION:9\n");
         ph.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
 
-        ph.push_str(&format!(
-            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5},CAN-SKIP-UNTIL={:.5}\n",
-            part_hold_back, can_skip_until as f64
-        ));
+        if can_skip {
+            ph.push_str(&format!(
+                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5},CAN-SKIP-UNTIL={:.5}\n",
+                part_hold_back, can_skip_until as f64
+            ));
+        } else {
+            ph.push_str(&format!(
+                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5}\n",
+                part_hold_back
+            ));
+        }
 
         let mut seq = self.seg_id;
         if self.seg_id > 7 {
@@ -210,6 +243,25 @@ fn ms_to_target_duration(ms: u32) -> u32 {
 mod tests {
     use super::*;
 
+    fn tag_line<'a>(playlist: &'a str, prefix: &str) -> &'a str {
+        playlist
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix}"))
+    }
+
+    fn attr_f64(line: &str, name: &str) -> f64 {
+        line.split_once(':')
+            .map(|(_, attrs)| attrs)
+            .unwrap_or(line)
+            .split(',')
+            .find_map(|attr| {
+                let (attr_name, value) = attr.split_once('=')?;
+                (attr_name == name).then(|| value.trim_matches('"').parse::<f64>().unwrap())
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
     #[test]
     fn fresh_live_manifest_has_valid_positive_targets() {
         let manifest = String::from_utf8(M3u8Manifest::new(Options::default()).m3u8().to_vec())
@@ -218,5 +270,83 @@ mod tests {
         assert!(manifest.contains("#EXT-X-TARGETDURATION:4"));
         assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=1.50000"));
         assert!(manifest.contains("PART-HOLD-BACK=4.50000"));
+        assert!(!manifest.contains("CAN-SKIP-UNTIL"));
+        assert!(!manifest.contains("#EXT-X-PRELOAD-HINT"));
+    }
+
+    #[test]
+    fn advertises_skip_only_when_window_can_skip() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 10,
+            segment_min_ms: 1000,
+            ..Options::default()
+        });
+
+        for _ in 0..16 {
+            manifest.add_part(1000, true);
+        }
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+        assert!(playlist.contains("CAN-SKIP-UNTIL=6.00000"));
+    }
+
+    #[test]
+    fn does_not_advertise_skip_when_ring_cannot_retain_skip_boundary() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 7,
+            segment_min_ms: 1000,
+            ..Options::default()
+        });
+
+        for _ in 0..16 {
+            manifest.add_part(1000, true);
+        }
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+        assert!(!playlist.contains("CAN-SKIP-UNTIL"));
+    }
+
+    #[test]
+    fn emitted_ll_hls_controls_are_internally_consistent() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 10,
+            segment_min_ms: 1000,
+            ..Options::default()
+        });
+
+        for _ in 0..12 {
+            manifest.add_part(1000, true);
+        }
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+        let version = tag_line(&playlist, "#EXT-X-VERSION:")
+            .trim_start_matches("#EXT-X-VERSION:")
+            .parse::<u32>()
+            .unwrap();
+        let target_duration = tag_line(&playlist, "#EXT-X-TARGETDURATION:")
+            .trim_start_matches("#EXT-X-TARGETDURATION:")
+            .parse::<f64>()
+            .unwrap();
+        let part_target = tag_line(&playlist, "#EXT-X-PART-INF:");
+        let part_target = attr_f64(part_target, "PART-TARGET");
+        let server_control = tag_line(&playlist, "#EXT-X-SERVER-CONTROL:");
+        let part_hold_back = attr_f64(server_control, "PART-HOLD-BACK");
+        let can_skip_until = attr_f64(server_control, "CAN-SKIP-UNTIL");
+
+        assert!(version >= 9);
+        assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(server_control.contains("CAN-BLOCK-RELOAD=YES"));
+        assert!(part_hold_back >= part_target * 3.0);
+        assert!(can_skip_until >= target_duration * 6.0);
+        assert!(!server_control.contains("CAN-SKIP-DATERANGES"));
+        assert!(!playlist.contains("#EXT-X-PRELOAD-HINT"));
+
+        for line in playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-PART:"))
+        {
+            assert!(line.contains("DURATION="));
+            assert!(line.contains("URI=\"p"));
+        }
     }
 }
