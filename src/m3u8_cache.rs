@@ -89,6 +89,10 @@ impl M3u8Cache {
             .map(|n| self.last_part[n].load(Ordering::Acquire))
     }
 
+    pub fn last_position(&self, stream_id: u64) -> Option<(usize, usize)> {
+        Some((self.last_seg(stream_id)?, self.last_part(stream_id)?))
+    }
+
     fn add_stream_id(&self, stream_id: u64) -> Result<(), CacheError> {
         let _lock = self.stream_id_mutex.lock().unwrap();
         if self.offset(stream_id).is_some() {
@@ -478,6 +482,23 @@ mod tests {
         cache.ensure_stream_id(2).unwrap();
         assert!(cache.get(1, 1, 0).unwrap().is_none());
         assert!(cache.get(2, 1, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn tracks_last_playlist_position() {
+        let cache = M3u8Cache::new(Options::default());
+
+        assert_eq!(cache.last_position(7), None);
+
+        cache
+            .add(7, 12, 0, 0, Bytes::from_static(b"first"))
+            .unwrap();
+        assert_eq!(cache.last_position(7), Some((12, 0)));
+
+        cache
+            .add(7, 12, 1, 1, Bytes::from_static(b"second"))
+            .unwrap();
+        assert_eq!(cache.last_position(7), Some((12, 1)));
     }
 
     #[test]
