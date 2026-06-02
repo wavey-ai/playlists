@@ -421,7 +421,7 @@ impl M3u8Cache {
     ) -> Result<Option<(usize, usize)>, CacheError> {
         if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
             let mut b = self.seg_parts[idx].load(Ordering::Acquire);
-            if b == 0 && self.last_seg(stream_id) == Some(segment_id) {
+            if self.last_seg(stream_id) == Some(segment_id) {
                 b = self
                     .last_seq(stream_id)
                     .and_then(|last_seq| last_seq.checked_add(1))
@@ -733,6 +733,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.get_idxs(7, 5).unwrap(), Some((25, 27)));
+    }
+
+    #[test]
+    fn open_segment_range_ignores_stale_ring_boundary() {
+        let options = Options {
+            max_segments: 4,
+            ..Options::default()
+        };
+        let cache = M3u8Cache::new(options);
+
+        cache
+            .add(7, 1, 1, 0, Bytes::from_static(b"open-1"))
+            .unwrap();
+        cache
+            .add(7, 2, 3, 0, Bytes::from_static(b"open-2"))
+            .unwrap();
+        cache
+            .add(7, 3, 5, 0, Bytes::from_static(b"open-3"))
+            .unwrap();
+        cache
+            .add(7, 4, 7, 0, Bytes::from_static(b"open-4-a"))
+            .unwrap();
+        cache
+            .add(7, 4, 8, 1, Bytes::from_static(b"open-4-b"))
+            .unwrap();
+
+        assert_eq!(cache.last_position(7), Some((4, 1)));
+        assert_eq!(cache.get_idxs(7, 4).unwrap(), Some((7, 9)));
     }
 
     #[test]
