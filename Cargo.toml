@@ -17,4 +17,4 @@ tls-helpers = "0.2.0"
 tracing = "0.1.40"
 thiserror = "1.0.64"
 tokio = { version = "1.43.1", features = ["full"] }
-access-unit = "0.1.2"
+access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
