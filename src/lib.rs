@@ -35,6 +35,7 @@ pub struct Options {
     pub max_parted_segments: usize,
     pub segment_min_ms: u32,
     pub target_duration_ms: u32,
+    pub part_target_ms: u32,
     pub buffer_size_kb: usize,
     pub init_size_kb: usize,
 }
@@ -48,6 +49,7 @@ impl Default for Options {
             max_parted_segments: 32,
             segment_min_ms: 1500,
             target_duration_ms: 6000,
+            part_target_ms: 500,
             buffer_size_kb: 800,
             init_size_kb: 5,
         }
@@ -62,6 +64,7 @@ impl Options {
         self.max_parted_segments = self.max_parted_segments.max(1);
         self.segment_min_ms = self.segment_min_ms.max(1);
         self.target_duration_ms = self.target_duration_ms.max(1000);
+        self.part_target_ms = self.part_target_ms.max(1);
         self
     }
 }

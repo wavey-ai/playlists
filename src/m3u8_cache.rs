@@ -736,6 +736,7 @@ mod tests {
             max_segments: 10,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         };
         let cache = M3u8Cache::new(options);

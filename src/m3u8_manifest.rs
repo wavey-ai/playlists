@@ -31,7 +31,6 @@ pub struct M3u8Manifest {
     seg_id: u32,
     seg_durs: Vec<u32>,
     seg_parts: Vec<Vec<PartInfo>>,
-    part_target_ms: u32,
     start_time: DateTime<Utc>,
     idx: u32,
     options: Options,
@@ -54,7 +53,6 @@ impl M3u8Manifest {
             seg_id: 1,
             seg_durs: Vec::new(),
             seg_parts,
-            part_target_ms: 0,
             start_time: Utc::now(),
             idx: 0,
             options,
@@ -147,7 +145,6 @@ impl M3u8Manifest {
         self.seq += 1;
         self.dur += duration;
         self.seg_dur += duration;
-        self.part_target_ms = self.part_target_ms.max(duration);
         let byte_range = byte_range.or_else(|| MediaByteRange::new(byte_len?, self.seg_byte_len));
         if let Some(range) = byte_range {
             self.seg_byte_len = self
@@ -217,16 +214,10 @@ impl M3u8Manifest {
         append_preload_hint(&mut ps, self.seg_id, open_parts);
 
         let target_duration = ms_to_target_duration(self.options.target_duration_ms);
-
-        let max_duration = if self.part_target_ms == 0 {
-            self.options.segment_min_ms
-        } else {
-            self.part_target_ms
-        }
-        .max(1);
-        let part_target = max_duration as f64 / 1000.0;
+        let part_target = self.options.part_target_ms as f64 / 1000.0;
 
         let part_hold_back = part_target * 3_f64;
+        let hold_back = (target_duration as f64) * 3_f64;
         let can_skip_until = target_duration * 6;
         let can_skip_until_ms = can_skip_until.saturating_mul(1000);
         let can_skip = segment_durations
@@ -246,13 +237,12 @@ impl M3u8Manifest {
 
         if can_skip {
             ph.push_str(&format!(
-                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5},CAN-SKIP-UNTIL={:.5}\n",
-                part_hold_back, can_skip_until as f64
+                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK={hold_back:.5},PART-HOLD-BACK={part_hold_back:.5},CAN-SKIP-UNTIL={:.5}\n",
+                can_skip_until as f64
             ));
         } else {
             ph.push_str(&format!(
-                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={:.5}\n",
-                part_hold_back
+                "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK={hold_back:.5},PART-HOLD-BACK={part_hold_back:.5}\n"
             ));
         }
 
@@ -298,13 +288,20 @@ fn append_segment_byte_range(playlist: &mut String, parts: &[PartInfo]) {
 }
 
 fn append_preload_hint(playlist: &mut String, segment_id: u32, parts: &[PartInfo]) {
-    let Some((offset, length)) = segment_byte_range(parts) else {
+    let Some(last_part) = parts.last() else {
         return;
     };
-    let start = offset.saturating_add(length);
-    playlist.push_str(&format!(
-        "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s{segment_id}.mp4\",BYTERANGE-START={start}\n"
-    ));
+    if let Some((offset, length)) = segment_byte_range(parts) {
+        let start = offset.saturating_add(length);
+        playlist.push_str(&format!(
+            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s{segment_id}.mp4\",BYTERANGE-START={start}\n"
+        ));
+    } else {
+        let next_part_sequence = last_part.sequence.saturating_add(1);
+        playlist.push_str(&format!(
+            "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p{next_part_sequence}.mp4\"\n"
+        ));
+    }
 }
 
 fn segment_byte_range(parts: &[PartInfo]) -> Option<(u64, u64)> {
@@ -349,8 +346,9 @@ mod tests {
             .expect("manifest utf8");
 
         assert!(manifest.contains("#EXT-X-TARGETDURATION:6"));
-        assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=1.50000"));
-        assert!(manifest.contains("PART-HOLD-BACK=4.50000"));
+        assert!(manifest.contains("#EXT-X-PART-INF:PART-TARGET=0.50000"));
+        assert!(manifest.contains("HOLD-BACK=18.00000"));
+        assert!(manifest.contains("PART-HOLD-BACK=1.50000"));
         assert!(!manifest.contains("gap.mp4"));
         assert!(!manifest.contains("CAN-SKIP-UNTIL"));
         assert!(!manifest.contains("#EXT-X-PRELOAD-HINT"));
@@ -362,6 +360,7 @@ mod tests {
             max_segments: 10,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         });
 
@@ -379,6 +378,7 @@ mod tests {
             max_segments: 7,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         });
 
@@ -395,6 +395,7 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 64,
             segment_min_ms: 1000,
+            part_target_ms: 1000,
             ..Options::default()
         });
 
@@ -414,16 +415,18 @@ mod tests {
         let part_target = tag_line(&playlist, "#EXT-X-PART-INF:");
         let part_target = attr_f64(part_target, "PART-TARGET");
         let server_control = tag_line(&playlist, "#EXT-X-SERVER-CONTROL:");
+        let hold_back = attr_f64(server_control, "HOLD-BACK");
         let part_hold_back = attr_f64(server_control, "PART-HOLD-BACK");
         let can_skip_until = attr_f64(server_control, "CAN-SKIP-UNTIL");
 
         assert!(version >= 9);
         assert!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""));
         assert!(server_control.contains("CAN-BLOCK-RELOAD=YES"));
+        assert!(hold_back >= target_duration * 3.0);
         assert!(part_hold_back >= part_target * 3.0);
         assert!(can_skip_until >= target_duration * 6.0);
         assert!(!server_control.contains("CAN-SKIP-DATERANGES"));
-        assert!(!playlist.contains("#EXT-X-PRELOAD-HINT"));
+        assert!(playlist.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p49.mp4\""));
 
         for line in playlist
             .lines()
@@ -440,6 +443,7 @@ mod tests {
             max_segments: 16,
             segment_min_ms: 200,
             target_duration_ms: 6000,
+            part_target_ms: 500,
             ..Options::default()
         });
 
@@ -450,10 +454,46 @@ mod tests {
     }
 
     #[test]
+    fn part_target_is_configured_and_stable() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 16,
+            segment_min_ms: 200,
+            part_target_ms: 500,
+            ..Options::default()
+        });
+
+        for duration in [200, 300, 100, 400, 250, 150] {
+            let playlist = String::from_utf8(manifest.add_part(duration, true).0.to_vec()).unwrap();
+            assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.50000"));
+            assert!(playlist.contains("PART-HOLD-BACK=1.50000"));
+        }
+    }
+
+    #[test]
+    fn emits_preload_hint_for_discrete_part_resources() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 10,
+            segment_min_ms: 1000,
+            part_target_ms: 250,
+            ..Options::default()
+        });
+
+        manifest.add_part(250, true);
+        manifest.add_part(250, false);
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
+
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.25000,URI=\"p1.mp4\",INDEPENDENT=YES"));
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.25000,URI=\"p2.mp4\""));
+        assert!(playlist.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p3.mp4\""));
+    }
+
+    #[test]
     fn emits_raw_media_byte_ranges_when_part_sizes_are_known() {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 10,
             segment_min_ms: 200,
+            part_target_ms: 100,
             ..Options::default()
         });
 
