@@ -521,15 +521,26 @@ impl ChunkCache {
                 return;
             }
             let current = last.load(Ordering::Acquire);
-            let mut candidate = if current == EMPTY_LAST {
+            let published_next = if current == EMPTY_LAST {
                 first_expected_id
             } else {
                 current.saturating_add(1)
             };
+            let observed_next = self
+                .next_ids
+                .get(stream_idx)
+                .map(|next| next.load(Ordering::Acquire))
+                .unwrap_or(published_next);
+            let retained_start = observed_next.saturating_sub(self.stream_capacity());
+            let mut candidate = published_next.max(first_expected_id).max(retained_start);
             let mut contiguous_last = current;
 
             // One scan can advance by at most the retained ring capacity. This
             // keeps completion work bounded even for adversarial object IDs.
+            // Once an unresolved gap has fallen behind `retained_start`, the
+            // rolling live publication may resume at the first still-retained
+            // object. The watermark always points at a real stored object; it
+            // never fabricates completeness for a slot that is still retained.
             for _ in 0..self.stream_capacity() {
                 let Some(slot) = self.offset(stream_idx, candidate) else {
                     return;
@@ -1259,5 +1270,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.last(stream_idx), Some(8_000));
+    }
+
+    #[tokio::test]
+    async fn contiguous_publication_resumes_after_a_gap_leaves_the_retained_window() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        });
+        let stream_idx = cache.add_stream_id(63).await;
+
+        cache
+            .put_if_absent_contiguous_for_stream_id(63, 0, 0, Bytes::from_static(b"object-0"))
+            .await
+            .unwrap();
+        for sequence in 2..=4 {
+            cache
+                .put_if_absent_contiguous_for_stream_id(
+                    63,
+                    sequence,
+                    0,
+                    Bytes::from(sequence.to_be_bytes().to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(cache.last(stream_idx), Some(0));
+
+        cache
+            .put_if_absent_contiguous_for_stream_id(63, 5, 0, Bytes::from_static(b"object-5"))
+            .await
+            .unwrap();
+
+        assert!(cache.get_for_stream_id(63, 1).await.is_none());
+        assert_eq!(cache.last(stream_idx), Some(5));
+        assert_eq!(
+            cache.get_for_stream_id(63, 5).await.unwrap().0,
+            Bytes::from_static(b"object-5")
+        );
     }
 }
