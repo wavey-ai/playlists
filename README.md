@@ -27,6 +27,7 @@ blocking I/O.
 ChunkCache layout
     num_playlists × max_segments × max_parts_per_segment slots
         slot = atomic logical id + atomic generation + atomic hash + payload
+        stream = atomic last id + atomic generation + atomic content version
 
 M3u8Cache layout
     identical shape, but payload is gzip-compressed playlist data
@@ -34,6 +35,9 @@ M3u8Cache layout
 • Each playlist gets its own ring buffer; unrelated playlists never block each other.
 • Writes lock exactly one slot; reads take shared locks and can run in parallel.
 • All indices (last_seg, last_part, idxs) are AtomicUsize.
+• `ChunkCache::version(stream_idx)` advances after every slot mutation and stream
+  reuse, allowing callers to invalidate derived manifests without rescanning
+  unchanged slots on every request.
 
 ## Generic nature
 
@@ -75,6 +79,23 @@ caller-provided private-subnet discovery path bootstrap discovery, mesh `HELLO`
 frames gossip known peer addresses, and remotely replicated slots are not
 re-forwarded. That is enough for the first regional prototype and keeps the
 cache API independent of any specific media protocol.
+
+Mesh FEC uses a configurable repair-symbol floor plus payload-proportional
+redundancy and a hard cap. Defaults are one repair symbol, a 3% repair ratio,
+and at most 32 repair symbols. Small realtime messages retain low overhead,
+while larger cache parts receive enough independent repair symbols to tolerate
+multiple packet losses without waiting for demand-triggered backfill. Configure
+the policy through `CacheMeshConfig::{repair_symbols, repair_ratio,
+max_repair_symbols, symbol_size}`.
+
+`CacheMeshHandle::fec_stats()` returns a lock-free bounded snapshot of transport
+outcomes. It separates source and repair traffic, protected and wire bytes,
+successful decodes, objects and missing source symbols actually recovered by
+FEC, late source arrivals versus repaired sources still absent after the bounded
+observation window, incomplete objects aged out of that window, and
+encode/decode errors. Recovery accounting reads only the fixed datagram and
+RaptorQ payload-id headers on the hot path; normal decoder validation remains
+authoritative.
 
 ## Performance
 
