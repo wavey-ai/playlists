@@ -1,6 +1,7 @@
 pub mod chunk_cache;
 pub mod m3u8_cache;
 pub mod m3u8_manifest;
+#[cfg(feature = "mesh")]
 pub mod mesh;
 
 use access_unit::Fmp4;

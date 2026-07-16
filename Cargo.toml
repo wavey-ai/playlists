@@ -7,11 +7,15 @@ license = "MIT"
 repository = "https://github.com/wavey-ai/playlists"
 readme = "README.md"
 
+[features]
+default = []
+mesh = ["dep:raptorq-datagram-fec"]
+
 [dependencies]
 bytes = "1.6.0"
 chrono = "0.4.38"
 flate2 = "1.0.28"
-raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git" }
+raptorq-datagram-fec = { git = "https://github.com/wavey-ai/raptor-fec.git", optional = true }
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
 tls-helpers = "0.2.0"
 tracing = "0.1.40"
