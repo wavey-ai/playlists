@@ -443,7 +443,13 @@ impl ChunkCache {
         Some((stream_idx, generation))
     }
 
-    fn reset_stream_idx(&self, stream_idx: usize) {
+    /// Reset all published state for a physical stream index.
+    ///
+    /// This is intended for callers that manage their own logical stream IDs
+    /// on top of fixed `ChunkCache` indices. It advances the generation so
+    /// retained ring-buffer bytes from the previous logical stream are no
+    /// longer visible through `get`, `last`, or initialization lookups.
+    pub fn reset_stream_idx(&self, stream_idx: usize) {
         if let Some(initialization) = self.stream_initializations.get(stream_idx) {
             if let Ok(mut initialization) = initialization.write() {
                 *initialization = None;
@@ -1039,6 +1045,50 @@ mod tests {
             cache.get_for_stream_id(2, 0).await.unwrap().0,
             Bytes::from_static(b"second")
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_stream_idx_reset_hides_previous_slot_data() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        };
+        let cache = ChunkCache::new(options);
+        let stream_idx = 0;
+
+        cache
+            .add(stream_idx, 1, Bytes::from_static(b"headers"))
+            .await
+            .unwrap();
+        cache
+            .add(stream_idx, 2, Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+
+        assert_eq!(cache.last(stream_idx), Some(2));
+        assert_eq!(
+            cache.get(stream_idx, 2).await.unwrap().0,
+            Bytes::from_static(b"body")
+        );
+
+        cache.reset_stream_idx(stream_idx);
+
+        assert!(cache.last(stream_idx).is_none());
+        assert!(cache.get(stream_idx, 1).await.is_none());
+        assert!(cache.get(stream_idx, 2).await.is_none());
+
+        cache
+            .add(stream_idx, 1, Bytes::from_static(b"next-headers"))
+            .await
+            .unwrap();
+        assert_eq!(cache.last(stream_idx), Some(1));
+        assert_eq!(
+            cache.get(stream_idx, 1).await.unwrap().0,
+            Bytes::from_static(b"next-headers")
+        );
+        assert!(cache.get(stream_idx, 2).await.is_none());
     }
 
     #[tokio::test]
