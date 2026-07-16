@@ -349,6 +349,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 [[package]]
 name = "raptorq-datagram-fec"
 version = "0.1.3"
+source = "git+https://github.com/wavey-ai/raptor-fec.git#27229228b7a910e019f8fbc42091ae45c677bbe3"
 dependencies = [
  "bytes",
  "raptorq",
