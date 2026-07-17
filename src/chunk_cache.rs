@@ -2,12 +2,13 @@ use crate::Options;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 const EMPTY_LAST: usize = usize::MAX;
+const MAX_EXACT_PART_WAITERS: usize = 65_536;
 
 /// Outcome of an immutable write at a stream/slot identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +39,7 @@ pub struct ChunkCache {
     versions: Vec<AtomicU64>,
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
     offsets: StdRwLock<HashMap<u64, usize>>,
+    exact_part_waiters: StdMutex<HashMap<(u64, usize), Weak<Notify>>>,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
     new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
@@ -82,6 +84,7 @@ impl ChunkCache {
             versions,
             stream_initializations,
             offsets: StdRwLock::new(HashMap::new()),
+            exact_part_waiters: StdMutex::new(HashMap::new()),
             idx: AtomicUsize::new(0),
             new_playlist_tx,
             new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
@@ -145,6 +148,7 @@ impl ChunkCache {
             .ok_or("Stream not found")?;
         self.add_with_generation(stream_idx, generation, id, data_bytes)
             .await?;
+        self.notify_exact_part_waiters(stream_id, id);
         Ok(stream_idx)
     }
 
@@ -172,6 +176,7 @@ impl ChunkCache {
         if result == PutIfAbsentResult::Inserted {
             self.advance_next_id(stream_idx, id.saturating_add(1));
             self.publish_last(stream_idx, id);
+            self.notify_exact_part_waiters(stream_id, id);
         }
         Ok(result)
     }
@@ -202,8 +207,43 @@ impl ChunkCache {
         if result == PutIfAbsentResult::Inserted {
             self.advance_next_id(stream_idx, id.saturating_add(1));
             self.publish_contiguous_last(stream_idx, generation, first_expected_id);
+            self.notify_exact_part_waiters(stream_id, id);
         }
         Ok(result)
+    }
+
+    /// Register for one exact stream/part identity becoming readable.
+    ///
+    /// Callers must register, enable the returned notification, and then
+    /// recheck the cache before awaiting it. This closes the lookup/register
+    /// race without waking unrelated LL-HLS requests for every cache commit.
+    pub fn exact_part_waiter(&self, stream_id: u64, id: usize) -> Option<Arc<Notify>> {
+        let mut waiters = self
+            .exact_part_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(waiter) = waiters.get(&(stream_id, id)).and_then(Weak::upgrade) {
+            return Some(waiter);
+        }
+        waiters.retain(|_, waiter| waiter.strong_count() > 0);
+        if waiters.len() >= MAX_EXACT_PART_WAITERS {
+            return None;
+        }
+        let waiter = Arc::new(Notify::new());
+        waiters.insert((stream_id, id), Arc::downgrade(&waiter));
+        Some(waiter)
+    }
+
+    fn notify_exact_part_waiters(&self, stream_id: u64, id: usize) {
+        let waiter = self
+            .exact_part_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(stream_id, id))
+            .and_then(|waiter| waiter.upgrade());
+        if let Some(waiter) = waiter {
+            waiter.notify_waiters();
+        }
     }
 
     pub async fn get_for_stream_id(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
@@ -583,6 +623,38 @@ mod tests {
     use std::sync::Arc;
     use tokio::task;
     use tokio::time::{timeout, Duration, Instant};
+
+    #[tokio::test]
+    async fn exact_part_waiters_follow_stream_and_sequence_identity() {
+        let cache = ChunkCache::new(Options::default());
+        let first_waiter = cache.exact_part_waiter(77, 0).unwrap();
+        let second_waiter = cache.exact_part_waiter(77, 1).unwrap();
+        let first = first_waiter.notified();
+        let second = second_waiter.notified();
+        tokio::pin!(first);
+        tokio::pin!(second);
+        first.as_mut().enable();
+        second.as_mut().enable();
+
+        cache
+            .add_for_stream_id(77, 0, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(100), &mut first)
+            .await
+            .expect("the exact sequence-zero waiter should wake");
+        assert!(timeout(Duration::from_millis(1), &mut second)
+            .await
+            .is_err());
+
+        cache
+            .add_for_stream_id(77, 1, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(100), &mut second)
+            .await
+            .expect("the exact sequence-one waiter should wake");
+    }
 
     #[tokio::test]
     async fn test_append_and_last() {
