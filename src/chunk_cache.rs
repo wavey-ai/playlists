@@ -251,6 +251,41 @@ impl ChunkCache {
         self.get_with_generation(stream_idx, generation, id).await
     }
 
+    /// Read a contiguous retained range for one logical stream identity.
+    ///
+    /// The stream mapping and generation are resolved once for the whole
+    /// range. Every slot must still contain the requested sequence in that
+    /// same generation, and the mapping must remain unchanged through the
+    /// read. This makes aggregation all-or-nothing while avoiding one global
+    /// stream-map lookup per constituent part.
+    pub async fn get_range_for_stream_id(
+        &self,
+        stream_id: u64,
+        first_id: usize,
+        count: usize,
+    ) -> Option<Vec<(Bytes, u64)>> {
+        if count == 0 || count > self.stream_capacity() {
+            return None;
+        }
+        let last_id = first_id.checked_add(count - 1)?;
+        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
+        let mut parts = Vec::with_capacity(count);
+
+        for id in first_id..=last_id {
+            let idx = self.offset(stream_idx, id)?;
+            let part = if let Ok(bytes) = self.buffer[idx].try_read() {
+                self.clone_matching_slot(idx, id, generation, &bytes)
+            } else {
+                let bytes = self.buffer[idx].read().await;
+                self.clone_matching_slot(idx, id, generation, &bytes)
+            }?;
+            parts.push(part);
+        }
+
+        (self.stream_generation_for_id(stream_id) == Some((stream_idx, generation)))
+            .then_some(parts)
+    }
+
     /// Store the durable initialization object associated with a stream.
     ///
     /// Initialization bytes live beside the rolling media window so a fresh
@@ -462,6 +497,19 @@ impl ChunkCache {
         }
     }
 
+    fn clone_matching_slot(
+        &self,
+        idx: usize,
+        id: usize,
+        generation: usize,
+        bytes: &Bytes,
+    ) -> Option<(Bytes, u64)> {
+        let stored_id = self.slot_ids.get(idx)?.load(Ordering::Acquire);
+        let stored_generation = self.slot_generations.get(idx)?.load(Ordering::Acquire);
+        let hash = self.slot_hashes.get(idx)?.load(Ordering::Acquire);
+        (stored_id == id && stored_generation == generation).then(|| (bytes.clone(), hash))
+    }
+
     pub fn retained_start(&self, last: usize) -> usize {
         last.saturating_sub(self.stream_capacity().saturating_sub(1))
     }
@@ -654,6 +702,102 @@ mod tests {
         timeout(Duration::from_millis(100), &mut second)
             .await
             .expect("the exact sequence-one waiter should wake");
+    }
+
+    #[tokio::test]
+    async fn range_read_returns_ordered_slots_across_ring_wrap() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        });
+
+        for id in 2..=5 {
+            cache
+                .add_for_stream_id(91, id, Bytes::from(format!("part-{id}")))
+                .await
+                .unwrap();
+        }
+
+        let parts = cache.get_range_for_stream_id(91, 2, 4).await.unwrap();
+        assert_eq!(
+            parts
+                .into_iter()
+                .map(|(bytes, _hash)| bytes)
+                .collect::<Vec<_>>(),
+            vec![
+                Bytes::from_static(b"part-2"),
+                Bytes::from_static(b"part-3"),
+                Bytes::from_static(b"part-4"),
+                Bytes::from_static(b"part-5"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn range_read_is_all_or_nothing_for_overwritten_or_invalid_ranges() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        });
+
+        for id in 0..=4 {
+            cache
+                .add_for_stream_id(92, id, Bytes::from(format!("part-{id}")))
+                .await
+                .unwrap();
+        }
+
+        assert!(cache.get_range_for_stream_id(92, 0, 4).await.is_none());
+        assert!(cache.get_range_for_stream_id(92, 1, 4).await.is_some());
+        assert!(cache.get_range_for_stream_id(92, 1, 0).await.is_none());
+        assert!(cache.get_range_for_stream_id(92, 1, 5).await.is_none());
+        assert!(cache
+            .get_range_for_stream_id(92, usize::MAX, 2)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn range_read_never_crosses_a_reused_stream_generation() {
+        let cache = Arc::new(ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        }));
+        for id in 0..2 {
+            cache
+                .add_for_stream_id(93, id, Bytes::from(format!("old-{id}")))
+                .await
+                .unwrap();
+        }
+
+        let blocked_slot = cache.offset(0, 1).unwrap();
+        let slot_write = cache.buffer[blocked_slot].write().await;
+        let reader = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.get_range_for_stream_id(93, 0, 2).await })
+        };
+        tokio::task::yield_now().await;
+        cache.add_stream_id(94).await;
+        drop(slot_write);
+
+        assert!(reader.await.unwrap().is_none());
+        assert!(cache.get_range_for_stream_id(93, 0, 2).await.is_none());
+
+        for id in 0..2 {
+            cache
+                .add_for_stream_id(94, id, Bytes::from(format!("new-{id}")))
+                .await
+                .unwrap();
+        }
+        let new_parts = cache.get_range_for_stream_id(94, 0, 2).await.unwrap();
+        assert_eq!(new_parts[0].0, Bytes::from_static(b"new-0"));
+        assert_eq!(new_parts[1].0, Bytes::from_static(b"new-1"));
     }
 
     #[tokio::test]
