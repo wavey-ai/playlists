@@ -9,6 +9,9 @@ use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 const EMPTY_LAST: usize = usize::MAX;
 const MAX_EXACT_PART_WAITERS: usize = 65_536;
+const EXACT_PART_WAITER_SHARDS: usize = 64;
+const MAX_EXACT_PART_WAITERS_PER_SHARD: usize =
+    MAX_EXACT_PART_WAITERS.div_ceil(EXACT_PART_WAITER_SHARDS);
 
 /// Outcome of an immutable write at a stream/slot identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,7 +42,7 @@ pub struct ChunkCache {
     versions: Vec<AtomicU64>,
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
     offsets: StdRwLock<HashMap<u64, usize>>,
-    exact_part_waiters: StdMutex<HashMap<(u64, usize), Weak<Notify>>>,
+    exact_part_waiters: Vec<StdMutex<HashMap<(u64, usize), Weak<Notify>>>>,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
     new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
@@ -84,7 +87,9 @@ impl ChunkCache {
             versions,
             stream_initializations,
             offsets: StdRwLock::new(HashMap::new()),
-            exact_part_waiters: StdMutex::new(HashMap::new()),
+            exact_part_waiters: (0..EXACT_PART_WAITER_SHARDS)
+                .map(|_| StdMutex::new(HashMap::new()))
+                .collect(),
             idx: AtomicUsize::new(0),
             new_playlist_tx,
             new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
@@ -218,25 +223,35 @@ impl ChunkCache {
     /// recheck the cache before awaiting it. This closes the lookup/register
     /// race without waking unrelated LL-HLS requests for every cache commit.
     pub fn exact_part_waiter(&self, stream_id: u64, id: usize) -> Option<Arc<Notify>> {
+        let key = (stream_id, id);
         let mut waiters = self
             .exact_part_waiters
+            .get(Self::exact_part_waiter_shard(stream_id, id))?
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(waiter) = waiters.get(&(stream_id, id)).and_then(Weak::upgrade) {
+        if let Some(waiter) = waiters.get(&key).and_then(Weak::upgrade) {
             return Some(waiter);
         }
-        waiters.retain(|_, waiter| waiter.strong_count() > 0);
-        if waiters.len() >= MAX_EXACT_PART_WAITERS {
+        // A cancelled request leaves only a dead Weak at this key. Replacing it
+        // is O(1); sweeping the shard on every 5 ms registration made live-tail
+        // work quadratic in the number of concurrent waiters.
+        waiters.remove(&key);
+        if waiters.len() >= MAX_EXACT_PART_WAITERS_PER_SHARD {
+            waiters.retain(|_, waiter| waiter.strong_count() > 0);
+        }
+        if waiters.len() >= MAX_EXACT_PART_WAITERS_PER_SHARD {
             return None;
         }
         let waiter = Arc::new(Notify::new());
-        waiters.insert((stream_id, id), Arc::downgrade(&waiter));
+        waiters.insert(key, Arc::downgrade(&waiter));
         Some(waiter)
     }
 
     fn notify_exact_part_waiters(&self, stream_id: u64, id: usize) {
         let waiter = self
             .exact_part_waiters
+            .get(Self::exact_part_waiter_shard(stream_id, id))
+            .expect("exact-part waiter shard index must be in bounds")
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(stream_id, id))
@@ -244,6 +259,13 @@ impl ChunkCache {
         if let Some(waiter) = waiter {
             waiter.notify_waiters();
         }
+    }
+
+    fn exact_part_waiter_shard(stream_id: u64, id: usize) -> usize {
+        debug_assert!(EXACT_PART_WAITER_SHARDS.is_power_of_two());
+        let mixed =
+            stream_id ^ (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ stream_id.rotate_left(17);
+        mixed as usize & (EXACT_PART_WAITER_SHARDS - 1)
     }
 
     pub async fn get_for_stream_id(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
@@ -667,6 +689,7 @@ impl ChunkCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::task;
@@ -702,6 +725,31 @@ mod tests {
         timeout(Duration::from_millis(100), &mut second)
             .await
             .expect("the exact sequence-one waiter should wake");
+    }
+
+    #[test]
+    fn exact_part_waiters_share_keys_and_replace_cancelled_registrations() {
+        let cache = ChunkCache::new(Options::default());
+        let first = cache.exact_part_waiter(78, 12).unwrap();
+        let duplicate = cache.exact_part_waiter(78, 12).unwrap();
+        assert!(Arc::ptr_eq(&first, &duplicate));
+
+        drop(first);
+        drop(duplicate);
+        let replacement = cache.exact_part_waiter(78, 12).unwrap();
+        let duplicate_replacement = cache.exact_part_waiter(78, 12).unwrap();
+        assert!(Arc::ptr_eq(&replacement, &duplicate_replacement));
+
+        let shard = ChunkCache::exact_part_waiter_shard(78, 12);
+        assert_eq!(cache.exact_part_waiters[shard].lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn exact_part_waiter_keys_are_distributed_across_shards() {
+        let used = (0_u64..256)
+            .map(|stream_id| ChunkCache::exact_part_waiter_shard(stream_id, 1_000))
+            .collect::<HashSet<_>>();
+        assert_eq!(used.len(), EXACT_PART_WAITER_SHARDS);
     }
 
     #[tokio::test]
