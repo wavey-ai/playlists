@@ -119,15 +119,32 @@ Read:   3966 MB/s (63,461 ops/s)
 Combined: 5830 MB/s
 ```
 
-Massive concurrent reads (1000 readers, 1 writer):
+Massive concurrent reads (1000 tasks, 1 writer):
 ```
 Read:  22.1M ops/s
 Write: 22K ops/s (concurrent)
 ```
 
-ChunkCache scales to millions of concurrent reads because:
+Run the realistic 48 kHz S24 PCM part-hit qualification with:
+
+```sh
+cargo bench --bench distribution_capacity -- --duration-seconds 3
+```
+
+It reports `ChunkCache::get_for_stream_id` throughput for 5,760-byte parts at
+1, 2, 4, and all available worker threads as JSON. Logical payload throughput
+in that report is the byte length accessed through zero-copy `Bytes`; it is not
+network throughput.
+
+ChunkCache sustains millions of lookups per second under concurrent readers
+because:
 
 - Pre-allocated ring buffers (no malloc per write)
 - Per-slot RwLock (readers only contend on same slot, not globally)
 - Lock-free `last()` via atomic load
 - Zero-copy reads via `Bytes::slice()`
+
+Lookup operations per second, simultaneous blocked requests, open connections,
+and active media customers are separate capacities. This cache benchmark makes
+no claim that one edge can deliver millions of active PCM streams; HTTP/3,
+encryption, kernel networking, and payload bandwidth are outside this boundary.

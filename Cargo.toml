@@ -22,3 +22,12 @@ tracing = "0.1.40"
 thiserror = "1.0.64"
 tokio = { version = "1.43.1", features = ["full"] }
 access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
+
+[dev-dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[bench]]
+name = "distribution_capacity"
+harness = false
