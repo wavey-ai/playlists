@@ -13,6 +13,8 @@ const EXACT_PART_WAITER_SHARDS: usize = 64;
 const MAX_EXACT_PART_WAITERS_PER_SHARD: usize =
     MAX_EXACT_PART_WAITERS.div_ceil(EXACT_PART_WAITER_SHARDS);
 
+type ExactPartWaiterShard = StdMutex<HashMap<(u64, usize), Weak<Notify>>>;
+
 /// Outcome of an immutable write at a stream/slot identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PutIfAbsentResult {
@@ -22,6 +24,17 @@ pub enum PutIfAbsentResult {
     AlreadyPresent,
     /// The slot identity already contained different bytes.
     HashConflict,
+}
+
+/// Bounded exact-part waiter state retained by the rolling chunk cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactPartWaiterStats {
+    /// Stream/sequence identities still represented in the sharded waiter maps.
+    pub retained_keys: usize,
+    /// Strong waiter handles currently held by blocked requests.
+    pub active_registrations: usize,
+    /// Hard upper bound across every waiter shard.
+    pub capacity: usize,
 }
 
 #[derive(Clone)]
@@ -42,7 +55,7 @@ pub struct ChunkCache {
     versions: Vec<AtomicU64>,
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
     offsets: StdRwLock<HashMap<u64, usize>>,
-    exact_part_waiters: Vec<StdMutex<HashMap<(u64, usize), Weak<Notify>>>>,
+    exact_part_waiters: Vec<ExactPartWaiterShard>,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
     new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
@@ -245,6 +258,33 @@ impl ChunkCache {
         let waiter = Arc::new(Notify::new());
         waiters.insert(key, Arc::downgrade(&waiter));
         Some(waiter)
+    }
+
+    /// Snapshot exact-part waiter occupancy without retaining any waiter.
+    ///
+    /// Dead weak entries are reported separately from active request handles so
+    /// cancellation qualifications can prove both request cleanup and the hard
+    /// bound on lazily reclaimed keys.
+    pub fn exact_part_waiter_stats(&self) -> ExactPartWaiterStats {
+        let mut retained_keys = 0_usize;
+        let mut active_registrations = 0_usize;
+        for shard in &self.exact_part_waiters {
+            let waiters = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retained_keys = retained_keys.saturating_add(waiters.len());
+            active_registrations = active_registrations.saturating_add(
+                waiters
+                    .values()
+                    .map(|waiter| waiter.strong_count())
+                    .sum::<usize>(),
+            );
+        }
+        ExactPartWaiterStats {
+            retained_keys,
+            active_registrations,
+            capacity: MAX_EXACT_PART_WAITERS,
+        }
     }
 
     fn notify_exact_part_waiters(&self, stream_id: u64, id: usize) {
@@ -706,6 +746,8 @@ mod tests {
         tokio::pin!(second);
         first.as_mut().enable();
         second.as_mut().enable();
+        assert_eq!(cache.exact_part_waiter_stats().retained_keys, 2);
+        assert_eq!(cache.exact_part_waiter_stats().active_registrations, 2);
 
         cache
             .add_for_stream_id(77, 0, Bytes::from_static(b"first"))
@@ -714,6 +756,8 @@ mod tests {
         timeout(Duration::from_millis(100), &mut first)
             .await
             .expect("the exact sequence-zero waiter should wake");
+        assert_eq!(cache.exact_part_waiter_stats().retained_keys, 1);
+        assert_eq!(cache.exact_part_waiter_stats().active_registrations, 1);
         assert!(timeout(Duration::from_millis(1), &mut second)
             .await
             .is_err());
@@ -725,6 +769,8 @@ mod tests {
         timeout(Duration::from_millis(100), &mut second)
             .await
             .expect("the exact sequence-one waiter should wake");
+        assert_eq!(cache.exact_part_waiter_stats().retained_keys, 0);
+        assert_eq!(cache.exact_part_waiter_stats().active_registrations, 0);
     }
 
     #[test]
@@ -733,15 +779,32 @@ mod tests {
         let first = cache.exact_part_waiter(78, 12).unwrap();
         let duplicate = cache.exact_part_waiter(78, 12).unwrap();
         assert!(Arc::ptr_eq(&first, &duplicate));
+        assert_eq!(
+            cache.exact_part_waiter_stats(),
+            ExactPartWaiterStats {
+                retained_keys: 1,
+                active_registrations: 2,
+                capacity: MAX_EXACT_PART_WAITERS,
+            }
+        );
 
         drop(first);
         drop(duplicate);
+        assert_eq!(cache.exact_part_waiter_stats().active_registrations, 0);
         let replacement = cache.exact_part_waiter(78, 12).unwrap();
         let duplicate_replacement = cache.exact_part_waiter(78, 12).unwrap();
         assert!(Arc::ptr_eq(&replacement, &duplicate_replacement));
 
         let shard = ChunkCache::exact_part_waiter_shard(78, 12);
         assert_eq!(cache.exact_part_waiters[shard].lock().unwrap().len(), 1);
+        assert_eq!(
+            cache.exact_part_waiter_stats(),
+            ExactPartWaiterStats {
+                retained_keys: 1,
+                active_registrations: 2,
+                capacity: MAX_EXACT_PART_WAITERS,
+            }
+        );
     }
 
     #[test]
