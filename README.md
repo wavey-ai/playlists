@@ -4,9 +4,8 @@
 
 ## Overview
 
-This crate offers a high-throughput, lock-efficient ring buffer for Low-Latency HLS
-(LL-HLS) segments and any other workload that needs to push and read binary packets
-with minimal contention.
+This crate supplies a high-throughput, lock-efficient ring buffer. It supports
+Low-Latency HLS (LL-HLS) segments and other binary-packet workloads.
 
 Components
 
@@ -32,8 +31,8 @@ ChunkCache layout
 M3u8Cache layout
     identical shape, but payload is gzip-compressed playlist data
 
-• Each playlist gets its own ring buffer; unrelated playlists never block each other.
-• Writes lock exactly one slot; reads take shared locks and can run in parallel.
+• Each playlist gets its own ring buffer. Unrelated playlists never block each other.
+• Writes lock exactly one slot. Reads take shared locks and can run in parallel.
 • All indices (last_seg, last_part, idxs) are AtomicUsize.
 • `ChunkCache::version(stream_idx)` advances after every slot mutation and stream
   reuse, allowing callers to invalidate derived manifests without rescanning
@@ -47,11 +46,15 @@ frames, or any other byte slice.
 
 ## Cache mesh prototype
 
-`playlists::mesh` can bind a UDP socket, discover configured or broadcast peer
-caches with FEC-protected hello frames, gossip known peer addresses, and copy
-`ChunkCache` slots by stable `stream_id`. This is intended for local AV mesh
-prototyping where one region ingests media and other regions need to serve the
-same HLS parts from their own local cache.
+`playlists::mesh` can:
+
+- bind a UDP socket
+- discover configured or broadcast peer caches with FEC-protected hello frames
+- share known peer addresses
+- copy `ChunkCache` slots by stable `stream_id`.
+
+Use this feature for local AV mesh prototypes. One region can ingest media, and
+other regions can serve the same HLS parts from their local caches.
 
 ```rust
 use playlists::{
@@ -74,11 +77,11 @@ mesh.shutdown();
 # }
 ```
 
-The current implementation is deliberately simple: static seed peers or a
-caller-provided private-subnet discovery path bootstrap discovery, mesh `HELLO`
-frames gossip known peer addresses, and remotely replicated slots are not
-re-forwarded. That is enough for the first regional prototype and keeps the
-cache API independent of any specific media protocol.
+The current implementation is deliberately simple. Static seed peers or a
+caller-supplied private-subnet path start discovery. Mesh `HELLO` frames share
+known peer addresses. Nodes do not forward remotely replicated slots again.
+This design supports the first regional prototype. It also keeps the cache API
+independent of a specific media protocol.
 
 Mesh FEC uses a configurable repair-symbol floor plus payload-proportional
 redundancy and a hard cap. Defaults are one repair symbol, a 3% repair ratio,
@@ -89,20 +92,26 @@ the policy through `CacheMeshConfig::{repair_symbols, repair_ratio,
 max_repair_symbols, symbol_size}`.
 
 `CacheMeshHandle::fec_stats()` returns a lock-free bounded snapshot of transport
-outcomes. It separates source and repair traffic, protected and wire bytes,
-successful decodes, objects and missing source symbols actually recovered by
-FEC, late source arrivals versus repaired sources still absent after the bounded
-observation window, incomplete objects aged out of that window, and
-encode/decode errors. Recovery accounting reads only the fixed datagram and
-RaptorQ payload-id headers on the hot path; normal decoder validation remains
-authoritative.
+outcomes. It separates:
+
+- source and repair traffic
+- protected and wire bytes
+- successful decodes
+- objects and missing source symbols recovered by FEC
+- late sources and repaired sources that remain absent after observation
+- incomplete objects that age out of the observation window
+- encode and decode errors.
+
+Recovery accounting reads only fixed datagram and RaptorQ payload-ID headers on
+the hot path. Normal decoder validation remains authoritative.
 
 ## Performance
 
-Operation                  Complexity   Details
-append / add               O(1)         one atomic + one write-lock
-get / last                 O(1)         one atomic + one read-lock
-playlist rollover          O(S)         zero-fill S = max_segments × max_parts_per_segment
+| Operation | Complexity | Details |
+| --- | --- | --- |
+| append / add | O(1) | one atomic operation and one write lock |
+| get / last | O(1) | one atomic operation and one read lock |
+| playlist rollover | O(S) | zero-fill S = max_segments × max_parts_per_segment |
 
 ### Benchmarks (Apple Silicon)
 
@@ -133,7 +142,7 @@ cargo bench --bench distribution_capacity -- --duration-seconds 3
 
 It reports `ChunkCache::get_for_stream_id` throughput for 5,760-byte parts at
 1, 2, 4, and all available worker threads as JSON. Logical payload throughput
-in that report is the byte length accessed through zero-copy `Bytes`; it is not
+in that report is the byte length accessed through zero-copy `Bytes`. It is not
 network throughput.
 
 ChunkCache sustains millions of lookups per second under concurrent readers
@@ -146,5 +155,5 @@ because:
 
 Lookup operations per second, simultaneous blocked requests, open connections,
 and active media customers are separate capacities. This cache benchmark makes
-no claim that one edge can deliver millions of active PCM streams; HTTP/3,
+no claim that one edge can deliver millions of active PCM streams. HTTP/3,
 encryption, kernel networking, and payload bandwidth are outside this boundary.
