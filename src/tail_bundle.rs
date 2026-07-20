@@ -1,14 +1,20 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashSet;
 use thiserror::Error;
 
 pub const TAIL_BUNDLE_CONTENT_TYPE: &str = "application/vnd.needletail.llhls-tail-bundle";
+pub const TAIL_BUNDLE_STREAM_CONTENT_TYPE: &str =
+    "application/vnd.needletail.llhls-tail-bundle-stream";
 pub const TAIL_BUNDLE_MAGIC: [u8; 4] = *b"NTB1";
 pub const MAX_TAIL_BUNDLE_ENTRIES: usize = 128;
 pub const MAX_TAIL_BUNDLE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 const BUNDLE_HEADER_BYTES: usize = 8;
 const ENTRY_HEADER_BYTES: usize = 36;
+const STREAM_FRAME_HEADER_BYTES: usize = 4;
+const MAX_TAIL_BUNDLE_ENCODED_BYTES: usize = BUNDLE_HEADER_BYTES
+    + ENTRY_HEADER_BYTES * MAX_TAIL_BUNDLE_ENTRIES
+    + MAX_TAIL_BUNDLE_PAYLOAD_BYTES;
 
 /// One opaque LL-HLS stream range carried in a synchronized tail response.
 ///
@@ -47,6 +53,46 @@ pub enum TailBundleError {
     Truncated,
     #[error("tail bundle has trailing bytes")]
     TrailingBytes,
+    #[error("tail bundle stream frame length is invalid")]
+    InvalidFrameLength,
+}
+
+/// Prefix one encoded bundle for transport on a persistent response body.
+///
+/// HTTP/3 DATA frame boundaries are not application-message boundaries. The
+/// four-byte network-order length keeps each existing bundle self-delimiting
+/// when chunks are split or coalesced by the transport.
+pub fn encode_tail_bundle_stream_frame(bundle: Bytes) -> Result<Bytes, TailBundleError> {
+    if bundle.is_empty() || bundle.len() > MAX_TAIL_BUNDLE_ENCODED_BYTES {
+        return Err(TailBundleError::InvalidFrameLength);
+    }
+    let bundle_len = u32::try_from(bundle.len()).map_err(|_| TailBundleError::LengthOverflow)?;
+    let mut frame = BytesMut::with_capacity(STREAM_FRAME_HEADER_BYTES + bundle.len());
+    frame.put_u32(bundle_len);
+    frame.extend_from_slice(&bundle);
+    Ok(frame.freeze())
+}
+
+/// Remove one complete bundle from an incremental persistent-response buffer.
+pub fn decode_tail_bundle_stream_frame(
+    buffered: &mut BytesMut,
+) -> Result<Option<Bytes>, TailBundleError> {
+    if buffered.len() < STREAM_FRAME_HEADER_BYTES {
+        return Ok(None);
+    }
+    let bundle_len =
+        u32::from_be_bytes(buffered[..STREAM_FRAME_HEADER_BYTES].try_into().unwrap()) as usize;
+    if bundle_len == 0 || bundle_len > MAX_TAIL_BUNDLE_ENCODED_BYTES {
+        return Err(TailBundleError::InvalidFrameLength);
+    }
+    let frame_len = STREAM_FRAME_HEADER_BYTES
+        .checked_add(bundle_len)
+        .ok_or(TailBundleError::LengthOverflow)?;
+    if buffered.len() < frame_len {
+        return Ok(None);
+    }
+    buffered.advance(STREAM_FRAME_HEADER_BYTES);
+    Ok(Some(buffered.split_to(bundle_len).freeze()))
 }
 
 pub fn encode_tail_bundle(entries: &[TailBundleEntry]) -> Result<Bytes, TailBundleError> {
@@ -227,6 +273,47 @@ mod tests {
         let encoded = encode_tail_bundle(&entries).unwrap();
         let decoded = decode_tail_bundle(encoded).unwrap();
         assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn persistent_stream_frames_survive_split_and_coalesced_transport_chunks() {
+        let first = encode_tail_bundle(&[entry(11, 7, b"opus-a")]).unwrap();
+        let second = encode_tail_bundle(&[entry(11, 8, b"opus-b")]).unwrap();
+        let first_frame = encode_tail_bundle_stream_frame(first.clone()).unwrap();
+        let second_frame = encode_tail_bundle_stream_frame(second.clone()).unwrap();
+
+        let mut buffered = BytesMut::new();
+        buffered.extend_from_slice(&first_frame[..3]);
+        assert_eq!(
+            decode_tail_bundle_stream_frame(&mut buffered).unwrap(),
+            None
+        );
+        buffered.extend_from_slice(&first_frame[3..]);
+        buffered.extend_from_slice(&second_frame);
+        assert_eq!(
+            decode_tail_bundle_stream_frame(&mut buffered).unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            decode_tail_bundle_stream_frame(&mut buffered).unwrap(),
+            Some(second)
+        );
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn persistent_stream_frame_rejects_zero_and_oversized_lengths() {
+        let mut zero = BytesMut::from(&0_u32.to_be_bytes()[..]);
+        assert_eq!(
+            decode_tail_bundle_stream_frame(&mut zero),
+            Err(TailBundleError::InvalidFrameLength)
+        );
+        let oversized = u32::try_from(MAX_TAIL_BUNDLE_ENCODED_BYTES + 1).unwrap();
+        let mut oversized = BytesMut::from(&oversized.to_be_bytes()[..]);
+        assert_eq!(
+            decode_tail_bundle_stream_frame(&mut oversized),
+            Err(TailBundleError::InvalidFrameLength)
+        );
     }
 
     #[test]
