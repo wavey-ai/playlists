@@ -1,6 +1,6 @@
 [package]
 name = "playlists"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "M3u8 playlist and ring buffers"
 license = "MIT"
@@ -15,13 +15,13 @@ mesh = ["dep:raptorq-datagram-fec"]
 bytes = "1.6.0"
 chrono = "0.4.38"
 flate2 = "1.0.28"
-raptorq-datagram-fec = { version = "0.1.4", path = "../raptor-fec/crates/raptorq-datagram-fec", optional = true }
+raptorq-datagram-fec = { version = "0.1.4", optional = true }
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
 tls-helpers = "0.2.0"
 tracing = "0.1.40"
 thiserror = "1.0.64"
 tokio = { version = "1.43.1", features = ["full"] }
-access-unit = { version = "0.1.2", git = "https://github.com/wavey-ai/access-unit.git" }
+access-unit = "0.1.2"
 
 [dev-dependencies]
 libc = "0.2"
