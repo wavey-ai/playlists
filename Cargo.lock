@@ -321,7 +321,7 @@ checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
 name = "playlists"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "access-unit",
  "bytes",
@@ -364,11 +364,12 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.4"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab739ed411990e4433b2e198e274e8760d38fc6e321d818b928136599f598c6c"
+checksum = "a8aef794a9c41cf367daa21ced02d91bd828e33411b01c9ea14c81d1a90e8979"
 dependencies = [
  "bytes",
+ "crc32fast",
  "raptorq",
  "tokio",
 ]
