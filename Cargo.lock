@@ -4,9 +4,8 @@ version = 4
 
 [[package]]
 name = "access-unit"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "089654a0182818690a0efe33f1c8fde8d0cee83a1dd043b6d358525857d1b169"
+version = "0.1.3"
+source = "git+https://github.com/wavey-ai/access-unit.git#ae7aa5f0baa6c2827e17ce19319d57181bdb401a"
 dependencies = [
  "bytes",
 ]
