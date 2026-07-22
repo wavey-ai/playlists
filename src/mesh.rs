@@ -16,7 +16,8 @@ use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
 
 const FRAME_MAGIC: &[u8; 8] = b"PLMESH1\0";
-const FRAME_VERSION: u8 = 1;
+const FRAME_VERSION: u8 = 2;
+const FRAME_VERSION_LEGACY: u8 = 1;
 const FRAME_HELLO: u8 = 1;
 const FRAME_CHUNK: u8 = 2;
 const FRAME_REPLICA_REQUEST: u8 = 3;
@@ -32,6 +33,41 @@ const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
 const MAX_GOSSIP_PEERS: usize = 256;
 const FEC_OBSERVATION_DATAGRAM_WINDOW: u64 = 8_192;
 const FEC_COMPLETED_BLOCK_WINDOW: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMeshRole {
+    /// Compatibility mode for existing local mesh fixtures.
+    Peer,
+    /// A regional cache distributor may serve child replicas.
+    Distributor,
+    /// A leaf playback cache receives from parents and never forwards cache data.
+    Edge,
+}
+
+impl Default for CacheMeshRole {
+    fn default() -> Self {
+        Self::Peer
+    }
+}
+
+impl CacheMeshRole {
+    fn wire_value(self) -> u8 {
+        match self {
+            Self::Peer => 0,
+            Self::Distributor => 1,
+            Self::Edge => 2,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, MeshError> {
+        match value {
+            0 => Ok(Self::Peer),
+            1 => Ok(Self::Distributor),
+            2 => Ok(Self::Edge),
+            _ => Err(MeshError::InvalidFrame("unknown cache mesh role")),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum MeshError {
@@ -86,6 +122,12 @@ pub struct CacheMeshConfig {
     pub repair_ratio: f32,
     pub max_repair_symbols: u32,
     pub symbol_size: u16,
+    pub same_region_only: bool,
+    pub role: CacheMeshRole,
+    /// Maximum number of parent distributors queried by one cache request.
+    pub max_parents: usize,
+    /// Maximum number of child edges served by one distributor tick.
+    pub max_children: usize,
 }
 
 impl CacheMeshConfig {
@@ -105,6 +147,10 @@ impl CacheMeshConfig {
             repair_ratio: DEFAULT_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
             symbol_size: DEFAULT_SYMBOL_SIZE,
+            same_region_only: false,
+            role: CacheMeshRole::Peer,
+            max_parents: 2,
+            max_children: 8,
         }
     }
 
@@ -115,6 +161,26 @@ impl CacheMeshConfig {
 
     pub fn with_peers(mut self, peers: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.peers.extend(peers);
+        self
+    }
+
+    pub fn with_same_region_only(mut self, same_region_only: bool) -> Self {
+        self.same_region_only = same_region_only;
+        self
+    }
+
+    pub fn with_role(mut self, role: CacheMeshRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    pub fn with_max_parents(mut self, max_parents: usize) -> Self {
+        self.max_parents = max_parents.max(1);
+        self
+    }
+
+    pub fn with_max_children(mut self, max_children: usize) -> Self {
+        self.max_children = max_children.max(1);
         self
     }
 }
@@ -210,6 +276,8 @@ impl CacheMesh {
         let peers = Arc::new(RwLock::new(
             self.config.peers.iter().copied().collect::<HashSet<_>>(),
         ));
+        let peer_regions = Arc::new(RwLock::new(HashMap::new()));
+        let peer_roles = Arc::new(RwLock::new(HashMap::new()));
         let remote_slots = Arc::new(RwLock::new(HashSet::new()));
         let fec_counters = Arc::new(CacheMeshFecCounters::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -218,6 +286,8 @@ impl CacheMesh {
             Arc::clone(&socket),
             Arc::clone(&self.cache),
             Arc::clone(&peers),
+            Arc::clone(&peer_regions),
+            Arc::clone(&peer_roles),
             Arc::clone(&remote_slots),
             Arc::clone(&fec_counters),
             self.config.clone(),
@@ -226,6 +296,8 @@ impl CacheMesh {
         tokio::spawn(announce_task(
             Arc::clone(&socket),
             Arc::clone(&peers),
+            Arc::clone(&peer_regions),
+            Arc::clone(&peer_roles),
             Arc::clone(&fec_counters),
             self.config.clone(),
             shutdown_rx.clone(),
@@ -234,6 +306,8 @@ impl CacheMesh {
             Arc::clone(&socket),
             self.cache,
             Arc::clone(&peers),
+            Arc::clone(&peer_regions),
+            Arc::clone(&peer_roles),
             remote_slots,
             Arc::clone(&fec_counters),
             self.config.clone(),
@@ -250,6 +324,8 @@ impl CacheMesh {
         Ok(CacheMeshHandle {
             shutdown_tx,
             peers,
+            peer_regions,
+            peer_roles,
             socket,
             node_id: self.config.node_id,
             repair_symbols: self.config.repair_symbols,
@@ -259,6 +335,10 @@ impl CacheMesh {
             fec_counters,
             request_block_id: Arc::new(AtomicU32::new(REQUEST_BLOCK_ID_BASE)),
             local_addr,
+            region: self.config.region,
+            same_region_only: self.config.same_region_only,
+            role: self.config.role,
+            max_parents: self.config.max_parents.max(1),
         })
     }
 }
@@ -266,6 +346,8 @@ impl CacheMesh {
 pub struct CacheMeshHandle {
     shutdown_tx: watch::Sender<()>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     socket: Arc<UdpSocket>,
     node_id: String,
     repair_symbols: u32,
@@ -275,6 +357,10 @@ pub struct CacheMeshHandle {
     fec_counters: Arc<CacheMeshFecCounters>,
     request_block_id: Arc<AtomicU32>,
     local_addr: SocketAddr,
+    region: String,
+    same_region_only: bool,
+    role: CacheMeshRole,
+    max_parents: usize,
 }
 
 impl CacheMeshHandle {
@@ -302,7 +388,7 @@ impl CacheMeshHandle {
         stream_id: u64,
         from_slot: usize,
     ) -> Result<usize, MeshError> {
-        let peers = self.peers().await;
+        let peers = self.allowed_peers().await;
         if peers.is_empty() {
             return Ok(0);
         }
@@ -329,6 +415,38 @@ impl CacheMeshHandle {
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }
+
+    async fn allowed_peers(&self) -> Vec<SocketAddr> {
+        let peers = self.peers.read().await.iter().copied().collect::<Vec<_>>();
+        let regions = self.peer_regions.read().await;
+        let roles = self.peer_roles.read().await;
+        let mut peers = peers
+            .into_iter()
+            .filter(|peer| {
+                if self.same_region_only
+                    && regions
+                        .get(peer)
+                        .is_none_or(|region| region != &self.region)
+                {
+                    return false;
+                }
+                if self.role == CacheMeshRole::Edge {
+                    return roles
+                        .get(peer)
+                        .is_none_or(|role| *role != CacheMeshRole::Edge);
+                }
+                if self.role == CacheMeshRole::Distributor {
+                    return roles
+                        .get(peer)
+                        .is_none_or(|role| *role != CacheMeshRole::Edge);
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+        peers.sort_unstable();
+        peers.truncate(self.max_parents.max(1));
+        peers
+    }
 }
 
 impl Drop for CacheMeshHandle {
@@ -342,6 +460,7 @@ enum MeshFrame {
     Hello {
         node_id: String,
         region: String,
+        role: CacheMeshRole,
         peers: Vec<SocketAddr>,
     },
     Chunk {
@@ -363,6 +482,7 @@ enum MeshFrame {
 }
 
 impl MeshFrame {
+    #[cfg(test)]
     fn hello_with_peers(
         node_id: impl Into<String>,
         region: impl Into<String>,
@@ -371,6 +491,21 @@ impl MeshFrame {
         Self::Hello {
             node_id: node_id.into(),
             region: region.into(),
+            role: CacheMeshRole::Peer,
+            peers,
+        }
+    }
+
+    fn hello_with_role(
+        node_id: impl Into<String>,
+        region: impl Into<String>,
+        role: CacheMeshRole,
+        peers: Vec<SocketAddr>,
+    ) -> Self {
+        Self::Hello {
+            node_id: node_id.into(),
+            region: region.into(),
+            role,
             peers,
         }
     }
@@ -419,7 +554,12 @@ impl MeshFrame {
         out.put_slice(FRAME_MAGIC);
         out.put_u8(FRAME_VERSION);
         match self {
-            Self::Hello { region, peers, .. } => {
+            Self::Hello {
+                region,
+                role,
+                peers,
+                ..
+            } => {
                 let region = region.as_bytes();
                 if region.len() > u16::MAX as usize {
                     return Err(MeshError::InvalidFrame("region too long"));
@@ -442,6 +582,7 @@ impl MeshFrame {
                     out.put_u16(peer.len() as u16);
                     out.put_slice(peer);
                 }
+                out.put_u8(role.wire_value());
             }
             Self::Chunk {
                 stream_id,
@@ -498,7 +639,7 @@ impl MeshFrame {
         }
         buf.advance(FRAME_MAGIC.len());
         let version = buf.get_u8();
-        if version != FRAME_VERSION {
+        if version != FRAME_VERSION && version != FRAME_VERSION_LEGACY {
             return Err(MeshError::InvalidFrame("unsupported version"));
         }
         let kind = buf.get_u8();
@@ -522,13 +663,25 @@ impl MeshFrame {
                             .map_err(|_| MeshError::InvalidFrame("invalid gossip peer addr"))?;
                         peers.push(peer);
                     }
+                    let role = if version == FRAME_VERSION && buf.has_remaining() {
+                        CacheMeshRole::from_wire(buf.get_u8())?
+                    } else {
+                        CacheMeshRole::Peer
+                    };
                     if buf.has_remaining() {
                         return Err(MeshError::InvalidFrame("trailing hello bytes"));
                     }
+                    return Ok(Self::Hello {
+                        node_id,
+                        region,
+                        role,
+                        peers,
+                    });
                 }
                 Ok(Self::Hello {
                     node_id,
                     region,
+                    role: CacheMeshRole::Peer,
                     peers,
                 })
             }
@@ -953,6 +1106,8 @@ async fn receive_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     stats: Arc<CacheMeshFecCounters>,
     config: CacheMeshConfig,
@@ -1001,6 +1156,8 @@ async fn receive_task(
                                 socket: &socket,
                                 cache: &cache,
                                 peers: &peers,
+                                peer_regions: &peer_regions,
+                                peer_roles: &peer_roles,
                                 remote_slots: &remote_slots,
                                 config: &config,
                                 reply_sender: &mut reply_sender,
@@ -1018,6 +1175,8 @@ struct FrameHandler<'a> {
     socket: &'a Arc<UdpSocket>,
     cache: &'a Arc<ChunkCache>,
     peers: &'a Arc<RwLock<HashSet<SocketAddr>>>,
+    peer_regions: &'a Arc<RwLock<HashMap<SocketAddr, String>>>,
+    peer_roles: &'a Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: &'a Arc<RwLock<HashSet<(u64, usize)>>>,
     config: &'a CacheMeshConfig,
     reply_sender: &'a mut FecSender,
@@ -1028,9 +1187,18 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
         MeshFrame::Hello {
             node_id,
             region,
+            role,
             peers,
         } => {
+            if handler.config.same_region_only && region != handler.config.region {
+                handler.peers.write().await.remove(&peer);
+                handler.peer_regions.write().await.remove(&peer);
+                handler.peer_roles.write().await.remove(&peer);
+                debug!(node_id, region, peer = %peer, "ignored cache mesh peer from another region");
+                return;
+            }
             let mut discovered = 0usize;
+            let mut advertised = Vec::new();
             {
                 let mut peer_set = handler.peers.write().await;
                 if peer_set.insert(peer) {
@@ -1043,8 +1211,16 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                     if peer_set.insert(advertised_peer) {
                         discovered = discovered.saturating_add(1);
                     }
+                    advertised.push(advertised_peer);
                 }
             }
+            let mut peer_regions = handler.peer_regions.write().await;
+            peer_regions.insert(peer, region.clone());
+            for advertised_peer in advertised {
+                peer_regions.insert(advertised_peer, region.clone());
+            }
+            drop(peer_regions);
+            handler.peer_roles.write().await.insert(peer, role);
             debug!(node_id, region, peer = %peer, discovered, "cache mesh peer discovered");
         }
         MeshFrame::Chunk {
@@ -1053,6 +1229,9 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             slot_id,
             payload,
         } => {
+            if !peer_is_allowed(peer, &handler).await {
+                return;
+            }
             let Ok(slot_id) = usize::try_from(slot_id) else {
                 warn!(
                     node_id,
@@ -1086,6 +1265,9 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             stream_id,
             payload,
         } => {
+            if !peer_is_allowed(peer, &handler).await {
+                return;
+            }
             let bytes = payload.len();
             if let Err(err) = handler
                 .cache
@@ -1110,6 +1292,10 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             stream_id,
             from_slot,
         } => {
+            if !peer_is_allowed(peer, &handler).await || handler.config.role == CacheMeshRole::Edge
+            {
+                return;
+            }
             handler.peers.write().await.insert(peer);
             if let Err(err) = serve_replica_request(
                 handler.socket,
@@ -1132,6 +1318,28 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             }
         }
     }
+}
+
+async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
+    let region_allowed = handler
+        .peer_regions
+        .read()
+        .await
+        .get(&peer)
+        .map(|region| !handler.config.same_region_only || region == &handler.config.region)
+        .unwrap_or(!handler.config.same_region_only);
+    if !region_allowed {
+        return false;
+    }
+    if handler.config.role == CacheMeshRole::Edge {
+        return handler
+            .peer_roles
+            .read()
+            .await
+            .get(&peer)
+            .is_none_or(|role| *role != CacheMeshRole::Edge);
+    }
+    true
 }
 
 async fn serve_replica_request(
@@ -1180,6 +1388,8 @@ async fn serve_replica_request(
 async fn announce_task(
     socket: Arc<UdpSocket>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    _peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     stats: Arc<CacheMeshFecCounters>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
@@ -1195,14 +1405,27 @@ async fn announce_task(
             }
             _ = interval.tick() => {
                 let current_peers = peers.read().await.iter().copied().collect::<Vec<_>>();
-                let advertised_peers = current_peers
-                    .iter()
-                    .copied()
-                    .take(MAX_GOSSIP_PEERS)
-                    .collect::<Vec<_>>();
-                let frame = match MeshFrame::hello_with_peers(
+                let peer_regions = peer_regions.read().await;
+                let advertised_peers = if config.role == CacheMeshRole::Edge {
+                    Vec::new()
+                } else {
+                    current_peers
+                        .iter()
+                        .copied()
+                        .filter(|peer| {
+                            !config.same_region_only
+                                || peer_regions
+                                    .get(peer)
+                                    .is_none_or(|region| region == &config.region)
+                        })
+                        .take(MAX_GOSSIP_PEERS)
+                        .collect::<Vec<_>>()
+                };
+                drop(peer_regions);
+                let frame = match MeshFrame::hello_with_role(
                     config.node_id.clone(),
                     config.region.clone(),
+                    config.role,
                     advertised_peers,
                 )
                 .encode() {
@@ -1226,15 +1449,21 @@ async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
     peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     stats: Arc<CacheMeshFecCounters>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
+    if config.role == CacheMeshRole::Edge {
+        return;
+    }
     let mut sender =
         FecSender::from_config_with_initial_block_id(&config, CHUNK_BLOCK_ID_BASE, stats);
-    let mut sent: HashMap<(u64, usize), usize> = HashMap::new();
+    let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
     let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
+    let mut child_cursor = 0usize;
     let mut interval = tokio::time::interval(config.sync_interval);
 
     loop {
@@ -1244,12 +1473,56 @@ async fn sync_task(
                 return;
             }
             _ = interval.tick() => {
-                let peers = peers.read().await.iter().copied().collect::<Vec<_>>();
+                let peers = {
+                    let regions = peer_regions.read().await;
+                    let roles = peer_roles.read().await;
+                    let mut peers = peers
+                        .read()
+                        .await
+                        .iter()
+                        .copied()
+                        .filter(|peer| {
+                            !config.same_region_only
+                                || regions
+                                    .get(peer)
+                                    .is_some_and(|region| region == &config.region)
+                        })
+                        .filter(|peer| {
+                            config.role != CacheMeshRole::Distributor
+                                || roles
+                                .get(peer)
+                                    .is_none_or(|role| *role == CacheMeshRole::Edge)
+                        })
+                        .collect::<Vec<_>>();
+                    peers.sort_unstable();
+                    let max_children = config.max_children.max(1);
+                    if peers.len() > max_children {
+                        let offset = child_cursor % peers.len();
+                        peers.rotate_left(offset);
+                        child_cursor = child_cursor.wrapping_add(1);
+                        peers.truncate(max_children);
+                    }
+                    peers
+                };
                 if peers.is_empty() {
                     continue;
                 }
 
-                for (stream_id, stream_idx) in cache.stream_ids().await {
+                let stream_ids = cache.stream_ids().await;
+                let retained_ranges = stream_ids
+                    .iter()
+                    .filter_map(|(stream_id, stream_idx)| {
+                        cache
+                            .last(*stream_idx)
+                            .map(|last| (*stream_id, (cache.retained_start(last), last)))
+                    })
+                    .collect::<HashMap<_, _>>();
+                remote_slots.write().await.retain(|(stream_id, slot_id)| {
+                    retained_ranges
+                        .get(stream_id)
+                        .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
+                });
+                for (stream_id, stream_idx) in stream_ids {
                     if let Some(initialization) = cache.stream_initialization(stream_id) {
                         let frame = match MeshFrame::initialization(
                             config.node_id.clone(),
@@ -1281,45 +1554,52 @@ async fn sync_task(
                         continue;
                     };
                     let retained_start = cache.retained_start(last);
-                    let next = sent
-                        .get(&(stream_id, stream_idx))
-                        .copied()
-                        .and_then(|slot| slot.checked_add(1))
-                        .unwrap_or(retained_start)
-                        .max(retained_start);
-                    if next > last {
-                        continue;
-                    }
+                    for peer in &peers {
+                        let next = sent
+                            .get(&(stream_id, stream_idx, *peer))
+                            .copied()
+                            .and_then(|slot| slot.checked_add(1))
+                            .unwrap_or(retained_start)
+                            .max(retained_start);
+                        if next > last {
+                            continue;
+                        }
 
-                    for slot_id in next..=last {
-                        if remote_slots.read().await.contains(&(stream_id, slot_id)) {
-                            sent.insert((stream_id, stream_idx), slot_id);
-                            continue;
-                        }
-                        let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
-                            continue;
-                        };
-                        if hash == 0 && payload.is_empty() {
-                            continue;
-                        }
-                        let frame = match MeshFrame::chunk(
-                            config.node_id.clone(),
-                            stream_id,
-                            slot_id as u64,
-                            payload,
-                        ).encode() {
-                            Ok(frame) => frame,
-                            Err(err) => {
-                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                        for slot_id in next..=last {
+                            if config.role != CacheMeshRole::Distributor
+                                && remote_slots.read().await.contains(&(stream_id, slot_id))
+                            {
+                                sent.insert((stream_id, stream_idx, *peer), slot_id);
                                 continue;
                             }
-                        };
-                        for peer in &peers {
-                            if let Err(err) = sender.send(&socket, *peer, &frame).await {
-                                debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh chunk send failed");
+                            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                                continue;
+                            };
+                            if hash == 0 && payload.is_empty() {
+                                continue;
+                            }
+                            let frame = match MeshFrame::chunk(
+                                config.node_id.clone(),
+                                stream_id,
+                                slot_id as u64,
+                                payload,
+                            ).encode() {
+                                Ok(frame) => frame,
+                                Err(err) => {
+                                    warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                                    continue;
+                                }
+                            };
+                            match sender.send(&socket, *peer, &frame).await {
+                                Ok(()) => {
+                                    sent.insert((stream_id, stream_idx, *peer), slot_id);
+                                }
+                                Err(err) => {
+                                    debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh chunk send failed");
+                                    break;
+                                }
                             }
                         }
-                        sent.insert((stream_id, stream_idx), slot_id);
                     }
                 }
             }
@@ -1370,7 +1650,7 @@ mod tests {
 
         let mut legacy_hello = BytesMut::new();
         legacy_hello.put_slice(FRAME_MAGIC);
-        legacy_hello.put_u8(FRAME_VERSION);
+        legacy_hello.put_u8(FRAME_VERSION_LEGACY);
         legacy_hello.put_u8(FRAME_HELLO);
         legacy_hello.put_u16(2);
         legacy_hello.put_slice(b"uk");
@@ -1452,6 +1732,200 @@ mod tests {
         assert!(mesh_b.peers().await.contains(&addr_a));
         mesh_a.shutdown();
         mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn regional_distributor_feeds_edge_without_leaf_forwarding() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+        let parent_cache = Arc::new(ChunkCache::new(options));
+        let edge_cache = Arc::new(ChunkCache::new(options));
+        let mut parent_config = CacheMeshConfig::new("parent", "uk", parent_addr)
+            .with_peer(edge_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Distributor);
+        parent_config.sync_interval = Duration::from_millis(10);
+        let mut edge_config = CacheMeshConfig::new("edge", "uk", edge_addr)
+            .with_peer(parent_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Edge);
+        edge_config.sync_interval = Duration::from_millis(10);
+        let parent = CacheMesh::new(Arc::clone(&parent_cache), parent_config)
+            .start()
+            .await
+            .unwrap();
+        let edge = CacheMesh::new(Arc::clone(&edge_cache), edge_config)
+            .start()
+            .await
+            .unwrap();
+
+        parent_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"parent-part"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if edge_cache.get_for_stream_id(7, 0).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        edge_cache
+            .add_for_stream_id(8, 0, Bytes::from_static(b"edge-part"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(parent_cache.get_for_stream_id(8, 0).await.is_none());
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn distributor_forwards_a_parent_replica_to_edges() {
+        let upstream_addr = loopback_addr();
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+        let upstream_cache = Arc::new(ChunkCache::new(options));
+        let distributor_cache = Arc::new(ChunkCache::new(options));
+        let edge_cache = Arc::new(ChunkCache::new(options));
+        let mut upstream_config = CacheMeshConfig::new("upstream", "uk", upstream_addr)
+            .with_peer(distributor_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Distributor);
+        upstream_config.sync_interval = Duration::from_millis(10);
+        let mut distributor_config = CacheMeshConfig::new("distributor", "uk", distributor_addr)
+            .with_peers([upstream_addr, edge_addr])
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Distributor);
+        distributor_config.sync_interval = Duration::from_millis(10);
+        let mut edge_config = CacheMeshConfig::new("edge", "uk", edge_addr)
+            .with_peer(distributor_addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Edge);
+        edge_config.sync_interval = Duration::from_millis(10);
+        let upstream = CacheMesh::new(Arc::clone(&upstream_cache), upstream_config)
+            .start()
+            .await
+            .unwrap();
+        let distributor = CacheMesh::new(Arc::clone(&distributor_cache), distributor_config)
+            .start()
+            .await
+            .unwrap();
+        let edge = CacheMesh::new(Arc::clone(&edge_cache), edge_config)
+            .start()
+            .await
+            .unwrap();
+
+        upstream_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"parent-part"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if distributor.peers().await.contains(&upstream_addr) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if distributor.request_replica(7, 0).await.unwrap() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if distributor_cache.get_for_stream_id(7, 0).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if edge_cache.get_for_stream_id(7, 0).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        upstream.shutdown();
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn same_region_mesh_rejects_cross_region_leaf() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+        let parent_cache = Arc::new(ChunkCache::new(options));
+        let edge_cache = Arc::new(ChunkCache::new(options));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            CacheMeshConfig::new("parent", "uk", parent_addr)
+                .with_peer(edge_addr)
+                .with_same_region_only(true)
+                .with_role(CacheMeshRole::Distributor),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "jp", edge_addr)
+                .with_peer(parent_addr)
+                .with_same_region_only(true)
+                .with_role(CacheMeshRole::Edge),
+        )
+        .start()
+        .await
+        .unwrap();
+        parent_cache
+            .add_for_stream_id(9, 0, Bytes::from_static(b"cross-region"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(edge_cache.get_for_stream_id(9, 0).await.is_none());
+        parent.shutdown();
+        edge.shutdown();
     }
 
     #[tokio::test]
