@@ -11,7 +11,8 @@ use tokio::sync::Barrier;
 const STREAMS: usize = 2;
 const RETAINED_PARTS: usize = 512;
 const PCM_PART_BYTES: usize = 5_760;
-const LATENCY_SAMPLE_INTERVAL: u64 = 4_096;
+const LATENCY_SAMPLE_INTERVAL: u64 = 4_093;
+const COOPERATIVE_YIELD_INTERVAL: u64 = 4_096;
 
 #[derive(Clone, Copy, Default)]
 struct Usage {
@@ -174,10 +175,11 @@ async fn run_step(workers: usize, duration: Duration) -> StepReport {
                     sequence = 0;
                     stream = (stream + 1) % STREAMS;
                 }
-                if (result.reads + result.failures).is_multiple_of(4_096)
-                    && Instant::now() >= deadline
-                {
-                    break;
+                if (result.reads + result.failures).is_multiple_of(COOPERATIVE_YIELD_INTERVAL) {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
             }
             result
