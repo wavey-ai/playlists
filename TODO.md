@@ -248,6 +248,25 @@ failures. A dedicated-host median is still required for a release claim.
 
 ## P2: Memory, layout, and mesh pipeline
 
+### [x] Reuse the manifest render buffer
+
+`M3u8Manifest` precomputes both invariant LL-HLS headers. The hot `add_part`
+path clears one per-stream scratch buffer and writes changing fields into it.
+
+Integer-backed durations and UTC timestamps write directly into the buffer.
+Returned `Bytes` own one copy, so later renders cannot mutate earlier output.
+
+The instrumented benchmark fell from 46 allocations and 10 reallocations per
+write to one allocation and effectively no steady-state reallocations.
+
+A one-second local diagnostic improved one-worker throughput by 45%. It
+improved eight-worker throughput by 83%. Dedicated-host medians remain required
+for release claims.
+
+An exact-output fixture covers closed and open segments, byte ranges, preload
+hints, and rendition reports. Timestamp tests compare direct formatting with
+Chrono, including extended years and leap seconds.
+
 ### [x] Define and enforce the playlist memory budget
 
 `buffer_size_kb` limits both raw manifest input and combined encoded snapshot

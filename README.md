@@ -113,6 +113,10 @@ The cache builds and compresses both playlist variants on a write. A latest-full
 or latest-delta hit loads one `ArcSwap` snapshot. It does not decompress, parse,
 or recompress the playlist. Writes use the speed-optimized gzip level.
 
+Each manifest precomputes its invariant LL-HLS headers and retains one render
+buffer. Changing durations, timestamps, and identifiers write into that buffer
+without temporary strings. Returned `Bytes` remain independent of later writes.
+
 Stream reassignment closes a per-index reuse gate, clears published state, and
 advances the generation. Read paths validate the published generation before
 and after they clone `Bytes`. Write paths keep the reuse gate until slot and
