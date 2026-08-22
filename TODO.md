@@ -379,6 +379,14 @@ add instrumentation cost. Use the same instrumentation for both comparisons.
 
 ## Maintenance
 
+### [x] Update dependencies with open security alerts
+
+The lockfile now resolves `bytes 1.11.1`, `rustls-webpki 0.103.13`, and
+`aws-lc-sys 0.44.0`. Their previous versions caused ten Dependabot alerts.
+
+The addressed alerts included six high, two medium, and two low severities.
+GitHub may retain them until it scans the pushed lockfile.
+
 ### [x] Clean strict Clippy findings
 
 `CacheMeshRole` derives `Default`. The mesh pipeline refactor reduces the former
