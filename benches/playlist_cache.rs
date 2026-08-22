@@ -19,6 +19,7 @@ enum Mode {
     HandleFull,
     MappedDelta,
     HandleDelta,
+    HandleDeltaReplicated,
     MappedMiss,
     HandleMiss,
     ReuseRace,
@@ -31,6 +32,7 @@ impl Mode {
             Self::HandleFull => "handle_full_hit",
             Self::MappedDelta => "mapped_cached_delta_hit",
             Self::HandleDelta => "handle_cached_delta_hit",
+            Self::HandleDeltaReplicated => "handle_cached_delta_hit_replicated_per_worker",
             Self::MappedMiss => "mapped_miss",
             Self::HandleMiss => "handle_miss",
             Self::ReuseRace => "index_reuse_resolve_and_write_race",
@@ -47,6 +49,7 @@ struct Usage {
 #[derive(Serialize)]
 struct StepReport {
     workers: usize,
+    latest_read_replicas: usize,
     duration_seconds: f64,
     operations: u64,
     failures: u64,
@@ -121,7 +124,15 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
         part_target_ms: 1_000,
         ..Options::default()
     };
-    let cache = Arc::new(M3u8Cache::new(options));
+    let latest_read_replicas = if matches!(mode, Mode::HandleDeltaReplicated) {
+        workers
+    } else {
+        1
+    };
+    let cache = Arc::new(M3u8Cache::new_with_latest_read_replicas(
+        options,
+        latest_read_replicas,
+    ));
     let mut manifest = M3u8Manifest::new(options);
     let mut latest = None;
     for _ in 0..40 {
@@ -156,6 +167,9 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
                         .is_ok_and(|value| value.is_some()),
                     Mode::MappedDelta => cache.last_delta(1).is_ok_and(|value| value.is_some()),
                     Mode::HandleDelta => cache
+                        .last_delta_for_handle(handle)
+                        .is_ok_and(|value| value.is_some()),
+                    Mode::HandleDeltaReplicated => cache
                         .last_delta_for_handle(handle)
                         .is_ok_and(|value| value.is_some()),
                     Mode::MappedMiss => cache
@@ -231,6 +245,7 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
 
     StepReport {
         workers,
+        latest_read_replicas,
         duration_seconds: seconds,
         operations,
         failures,
@@ -275,11 +290,12 @@ fn parse_args() -> (Duration, Mode) {
                     "handle-full" => Mode::HandleFull,
                     "mapped-delta" => Mode::MappedDelta,
                     "handle-delta" => Mode::HandleDelta,
+                    "handle-delta-replicated" => Mode::HandleDeltaReplicated,
                     "mapped-miss" => Mode::MappedMiss,
                     "handle-miss" => Mode::HandleMiss,
                     "reuse-race" => Mode::ReuseRace,
                     _ => panic!(
-                        "--mode must be mapped-full, handle-full, mapped-delta, handle-delta, mapped-miss, handle-miss, or reuse-race"
+                        "--mode must be mapped-full, handle-full, mapped-delta, handle-delta, handle-delta-replicated, mapped-miss, handle-miss, or reuse-race"
                     ),
                 };
             }

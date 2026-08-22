@@ -21,6 +21,7 @@ const MEDIA_BYTES: usize = 5_760;
 enum Mode {
     ManifestRender,
     CacheWrite,
+    CacheWriteReplicated,
     PlaylistsIndependent,
     PlaylistsHot,
 }
@@ -30,6 +31,9 @@ impl Mode {
         match self {
             Self::ManifestRender => "manifest_render_independent_streams",
             Self::CacheWrite => "manifest_render_and_m3u8_cache_write",
+            Self::CacheWriteReplicated => {
+                "manifest_render_and_m3u8_cache_write_with_latest_read_replicas"
+            }
             Self::PlaylistsIndependent => "playlists_add_independent_streams",
             Self::PlaylistsHot => "playlists_add_one_hot_stream",
         }
@@ -54,6 +58,7 @@ struct Percentiles {
 #[derive(Serialize)]
 struct StepReport {
     workers: usize,
+    latest_read_replicas: usize,
     duration_seconds: f64,
     operations: u64,
     failures: u64,
@@ -123,7 +128,15 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
         buffer_size_kb: 64,
         ..Options::default()
     };
-    let cache = Arc::new(M3u8Cache::new(options));
+    let latest_read_replicas = if matches!(mode, Mode::CacheWriteReplicated) {
+        workers
+    } else {
+        1
+    };
+    let cache = Arc::new(M3u8Cache::new_with_latest_read_replicas(
+        options,
+        latest_read_replicas,
+    ));
     let (playlists, _chunks, playlists_cache) = Playlists::new(options);
     let handles = (0..workers)
         .map(|worker| {
@@ -158,7 +171,7 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
                         black_box(playlist);
                         true
                     }
-                    Mode::CacheWrite => {
+                    Mode::CacheWrite | Mode::CacheWriteReplicated => {
                         let (playlist, segment_id, sequence, part_idx, _) =
                             manifest.add_part(5, true);
                         cache
@@ -225,7 +238,7 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
     let after = process_usage();
     let allocations = allocation_snapshot().since(allocations_before);
     let (retained_encoded_payload_bytes, maximum_cache_payload_bytes) =
-        if matches!(mode, Mode::CacheWrite) {
+        if matches!(mode, Mode::CacheWrite | Mode::CacheWriteReplicated) {
             let memory = cache.memory_stats();
             (
                 memory.encoded_playlist_bytes + memory.initialization_bytes,
@@ -245,6 +258,7 @@ fn run_step(workers: usize, duration: Duration, mode: Mode) -> StepReport {
 
     StepReport {
         workers,
+        latest_read_replicas,
         duration_seconds: seconds,
         operations,
         failures,
@@ -287,10 +301,11 @@ fn parse_args() -> (Duration, Mode) {
                 mode = match value.as_str() {
                     "manifest-render" => Mode::ManifestRender,
                     "cache-write" => Mode::CacheWrite,
+                    "cache-write-replicated" => Mode::CacheWriteReplicated,
                     "playlists-independent" => Mode::PlaylistsIndependent,
                     "playlists-hot" => Mode::PlaylistsHot,
                     _ => panic!(
-                        "--mode must be manifest-render, cache-write, playlists-independent, or playlists-hot"
+                        "--mode must be manifest-render, cache-write, cache-write-replicated, playlists-independent, or playlists-hot"
                     ),
                 };
             }

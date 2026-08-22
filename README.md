@@ -117,6 +117,14 @@ Each manifest precomputes its invariant LL-HLS headers and retains one render
 buffer. Changing durations, timestamps, and identifiers write into that buffer
 without temporary strings. Returned `Bytes` remain independent of later writes.
 
+Latest-playlist reads use one shared payload by default. Read-heavy deployments
+can use `M3u8Cache::new_with_latest_read_replicas` or the matching `Playlists`
+constructor. Each runtime thread selects one independent payload replica.
+
+Replication reduces shared reference-count traffic for one hot stream. It adds
+one payload copy per extra replica on each write. Use it only after measuring
+the target read-to-write ratio.
+
 Stream reassignment closes a per-index reuse gate, clears published state, and
 advances the generation. Read paths validate the published generation before
 and after they clone `Bytes`. Write paths keep the reuse gate until slot and
@@ -148,6 +156,9 @@ for an invalid calculated capacity.
 Both caches expose `memory_stats`. These snapshots report live payload bytes and
 the configured maximum payload bytes. They do not include lock, map, allocator,
 or runtime overhead.
+
+`M3u8Cache` includes extra latest-read payload replicas in both reported byte
+values. The primary replica shares the normal ring payload.
 
 Manifest history is bounded by the retained segment and part counts. Program
 date-time state advances when an old segment leaves the retained window. A long
@@ -272,8 +283,8 @@ Use these accepted mode values:
 | --- | --- |
 | `distribution_capacity` | `--lookup raw`, `mapped`, `handle` |
 | `chunk_workloads` | `write-raw`, `write-mapped`, `write-handle`, `mixed-handle`, `churn` |
-| `playlist_cache` | `mapped-full`, `handle-full`, `mapped-delta`, `handle-delta`, `mapped-miss`, `handle-miss`, `reuse-race` |
-| `playlist_writes` | `manifest-render`, `cache-write`, `playlists-independent`, `playlists-hot` |
+| `playlist_cache` | `mapped-full`, `handle-full`, `mapped-delta`, `handle-delta`, `handle-delta-replicated`, `mapped-miss`, `handle-miss`, `reuse-race` |
+| `playlist_writes` | `manifest-render`, `cache-write`, `cache-write-replicated`, `playlists-independent`, `playlists-hot` |
 | `mesh_pipeline` | `receive`, `recovery`, `replica` |
 
 Each report includes process CPU time, CPU nanoseconds per operation, allocator

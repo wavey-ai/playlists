@@ -105,9 +105,27 @@ impl Playlists {
     }
 
     pub fn try_new(options: Options) -> Result<PlaylistCacheBundle, CacheError> {
+        Self::try_new_with_latest_read_replicas(options, 1)
+    }
+
+    /// Build playlist caches with independent latest-playlist read payloads.
+    ///
+    /// Use more than one replica only for read-heavy streams with measured
+    /// payload reference-count contention.
+    pub fn new_with_latest_read_replicas(options: Options, replicas: usize) -> PlaylistCacheBundle {
+        Self::try_new_with_latest_read_replicas(options, replicas)
+            .expect("valid playlist capacities")
+    }
+
+    pub fn try_new_with_latest_read_replicas(
+        options: Options,
+        replicas: usize,
+    ) -> Result<PlaylistCacheBundle, CacheError> {
         let options = options.normalized();
         let chunk_cache = Arc::new(ChunkCache::try_new(options)?);
-        let m3u8_cache = Arc::new(M3u8Cache::try_new(options)?);
+        let m3u8_cache = Arc::new(M3u8Cache::try_new_with_latest_read_replicas(
+            options, replicas,
+        )?);
 
         Ok((
             Arc::new(Self {

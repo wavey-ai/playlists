@@ -267,6 +267,29 @@ An exact-output fixture covers closed and open segments, byte ranges, preload
 hints, and rendition reports. Timestamp tests compare direct formatting with
 Chrono, including extended years and leap seconds.
 
+### [x] Make latest-playlist read replication opt-in
+
+The default latest-read path retains one payload. New cache and `Playlists`
+constructors accept one through 64 independent latest-payload replicas.
+
+Runtime threads select stable replicas without a request-time allocation.
+Writes copy only the additional latest payloads. Historical ring entries remain
+single-copy.
+
+An immediate two-second local A/B compared one hot cached delta playlist. Eight
+readers improved from 8.96 million to 38.62 million reads/s with eight replicas.
+CPU cost fell from 279.9 to 116.5 ns/read.
+
+Actual encoded payload increased from 911 to 7,304 bytes. The calculated maximum
+increased by 5.47 MiB because the configured snapshot limit is 800 KiB.
+
+The matching write diagnostic added nine allocations/write at eight replicas.
+Its CPU cost increased by 9%. Keep one replica unless hot-read fan-out justifies
+this write and memory cost.
+
+The benchmark adds `handle-delta-replicated` and `cache-write-replicated` modes.
+Tests cover exact variants, concurrent readers, memory accounting, and reuse.
+
 ### [x] Define and enforce the playlist memory budget
 
 `buffer_size_kb` limits both raw manifest input and combined encoded snapshot
@@ -375,7 +398,7 @@ Rust version, target, CPU, duration, mode, payload meaning, median, and range.
 
 The local implementation checks have these results:
 
-- [x] All-feature library tests pass: 93 tests.
+- [x] All-feature library tests pass: 100 tests.
 - [x] The local all-feature, all-target release run passes.
 - [x] Strict all-feature, all-target Clippy passes with warnings denied.
 - [x] All benchmark targets compile in release mode.

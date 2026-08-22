@@ -5,9 +5,18 @@ use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
+
+const MAX_LATEST_READ_REPLICAS: usize = 64;
+static NEXT_LATEST_READ_REPLICA: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static LATEST_READ_REPLICA: usize =
+        NEXT_LATEST_READ_REPLICA.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MediaSegmentBlock {
@@ -66,6 +75,17 @@ struct PlaylistSnapshot {
     delta: Option<CachedPlaylist>,
 }
 
+struct LatestPlaylistSnapshot {
+    stream_id: u64,
+    generation: u64,
+    variants: Box<[LatestPlaylistVariants]>,
+}
+
+struct LatestPlaylistVariants {
+    full: CachedPlaylist,
+    delta: Option<CachedPlaylist>,
+}
+
 #[derive(Clone)]
 struct StreamInitialization {
     stream_id: u64,
@@ -89,6 +109,8 @@ struct PlaylistStreamState {
 pub struct M3u8Cache {
     buffer: Vec<RwLock<Option<Arc<PlaylistSnapshot>>>>,
     latest: Vec<ArcSwapOption<PlaylistSnapshot>>,
+    latest_read_replicas: Option<Vec<ArcSwapOption<LatestPlaylistSnapshot>>>,
+    latest_read_replica_count: usize,
     stream_states: Vec<RwLock<PlaylistStreamState>>,
     inits: Vec<RwLock<Option<StreamInitialization>>>,
     update_notifiers: Vec<Arc<Notify>>,
@@ -98,13 +120,80 @@ pub struct M3u8Cache {
     max_init_bytes: usize,
 }
 
+impl LatestPlaylistSnapshot {
+    fn new(snapshot: &PlaylistSnapshot, replica_count: usize) -> Self {
+        let variants = (0..replica_count)
+            .map(|replica| LatestPlaylistVariants {
+                full: replicate_variant(&snapshot.full, replica > 0),
+                delta: snapshot
+                    .delta
+                    .as_ref()
+                    .map(|delta| replicate_variant(delta, replica > 0)),
+            })
+            .collect();
+        Self {
+            stream_id: snapshot.stream_id,
+            generation: snapshot.generation,
+            variants,
+        }
+    }
+
+    fn variant(&self) -> &LatestPlaylistVariants {
+        let replica = LATEST_READ_REPLICA.with(|replica| *replica) % self.variants.len();
+        &self.variants[replica]
+    }
+
+    fn extra_payload_bytes(&self) -> usize {
+        self.variants
+            .iter()
+            .skip(1)
+            .map(|variant| {
+                variant
+                    .full
+                    .bytes
+                    .len()
+                    .saturating_add(variant.delta.as_ref().map_or(0, |delta| delta.bytes.len()))
+            })
+            .fold(0_usize, usize::saturating_add)
+    }
+}
+
+fn replicate_variant(variant: &CachedPlaylist, copy_payload: bool) -> CachedPlaylist {
+    CachedPlaylist {
+        bytes: if copy_payload {
+            Bytes::copy_from_slice(&variant.bytes)
+        } else {
+            variant.bytes.clone()
+        },
+        hash: variant.hash,
+    }
+}
+
 impl M3u8Cache {
     pub fn new(options: Options) -> Self {
         Self::try_new(options).expect("valid playlist cache capacity")
     }
 
     pub fn try_new(options: Options) -> Result<Self, CacheError> {
+        Self::try_new_with_latest_read_replicas(options, 1)
+    }
+
+    /// Build a cache with independent latest-playlist payloads for hot readers.
+    ///
+    /// One replica preserves the default memory and write costs. Values above
+    /// one trade extra latest-snapshot memory and write copies for less payload
+    /// reference-count contention. The count is normalized to 1 through 64.
+    pub fn new_with_latest_read_replicas(options: Options, replicas: usize) -> Self {
+        Self::try_new_with_latest_read_replicas(options, replicas)
+            .expect("valid playlist cache capacity")
+    }
+
+    pub fn try_new_with_latest_read_replicas(
+        options: Options,
+        replicas: usize,
+    ) -> Result<Self, CacheError> {
         let options = options.normalized();
+        let latest_read_replica_count = replicas.clamp(1, MAX_LATEST_READ_REPLICAS);
         let stream_capacity = options
             .max_parts_per_segment
             .checked_mul(options.max_segments)
@@ -127,6 +216,12 @@ impl M3u8Cache {
             latest: (0..options.num_playlists)
                 .map(|_| ArcSwapOption::empty())
                 .collect(),
+            latest_read_replicas: (latest_read_replica_count > 1).then(|| {
+                (0..options.num_playlists)
+                    .map(|_| ArcSwapOption::empty())
+                    .collect()
+            }),
+            latest_read_replica_count,
             stream_states: (0..options.num_playlists)
                 .map(|_| {
                     RwLock::new(PlaylistStreamState {
@@ -151,6 +246,11 @@ impl M3u8Cache {
 
     pub fn resolve_stream(&self, stream_id: u64) -> Option<M3u8StreamHandle> {
         self.registry.resolve(stream_id).map(M3u8StreamHandle)
+    }
+
+    /// Return the normalized latest-playlist read replica count.
+    pub fn latest_read_replica_count(&self) -> usize {
+        self.latest_read_replica_count
     }
 
     pub fn resolve_or_create_stream(&self, stream_id: u64) -> Result<M3u8StreamHandle, CacheError> {
@@ -631,23 +731,45 @@ impl M3u8Cache {
         if !self.registry.is_current_fast(handle.0) {
             return Err(CacheError::StreamNotFound);
         }
-        let snapshot_guard = self.latest[handle.index()].load();
-        let Some(snapshot) = snapshot_guard.as_ref() else {
-            return Ok(None);
-        };
-        let result = if snapshot.stream_id == handle.stream_id()
-            && snapshot.generation == handle.generation()
-        {
-            if delta {
-                snapshot
-                    .delta
-                    .as_ref()
-                    .map(|variant| (variant.bytes.clone(), variant.hash))
+        let result = if let Some(latest_read_replicas) = &self.latest_read_replicas {
+            let snapshot_guard = latest_read_replicas[handle.index()].load();
+            let Some(snapshot) = snapshot_guard.as_ref() else {
+                return Ok(None);
+            };
+            if snapshot.stream_id == handle.stream_id()
+                && snapshot.generation == handle.generation()
+            {
+                let variants = snapshot.variant();
+                if delta {
+                    variants
+                        .delta
+                        .as_ref()
+                        .map(|variant| (variant.bytes.clone(), variant.hash))
+                } else {
+                    Some((variants.full.bytes.clone(), variants.full.hash))
+                }
             } else {
-                Some((snapshot.full.bytes.clone(), snapshot.full.hash))
+                None
             }
         } else {
-            None
+            let snapshot_guard = self.latest[handle.index()].load();
+            let Some(snapshot) = snapshot_guard.as_ref() else {
+                return Ok(None);
+            };
+            if snapshot.stream_id == handle.stream_id()
+                && snapshot.generation == handle.generation()
+            {
+                if delta {
+                    snapshot
+                        .delta
+                        .as_ref()
+                        .map(|variant| (variant.bytes.clone(), variant.hash))
+                } else {
+                    Some((snapshot.full.bytes.clone(), snapshot.full.hash))
+                }
+            } else {
+                None
+            }
         };
         self.registry
             .is_current_fast(handle.0)
@@ -687,19 +809,42 @@ impl M3u8Cache {
             .filter_map(|init| init.read().ok())
             .filter_map(|init| init.as_ref().map(|init| init.bytes.len()))
             .fold(0_usize, usize::saturating_add);
+        let latest_replica_bytes = self.latest_read_replicas.as_ref().map_or(0, |latest| {
+            latest
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .load()
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.extra_payload_bytes())
+                })
+                .fold(0_usize, usize::saturating_add)
+        });
         M3u8CacheMemoryStats {
             occupied_slots,
-            encoded_playlist_bytes,
+            encoded_playlist_bytes: encoded_playlist_bytes.saturating_add(latest_replica_bytes),
             initialization_bytes,
             maximum_payload_bytes: self
                 .buffer
                 .len()
                 .saturating_mul(self.max_snapshot_bytes)
-                .saturating_add(self.inits.len().saturating_mul(self.max_init_bytes)),
+                .saturating_add(self.inits.len().saturating_mul(self.max_init_bytes))
+                .saturating_add(
+                    self.options
+                        .num_playlists
+                        .saturating_mul(self.latest_read_replica_count.saturating_sub(1))
+                        .saturating_mul(self.max_snapshot_bytes),
+                ),
         }
     }
 
     fn publish_position(&self, stream_idx: usize, snapshot: Arc<PlaylistSnapshot>) {
+        let latest_read_replicas = self.latest_read_replicas.as_ref().map(|_| {
+            Arc::new(LatestPlaylistSnapshot::new(
+                &snapshot,
+                self.latest_read_replica_count,
+            ))
+        });
         let mut state = self.stream_states[stream_idx]
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -730,6 +875,11 @@ impl M3u8Cache {
         }) {
             state.position = Some(position);
             self.latest[stream_idx].store(Some(snapshot));
+            if let (Some(slots), Some(snapshot)) =
+                (&self.latest_read_replicas, latest_read_replicas)
+            {
+                slots[stream_idx].store(Some(snapshot));
+            }
         }
         state.version = next_version(state.version);
         drop(state);
@@ -767,6 +917,13 @@ impl M3u8Cache {
             state.version = next_version(state.version);
         }
         if let Some(latest) = self.latest.get(stream_idx) {
+            latest.store(None);
+        }
+        if let Some(latest) = self
+            .latest_read_replicas
+            .as_ref()
+            .and_then(|latest| latest.get(stream_idx))
+        {
             latest.store(None);
         }
         self.notify_update(stream_idx);
@@ -953,6 +1110,26 @@ mod tests {
     }
 
     #[test]
+    fn latest_read_replica_count_is_bounded() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 1,
+            ..Options::default()
+        };
+
+        assert_eq!(
+            M3u8Cache::new_with_latest_read_replicas(options, 0).latest_read_replica_count(),
+            1
+        );
+        assert_eq!(
+            M3u8Cache::new_with_latest_read_replicas(options, usize::MAX)
+                .latest_read_replica_count(),
+            MAX_LATEST_READ_REPLICAS
+        );
+    }
+
+    #[test]
     fn tracks_last_playlist_position() {
         let cache = M3u8Cache::new(Options::default());
 
@@ -1047,6 +1224,139 @@ mod tests {
         assert!(!delta.contains("s5.mp4"));
         assert!(delta.contains("s6.mp4"));
         assert!(delta.contains("#EXT-X-PART:"));
+    }
+
+    #[test]
+    fn latest_read_replicas_preserve_bytes_and_report_their_memory() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 10,
+            max_parts_per_segment: 16,
+            segment_min_ms: 1_000,
+            target_duration_ms: 1_000,
+            part_target_ms: 1_000,
+            buffer_size_kb: 64,
+            ..Options::default()
+        };
+        let baseline = M3u8Cache::new(options);
+        let replicated = M3u8Cache::new_with_latest_read_replicas(options, 4);
+        let mut manifest = M3u8Manifest::new(options);
+        let mut latest = None;
+        for _ in 0..12 {
+            latest = Some(manifest.add_part(1_000, true));
+        }
+        let (playlist, segment_id, sequence, part_idx, _) = latest.expect("rendered playlist");
+
+        baseline
+            .add(1, segment_id, sequence, part_idx, playlist.clone())
+            .expect("baseline write");
+        replicated
+            .add(1, segment_id, sequence, part_idx, playlist)
+            .expect("replicated write");
+
+        let baseline_handle = baseline.resolve_stream(1).expect("baseline handle");
+        let replicated_handle = replicated.resolve_stream(1).expect("replicated handle");
+        let expected_full = baseline
+            .last_for_handle(baseline_handle)
+            .expect("baseline read")
+            .expect("baseline full playlist");
+        let expected_delta = baseline
+            .last_delta_for_handle(baseline_handle)
+            .expect("baseline delta read")
+            .expect("baseline delta playlist");
+
+        for _ in 0..128 {
+            assert_eq!(
+                replicated
+                    .last_for_handle(replicated_handle)
+                    .expect("replicated read"),
+                Some(expected_full.clone())
+            );
+            assert_eq!(
+                replicated
+                    .last_delta_for_handle(replicated_handle)
+                    .expect("replicated delta read"),
+                Some(expected_delta.clone())
+            );
+        }
+
+        let baseline_memory = baseline.memory_stats();
+        let replicated_memory = replicated.memory_stats();
+        let one_snapshot_bytes = expected_full.0.len() + expected_delta.0.len();
+        assert_eq!(
+            replicated_memory.encoded_playlist_bytes,
+            baseline_memory.encoded_playlist_bytes + one_snapshot_bytes * 3
+        );
+        assert_eq!(
+            replicated_memory.maximum_payload_bytes,
+            baseline_memory.maximum_payload_bytes + options.buffer_size_kb * 1_024 * 3
+        );
+
+        replicated.ensure_stream_id(2).expect("reuse stream slot");
+        let replacement = replicated.resolve_stream(2).expect("replacement handle");
+        assert!(replicated.last_for_handle(replicated_handle).is_err());
+        assert_eq!(
+            replicated
+                .last_for_handle(replacement)
+                .expect("replacement read"),
+            None
+        );
+    }
+
+    #[test]
+    fn concurrent_latest_replica_reads_return_complete_variants() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 10,
+            segment_min_ms: 1_000,
+            target_duration_ms: 1_000,
+            part_target_ms: 1_000,
+            ..Options::default()
+        };
+        let cache = Arc::new(M3u8Cache::new_with_latest_read_replicas(options, 8));
+        let mut manifest = M3u8Manifest::new(options);
+        let mut latest = None;
+        for _ in 0..12 {
+            latest = Some(manifest.add_part(1_000, true));
+        }
+        let (playlist, segment_id, sequence, part_idx, _) = latest.expect("rendered playlist");
+        cache
+            .add(1, segment_id, sequence, part_idx, playlist)
+            .expect("seed replicated cache");
+        let handle = cache.resolve_stream(1).expect("stream handle");
+        let expected_full = cache
+            .last_for_handle(handle)
+            .expect("full read")
+            .expect("full playlist");
+        let expected_delta = cache
+            .last_delta_for_handle(handle)
+            .expect("delta read")
+            .expect("delta playlist");
+
+        let threads = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let expected_full = expected_full.clone();
+                let expected_delta = expected_delta.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        assert_eq!(
+                            cache.last_for_handle(handle).expect("replicated full read"),
+                            Some(expected_full.clone())
+                        );
+                        assert_eq!(
+                            cache
+                                .last_delta_for_handle(handle)
+                                .expect("replicated delta read"),
+                            Some(expected_delta.clone())
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("replica reader completed");
+        }
     }
 
     #[test]
