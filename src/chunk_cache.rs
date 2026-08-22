@@ -101,6 +101,7 @@ pub struct ChunkCache {
     stream_states: Vec<StdRwLock<ChunkStreamState>>,
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
     registry: StreamRegistry,
+    stream_update_notifiers: Vec<Arc<Notify>>,
     exact_part_waiters: Vec<ExactPartWaiterShard>,
     pub options: Options,
 }
@@ -133,6 +134,9 @@ impl ChunkCache {
                 .map(|_| StdRwLock::new(None))
                 .collect(),
             registry: StreamRegistry::new(options.num_playlists),
+            stream_update_notifiers: (0..options.num_playlists)
+                .map(|_| Arc::new(Notify::new()))
+                .collect(),
             exact_part_waiters: (0..EXACT_PART_WAITER_SHARDS)
                 .map(|_| StdMutex::new(HashMap::new()))
                 .collect(),
@@ -198,6 +202,16 @@ impl ChunkCache {
         streams
     }
 
+    /// Return the fixed notification source for writes or resets on one lane.
+    ///
+    /// This API supports callers that deliberately own a raw physical lane.
+    /// Enable a `notified` future, recheck the cache, and then await it. Logical
+    /// stream callers should prefer [`Self::exact_part_waiter`] when they know
+    /// the requested part identity.
+    pub fn update_notifier(&self, stream_idx: usize) -> Option<Arc<Notify>> {
+        self.stream_update_notifiers.get(stream_idx).cloned()
+    }
+
     pub async fn add_for_stream_id(
         &self,
         stream_id: u64,
@@ -218,6 +232,7 @@ impl ChunkCache {
     ) -> Result<(), &'static str> {
         self.add_slot_for_handle(handle, id, data_bytes).await?;
         self.notify_exact_part_waiters(handle, id);
+        self.notify_stream_update(handle.index());
         Ok(())
     }
 
@@ -251,6 +266,9 @@ impl ChunkCache {
             PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
         ) {
             self.notify_exact_part_waiters(handle, id);
+        }
+        if result == PutIfAbsentResult::Inserted {
+            self.notify_stream_update(handle.index());
         }
         Ok(result)
     }
@@ -292,6 +310,7 @@ impl ChunkCache {
             self.publish_contiguous_last(handle, first_expected_id)
                 .await?;
             self.notify_exact_part_waiters(handle, id);
+            self.notify_stream_update(handle.index());
         }
         Ok(result)
     }
@@ -507,7 +526,8 @@ impl ChunkCache {
         bytes: Bytes,
     ) -> Result<(), &'static str> {
         self.validate_initialization_payload(&bytes)?;
-        self.registry
+        let result = self
+            .registry
             .with_validated(handle.0, || {
                 let slot = self
                     .stream_initializations
@@ -530,7 +550,11 @@ impl ChunkCache {
                 });
                 self.bump_version_locked(handle.index());
             })
-            .ok_or("Stale stream handle")
+            .ok_or("Stale stream handle");
+        if result.is_ok() {
+            self.notify_stream_update(handle.index());
+        }
+        result
     }
 
     pub fn stream_initialization(&self, stream_id: u64) -> Option<Bytes> {
@@ -563,7 +587,9 @@ impl ChunkCache {
             .generation(stream_idx)
             .ok_or("Stream index out of bounds")?;
         self.set_with_generation(stream_idx, generation, id, data)
-            .await
+            .await?;
+        self.notify_stream_update(stream_idx);
+        Ok(())
     }
 
     async fn set_with_generation(
@@ -612,7 +638,9 @@ impl ChunkCache {
             .ok_or("Stream index out of bounds")?;
         let id = self.reserve_next_with_generation(stream_idx, generation)?;
         self.add_with_generation(stream_idx, generation, id, data_bytes)
-            .await
+            .await?;
+        self.notify_stream_update(stream_idx);
+        Ok(())
     }
 
     pub async fn append_for_handle(
@@ -636,7 +664,9 @@ impl ChunkCache {
             .generation(stream_idx)
             .ok_or("Stream index out of bounds")?;
         self.add_with_generation(stream_idx, generation, id, data_bytes)
-            .await
+            .await?;
+        self.notify_stream_update(stream_idx);
+        Ok(())
     }
 
     async fn add_with_generation(
@@ -809,6 +839,13 @@ impl ChunkCache {
             state.last = None;
             state.next_id = 1;
             state.version = next_version(state.version);
+        }
+        self.notify_stream_update(stream_idx);
+    }
+
+    fn notify_stream_update(&self, stream_idx: usize) {
+        if let Some(notifier) = self.stream_update_notifiers.get(stream_idx) {
+            notifier.notify_waiters();
         }
     }
 
@@ -1883,5 +1920,32 @@ mod tests {
             cache.get_for_stream_id(63, 5).await.unwrap().0,
             Bytes::from_static(b"object-5")
         );
+    }
+
+    #[tokio::test]
+    async fn raw_lane_update_notifier_wakes_for_write_and_reset() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        let notifier = cache.update_notifier(0).unwrap();
+        let written = notifier.notified();
+        tokio::pin!(written);
+        written.as_mut().enable();
+        cache
+            .add(0, 1, Bytes::from_static(b"raw-lane"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), written)
+            .await
+            .expect("raw lane write must wake an enabled waiter");
+
+        let reset = notifier.notified();
+        tokio::pin!(reset);
+        reset.as_mut().enable();
+        cache.reset_stream_idx(0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), reset)
+            .await
+            .expect("raw lane reset must wake an enabled waiter");
     }
 }

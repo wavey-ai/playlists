@@ -102,6 +102,13 @@ recheck the cache, and sleep until playlist publication, segment closure, or
 stream reset. This avoids a polling task for each waiting client and does not
 grow retained state with the number of requests.
 
+`ChunkCache::update_notifier` provides the equivalent fixed notification source
+for a deliberately raw lane. It wakes for successful writes, initialization
+changes, and resets. Enable a notification, recheck the lane, and then await it
+to avoid a missed update. Logical-stream callers should use
+`exact_part_waiter` when they know the requested part ID; that path also binds
+the wait to the stream generation.
+
 The cache builds and compresses both playlist variants on a write. A latest-full
 or latest-delta hit loads one `ArcSwap` snapshot. It does not decompress, parse,
 or recompress the playlist. Writes use the speed-optimized gzip level.
