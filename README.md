@@ -1,60 +1,131 @@
-# Playlists & Chunk Cache
+# Playlists and Chunk Cache
 
 [![CI](https://github.com/wavey-ai/playlists/actions/workflows/ci.yml/badge.svg)](https://github.com/wavey-ai/playlists/actions/workflows/ci.yml)
 
 ## Overview
 
-This crate supplies a high-throughput, lock-efficient ring buffer. It supports
-Low-Latency HLS (LL-HLS) segments and other binary-packet workloads.
+This crate provides fixed-capacity caches and manifest tools for Low-Latency HLS
+(LL-HLS) and other rolling byte streams.
 
-Components
+- `ChunkCache` stores `bytes::Bytes` media objects in a fixed ring.
+- `M3u8Cache` stores gzip-compressed full and delta playlist snapshots.
+- `M3u8Manifest` renders a bounded LL-HLS media playlist.
+- `Playlists` gives each active stream an independent manifest lock.
+- The optional `CacheMesh` feature replicates chunk data over UDP with RaptorQ
+  forward error correction (FEC).
 
-* ChunkCache – fixed-size circular buffer of `bytes::Bytes` slots
-* M3u8Cache – companion buffer that stores compressed playlist data and
-  initialisation fragments
-* M3u8Manifest – manifest builder that rolls segments and parts following the
-  LL-HLS draft spec
-* CacheMesh – UDP/RaptorQ-FEC peer discovery and cache-slot replication for
-  local multi-region HLS prototypes
-* Playlists – ties the two caches together and tracks active live streams
+`ChunkCache` uses Tokio locks for media slots. Playlist rendering, gzip work,
+and `M3u8Cache` operations are synchronous CPU work. The crate does not perform
+file I/O.
 
-All code is asynchronous (Tokio), uses only RwLock plus atomics, and performs no
-blocking I/O.
+## Stream identity
 
-## Architecture
+A logical stream ID is not a physical cache index. Physical indices are reused
+when the configured stream capacity is full. Each assignment therefore has a
+generation.
 
-ChunkCache layout
-    num_playlists × max_segments × max_parts_per_segment slots
-        slot = atomic logical id + atomic generation + atomic hash + payload
-        stream = atomic last id + atomic generation + atomic content version
+Resolve a stream once at a request or batch boundary. Reuse the returned opaque
+handle for repeated work.
 
-M3u8Cache layout
-    identical shape, but payload is gzip-compressed playlist data
+```rust
+use bytes::Bytes;
+use playlists::{chunk_cache::ChunkCache, Options};
 
-• Each playlist gets its own ring buffer. Unrelated playlists never block each other.
-• Writes lock exactly one slot. Reads take shared locks and can run in parallel.
-• All indices (last_seg, last_part, idxs) are AtomicUsize.
-• `ChunkCache::version(stream_idx)` advances after every slot mutation and stream
-  reuse, allowing callers to invalidate derived manifests without rescanning
-  unchanged slots on every request.
+# async fn example() -> Result<(), &'static str> {
+let cache = ChunkCache::new(Options::default());
+let stream = cache.resolve_or_create_stream(42).await;
 
-## Generic nature
+cache
+    .add_for_handle(stream, 7, Bytes::from_static(b"part-7"))
+    .await?;
+let part = cache.get_for_handle(stream, 7).await;
+assert_eq!(part.unwrap().0, Bytes::from_static(b"part-7"));
+# Ok(())
+# }
+```
 
-ChunkCache stores raw `bytes::Bytes`.  The cache never parses or validates the
-content, so it can be reused for protobuf blobs, encrypted chunks, telemetry
-frames, or any other byte slice.
+The handle contains a cache identity, stream ID, physical index, and generation.
+A stale handle cannot read or write a reused index. A handle from another cache
+is also rejected.
 
-## Cache mesh prototype
+Mapped methods such as `get_for_stream_id` are suitable for one-shot calls.
+They resolve the logical ID on each call. Handle methods avoid the global map on
+the repeated read path.
 
-`playlists::mesh` can:
+The raw-index methods are only for code that owns an unassigned physical index.
+They reject indices that belong to the logical-stream registry. Do not keep a
+raw index from `get_stream_idx` and use it as a durable identity.
 
-- bind a UDP socket
-- discover configured or broadcast peer caches with FEC-protected hello frames
-- share known peer addresses
-- copy `ChunkCache` slots by stable `stream_id`.
+## Concurrency design
 
-Use this feature for local AV mesh prototypes. One region can ingest media, and
-other regions can serve the same HLS parts from their local caches.
+`ChunkCache` stores the slot ID, generation, hash, and payload under one slot
+lock. A reader either sees the complete old slot or the complete new slot.
+Each stream has one grouped state value for its last ID, next ID, and content
+version.
+
+`M3u8Cache` stores one tagged snapshot with these values:
+
+- stream ID and generation
+- segment, part, and sequence
+- compressed full playlist and hash
+- optional compressed delta playlist and hash
+
+The cache builds and compresses both playlist variants on a write. A latest-full
+or latest-delta hit loads one `ArcSwap` snapshot. It does not decompress, parse,
+or recompress the playlist. Writes use the speed-optimized gzip level.
+
+Stream reassignment closes a per-index reuse gate, clears published state, and
+advances the generation. Read paths validate the published generation before
+and after they clone `Bytes`. Write paths keep the reuse gate until slot and
+position metadata are complete.
+
+`Playlists` holds the global map lock only while it finds or creates an entry.
+Each entry has its own manifest lock. Writes to unrelated streams can run in
+parallel. `fin` marks the exact entry as closing, waits for its in-flight write,
+clears both caches, and removes that entry.
+
+## Capacity and memory
+
+The main fixed-slot count is:
+
+```text
+num_playlists × max_segments × max_parts_per_segment
+```
+
+`buffer_size_kb` has two related meanings:
+
+- `ChunkCache` treats it as the maximum size of one chunk payload.
+- `M3u8Cache` treats it as the maximum raw manifest size and the maximum combined
+  encoded size of one full-plus-delta snapshot.
+
+`init_size_kb` is the maximum initialization-object size. Constructors use
+checked capacity arithmetic. `try_new` returns `CacheError::ArithmeticOverflow`
+for an invalid calculated capacity.
+
+Both caches expose `memory_stats`. These snapshots report live payload bytes and
+the configured maximum payload bytes. They do not include lock, map, allocator,
+or runtime overhead.
+
+Manifest history is bounded by the retained segment and part counts. Program
+date-time state advances when an old segment leaves the retained window. A long
+stream does not retain a duration entry for every segment it has produced.
+Rendition reports are limited to 256 entries, and each URI is limited to 2,048
+bytes.
+
+Exact-part waiter keys use 64 bounded shards. Registering a waiter for an unknown
+stream returns `None`; it does not create a stream or evict a live stream.
+
+## Missing initialization data
+
+Initialization data is tagged with the stream ID and generation. A new or reused
+stream has no initialization until a caller sets one. `M3u8Cache::get_init`
+returns `CacheError::StreamNotFound` when the stream or its initialization is
+absent. An HTTP service should map that crate-level result to its documented
+missing-resource response, normally HTTP 404.
+
+## Cache mesh
+
+Enable the prototype mesh with the `mesh` feature.
 
 ```rust
 use playlists::{
@@ -69,91 +140,116 @@ let cache = Arc::new(ChunkCache::new(Options::default()));
 let peer: SocketAddr = "127.0.0.1:9201".parse()?;
 let config = CacheMeshConfig::new("uk-1", "uk", "127.0.0.1:9101".parse()?)
     .with_peer(peer);
-let mesh = CacheMesh::new(cache.clone(), config).start().await?;
+let mesh = CacheMesh::new(Arc::clone(&cache), config).start().await?;
 
-cache.add_for_stream_id(1, 0, "part bytes".into()).await?;
+cache
+    .add_for_stream_id(1, 0, "part bytes".into())
+    .await
+    .expect("cache write");
 mesh.shutdown();
 # Ok(())
 # }
 ```
 
-The current implementation is deliberately simple. Static seed peers or a
-caller-supplied private-subnet path start discovery. Mesh `HELLO` frames share
-known peer addresses. Nodes do not forward remotely replicated slots again.
-This design supports the first regional prototype. It also keeps the cache API
-independent of a specific media protocol.
+The mesh is closed to unconfigured source addresses. `with_peer` and
+`with_peers` both connect and authorize an address. `with_allowed_peers`
+authorizes addresses that a trusted seed can advertise through gossip. Runtime
+`add_peer` also authorizes the address.
 
-Mesh FEC uses a configurable repair-symbol floor plus payload-proportional
-redundancy and a hard cap. Defaults are one repair symbol, a 3% repair ratio,
-and at most 32 repair symbols. Small realtime messages retain low overhead,
-while larger cache parts receive enough independent repair symbols to tolerate
-multiple packet losses without waiting for demand-triggered backfill. Configure
-the policy through `CacheMeshConfig::{repair_symbols, repair_ratio,
-max_repair_symbols, symbol_size}`.
+This address allowlist is not cryptographic authentication. Do not expose the
+prototype mesh to an untrusted network. Use a private authenticated transport or
+add message authentication before an Internet deployment.
 
-`CacheMeshHandle::fec_stats()` returns a lock-free bounded snapshot of transport
-outcomes. It separates:
+The receive path has three bounded stages:
 
-- source and repair traffic
-- protected and wire bytes
-- successful decodes
-- objects and missing source symbols recovered by FEC
-- late sources and repaired sources that remain absent after observation
-- incomplete objects that age out of the observation window
-- encode and decode errors.
+1. Validate the source, decode FEC, decode the frame, and enqueue it.
+2. Apply discovery, chunk, and initialization frames.
+3. Serve replica ranges from a separate replica queue.
 
-Recovery accounting reads only fixed datagram and RaptorQ payload-ID headers on
-the hot path. Normal decoder validation remains authoritative.
+A full frame or replica queue drops the new retryable work. Cache sync and a
+later replica request can retry it. `fec_stats` reports current and peak queue
+depth, queue drops, decode time, replica service attempts, service errors, and
+service time.
 
-## Performance
+Default network-input limits are:
 
-| Operation | Complexity | Details |
-| --- | --- | --- |
-| append / add | O(1) | one atomic operation and one write lock |
-| get / last | O(1) | one atomic operation and one read lock |
-| playlist rollover | O(S) | zero-fill S = max_segments × max_parts_per_segment |
+| Limit | Default |
+| --- | ---: |
+| Known peers | 256 |
+| Incomplete FEC objects | 64 |
+| Decoded frame bytes | 1 MiB |
+| Completed-frame queue | 64 |
+| Replica-request queue | 64 |
+| Remote slot hints | 65,536 |
 
-### Benchmarks (Apple Silicon)
+The FEC observation path uses an ordered expiry queue. It does not scan every
+in-flight map for each datagram. Unauthorized and oversized objects are rejected
+before decoder allocation. Edge nodes do not retain remote-forwarding hints.
 
-Single-stream sequential writes:
-```
-Slot size: 64 KB
-Throughput: ~1390 MB/s
-```
+## Operation costs
 
-Concurrent multi-stream (8 streams, 1 writer + 2 readers each):
-```
-Write:  1864 MB/s (29,827 ops/s)
-Read:   3966 MB/s (63,461 ops/s)
-Combined: 5830 MB/s
-```
+| Operation | Expected cost |
+| --- | --- |
+| Chunk handle hit | O(1), two generation checks and one shared slot lock |
+| Chunk mapped hit | O(1), plus one stream-map read |
+| Chunk write | O(payload bytes) for hashing, plus one slot and state update |
+| Latest playlist hit | O(1), two generation validations and one `ArcSwap` load |
+| Playlist write | O(retained manifest bytes), including full/delta gzip work |
+| Manifest render | O(retained segments and parts) |
+| Stream assignment | O(1), without clearing the complete payload ring |
 
-Massive concurrent reads (1000 tasks, 1 writer):
-```
-Read:  22.1M ops/s
-Write: 22K ops/s (concurrent)
-```
+`Bytes` clones are zero-copy payload references. Logical payload bytes in the
+benchmarks are not memory-copy or network throughput.
 
-Run the realistic 48 kHz S24 PCM part-hit qualification with:
+## Benchmarks
+
+The benchmark binaries emit JSON. They run with 1, 2, 4, and all available
+workers, when the host has those CPUs.
 
 ```sh
-cargo bench --bench distribution_capacity -- --duration-seconds 3
+# Chunk reads by physical index, logical stream ID, or handle.
+cargo bench --bench distribution_capacity -- --duration-seconds 3 --lookup handle
+
+# Chunk raw/mapped/handle writes, 15:1 mixed load, and stream churn.
+cargo bench --bench chunk_workloads -- --duration-seconds 3 --mode mixed-handle
+
+# Full/delta hits, mapped/handle misses, and index-reuse races.
+cargo bench --bench playlist_cache -- --duration-seconds 3 --mode handle-delta
+
+# Manifest, M3u8Cache, and full Playlists write paths.
+cargo bench --bench playlist_writes -- --duration-seconds 3 --mode playlists-independent
+
+# UDP receive, one-source FEC recovery, and replica range service.
+cargo bench --features mesh --bench mesh_pipeline -- --duration-seconds 3 --mode recovery
 ```
 
-It reports `ChunkCache::get_for_stream_id` throughput for 5,760-byte parts at
-1, 2, 4, and all available worker threads as JSON. Logical payload throughput
-in that report is the byte length accessed through zero-copy `Bytes`. It is not
-network throughput.
+Use these accepted mode values:
 
-ChunkCache sustains millions of lookups per second under concurrent readers
-because:
+| Binary | Modes |
+| --- | --- |
+| `distribution_capacity` | `--lookup raw`, `mapped`, `handle` |
+| `chunk_workloads` | `write-raw`, `write-mapped`, `write-handle`, `mixed-handle`, `churn` |
+| `playlist_cache` | `mapped-full`, `handle-full`, `mapped-delta`, `handle-delta`, `mapped-miss`, `handle-miss`, `reuse-race` |
+| `playlist_writes` | `manifest-render`, `cache-write`, `playlists-independent`, `playlists-hot` |
+| `mesh_pipeline` | `receive`, `recovery`, `replica` |
 
-- Pre-allocated ring buffers (no malloc per write)
-- Per-slot RwLock (readers only contend on same slot, not globally)
-- Lock-free `last()` via atomic load
-- Zero-copy reads via `Bytes::slice()`
+Each report includes process CPU time, CPU nanoseconds per operation, allocator
+calls, process live allocation bytes, retained cache payload bytes, maximum RSS,
+and sampled p50, p95, p99, and maximum latency. The allocator uses 64 counter
+shards. It reports the sum of shard peaks as an upper bound. On macOS,
+`ru_maxrss` is in bytes. On Linux, it is in KiB. The JSON field therefore uses
+the name `max_rss_platform_units`.
 
-Lookup operations per second, simultaneous blocked requests, open connections,
-and active media customers are separate capacities. This cache benchmark makes
-no claim that one edge can deliver millions of active PCM streams. HTTP/3,
-encryption, kernel networking, and payload bandwidth are outside this boundary.
+Run at least five samples for a release comparison. Use a quiet dedicated host.
+Record the crate commit, `rustc --version --verbose`, target, CPU model, duration,
+mode, worker count, payload size, median, and range. Do not use a short local run
+as a service-level claim.
+
+## Verification
+
+```sh
+cargo test --all-features --all-targets --release
+cargo check --all-features --all-targets
+cargo clippy --all-features --all-targets -- -D warnings
+cargo fmt --check
+```

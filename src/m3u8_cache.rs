@@ -1,19 +1,12 @@
-use crate::Options;
-
-use crate::CacheError;
-use bytes::{BufMut, Bytes, BytesMut};
-use flate2::read::GzDecoder;
+use crate::stream_registry::{ResolvedStream, StreamRegistry};
+use crate::{CacheError, Options};
+use arc_swap::ArcSwapOption;
+use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::collections::BTreeMap;
 use std::io::prelude::*;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex, RwLock,
-};
+use std::sync::{Arc, RwLock};
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
-
-const M3U8_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 struct MediaSegmentBlock {
@@ -21,212 +14,242 @@ struct MediaSegmentBlock {
     duration_ms: u64,
 }
 
+/// Cache-owned identity for one logical playlist stream.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct M3u8StreamHandle(ResolvedStream);
+
+impl M3u8StreamHandle {
+    pub fn stream_id(self) -> u64 {
+        self.0.stream_id()
+    }
+
+    pub fn index(self) -> usize {
+        self.0.index()
+    }
+
+    pub fn generation(self) -> u64 {
+        self.0.generation()
+    }
+}
+
+/// One atomically published playlist position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaylistPosition {
+    pub segment_id: usize,
+    pub part_idx: usize,
+    pub sequence: usize,
+}
+
+/// Snapshot of encoded payload memory retained by the playlist cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct M3u8CacheMemoryStats {
+    pub occupied_slots: usize,
+    pub encoded_playlist_bytes: usize,
+    pub initialization_bytes: usize,
+    pub maximum_payload_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedPlaylist {
+    bytes: Bytes,
+    hash: u64,
+}
+
+struct PlaylistSnapshot {
+    stream_id: u64,
+    generation: u64,
+    segment_id: usize,
+    part_idx: usize,
+    sequence: usize,
+    full: CachedPlaylist,
+    delta: Option<CachedPlaylist>,
+}
+
+#[derive(Clone)]
+struct StreamInitialization {
+    stream_id: u64,
+    generation: u64,
+    bytes: Bytes,
+}
+
+#[derive(Clone, Copy)]
+struct SegmentRange {
+    segment_id: usize,
+    first_sequence: usize,
+    end_sequence: usize,
+}
+
+struct PlaylistStreamState {
+    position: Option<PlaylistPosition>,
+    segment_ranges: Vec<Option<SegmentRange>>,
+    version: u64,
+}
+
 pub struct M3u8Cache {
-    buffer: Vec<RwLock<Bytes>>,
-    seg_parts: Vec<AtomicUsize>,
-    last_seg: Vec<AtomicUsize>,
-    last_part: Vec<AtomicUsize>,
-    last_seq: Vec<AtomicUsize>,
-    generations: Vec<AtomicUsize>,
-    inits: Vec<RwLock<Bytes>>,
-    offsets: RwLock<BTreeMap<u64, usize>>,
-    offset: AtomicUsize,
+    buffer: Vec<RwLock<Option<Arc<PlaylistSnapshot>>>>,
+    latest: Vec<ArcSwapOption<PlaylistSnapshot>>,
+    stream_states: Vec<RwLock<PlaylistStreamState>>,
+    inits: Vec<RwLock<Option<StreamInitialization>>>,
+    registry: StreamRegistry,
     options: Options,
-    stream_id_mutex: Mutex<()>,
+    max_snapshot_bytes: usize,
+    max_init_bytes: usize,
 }
 
 impl M3u8Cache {
-    pub fn new(mut options: Options) -> Self {
-        options = options.normalized();
-        options.buffer_size_kb = 5;
-        let buffer_size_bytes = options.buffer_size_kb * 1024;
-        let init_size_bytes = options.init_size_kb * 1024;
+    pub fn new(options: Options) -> Self {
+        Self::try_new(options).expect("valid playlist cache capacity")
+    }
 
-        let buffer_repeat_value = Bytes::from(vec![0u8; buffer_size_bytes]);
-        let init_repeat_value = Bytes::from(vec![0u8; init_size_bytes]);
+    pub fn try_new(options: Options) -> Result<Self, CacheError> {
+        let options = options.normalized();
+        let stream_capacity = options
+            .max_parts_per_segment
+            .checked_mul(options.max_segments)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let buffer_size = options
+            .num_playlists
+            .checked_mul(stream_capacity)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let max_snapshot_bytes = options
+            .buffer_size_kb
+            .checked_mul(1024)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let max_init_bytes = options
+            .init_size_kb
+            .checked_mul(1024)
+            .ok_or(CacheError::ArithmeticOverflow)?;
 
-        let buffer_size =
-            options.num_playlists * options.max_parts_per_segment * options.max_segments;
-        let buffer = (0..buffer_size)
-            .map(|_| RwLock::new(buffer_repeat_value.clone()))
-            .collect();
-
-        let seg_parts_size = options.max_segments * options.num_playlists;
-        let seg_parts = (0..seg_parts_size).map(|_| AtomicUsize::new(0)).collect();
-
-        let num_playlists = options.num_playlists;
-        let last_seg = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
-        let last_part = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
-        let last_seq = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
-        let generations = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
-        let inits = (0..num_playlists)
-            .map(|_| RwLock::new(init_repeat_value.clone()))
-            .collect();
-
-        Self {
-            buffer,
-            seg_parts,
-            last_seg,
-            last_part,
-            last_seq,
-            generations,
-            inits,
-            offsets: RwLock::new(BTreeMap::new()),
-            offset: AtomicUsize::new(0),
+        Ok(Self {
+            buffer: (0..buffer_size).map(|_| RwLock::new(None)).collect(),
+            latest: (0..options.num_playlists)
+                .map(|_| ArcSwapOption::empty())
+                .collect(),
+            stream_states: (0..options.num_playlists)
+                .map(|_| {
+                    RwLock::new(PlaylistStreamState {
+                        position: None,
+                        segment_ranges: vec![None; options.max_segments],
+                        version: 1,
+                    })
+                })
+                .collect(),
+            inits: (0..options.num_playlists)
+                .map(|_| RwLock::new(None))
+                .collect(),
+            registry: StreamRegistry::new(options.num_playlists),
             options,
-            stream_id_mutex: Mutex::new(()),
-        }
+            max_snapshot_bytes,
+            max_init_bytes,
+        })
     }
 
-    fn offset(&self, stream_id: u64) -> Option<usize> {
-        let lock = self.offsets.read().unwrap();
-        lock.get(&stream_id).copied()
+    pub fn resolve_stream(&self, stream_id: u64) -> Option<M3u8StreamHandle> {
+        self.registry.resolve(stream_id).map(M3u8StreamHandle)
     }
 
-    fn offset_and_generation(&self, stream_id: u64) -> Option<(usize, usize)> {
-        let n = self.offset(stream_id)?;
-        let generation = self.generations[n].load(Ordering::Acquire);
-        Some((n, generation))
-    }
-
-    fn last_seg(&self, stream_id: u64) -> Option<usize> {
-        self.offset(stream_id)
-            .map(|n| self.last_seg[n].load(Ordering::Acquire))
-    }
-
-    fn last_part(&self, stream_id: u64) -> Option<usize> {
-        self.offset(stream_id)
-            .map(|n| self.last_part[n].load(Ordering::Acquire))
-    }
-
-    fn last_seq(&self, stream_id: u64) -> Option<usize> {
-        self.offset(stream_id)
-            .map(|n| self.last_seq[n].load(Ordering::Acquire))
+    pub fn resolve_or_create_stream(&self, stream_id: u64) -> Result<M3u8StreamHandle, CacheError> {
+        Ok(M3u8StreamHandle(self.registry.resolve_or_create(
+            stream_id,
+            |index, generation| {
+                self.reset_index_state(index, generation);
+            },
+        )))
     }
 
     pub fn last_position(&self, stream_id: u64) -> Option<(usize, usize)> {
-        Some((self.last_seg(stream_id)?, self.last_part(stream_id)?))
+        let position = self.position(stream_id)?;
+        Some((position.segment_id, position.part_idx))
     }
 
-    fn add_stream_id(&self, stream_id: u64) -> Result<(), CacheError> {
-        let _lock = self.stream_id_mutex.lock().unwrap();
-        if self.offset(stream_id).is_some() {
-            return Ok(());
+    pub fn position(&self, stream_id: u64) -> Option<PlaylistPosition> {
+        let handle = self.resolve_stream(stream_id)?;
+        self.position_for_handle(handle)
+    }
+
+    pub fn position_for_handle(&self, handle: M3u8StreamHandle) -> Option<PlaylistPosition> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
         }
-
-        let idx = self.offset.load(Ordering::Acquire);
-        let next_offset = idx
-            .checked_add(1)
-            .map(|n| n % self.options.num_playlists)
-            .ok_or(CacheError::ArithmeticOverflow)?;
-
-        {
-            let mut lock = self.offsets.write().unwrap();
-            if let Some(previous_stream_id) = lock
-                .iter()
-                .find_map(|(candidate, mapped_idx)| (*mapped_idx == idx).then_some(*candidate))
-            {
-                lock.remove(&previous_stream_id);
-            }
-            self.reset_stream_idx(idx)?;
-            lock.insert(stream_id, idx);
-        }
-
-        self.set_last_seg(stream_id, 0)?;
-        self.set_last_part(stream_id, 0)?;
-        self.set_last_seq(stream_id, 0)?;
-
-        let seg_idx = self
-            .options
-            .max_segments
-            .checked_mul(idx)
-            .ok_or(CacheError::ArithmeticOverflow)?;
-        for n in seg_idx..(seg_idx + self.options.max_segments) {
-            self.seg_parts[n].store(0, Ordering::Release);
-        }
-
-        self.offset.store(next_offset, Ordering::Release);
-        Ok(())
+        let snapshot_guard = self.latest.get(handle.index())?.load();
+        let snapshot = snapshot_guard.as_ref()?;
+        let position = (snapshot.stream_id == handle.stream_id()
+            && snapshot.generation == handle.generation())
+        .then_some(PlaylistPosition {
+            segment_id: snapshot.segment_id,
+            part_idx: snapshot.part_idx,
+            sequence: snapshot.sequence,
+        });
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(position)
+            .flatten()
     }
 
     pub fn ensure_stream_id(&self, stream_id: u64) -> Result<(), CacheError> {
-        self.add_stream_id(stream_id)
+        self.resolve_or_create_stream(stream_id).map(|_| ())
     }
 
     pub fn zero_stream_id(&self, stream_id: u64) {
-        let mut lock = self.offsets.write().unwrap();
-        if let Some(idx) = lock.remove(&stream_id) {
-            let _ = self.reset_stream_idx(idx);
-        }
-    }
-
-    fn reset_stream_idx(&self, idx: usize) -> Result<(), CacheError> {
-        self.last_seg[idx].store(0, Ordering::Release);
-        self.last_part[idx].store(0, Ordering::Release);
-        self.last_seq[idx].store(0, Ordering::Release);
-        let next = self.generations[idx]
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        if next == 0 {
-            self.generations[idx].store(1, Ordering::Release);
-        }
-
-        let seg_idx = self
-            .options
-            .max_segments
-            .checked_mul(idx)
-            .ok_or(CacheError::ArithmeticOverflow)?;
-        for n in seg_idx..(seg_idx + self.options.max_segments) {
-            self.seg_parts[n].store(0, Ordering::Release);
-        }
-        Ok(())
-    }
-
-    fn set_last_seg(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
-        if let Some(n) = self.offset(stream_id) {
-            self.last_seg[n].store(id, Ordering::Release);
-            Ok(())
-        } else {
-            Err(CacheError::StreamNotFound)
-        }
-    }
-
-    fn set_last_part(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
-        if let Some(n) = self.offset(stream_id) {
-            self.last_part[n].store(id, Ordering::Release);
-            Ok(())
-        } else {
-            Err(CacheError::StreamNotFound)
-        }
-    }
-
-    fn set_last_seq(&self, stream_id: u64, id: usize) -> Result<(), CacheError> {
-        if let Some(n) = self.offset(stream_id) {
-            self.last_seq[n].store(id, Ordering::Release);
-            Ok(())
-        } else {
-            Err(CacheError::StreamNotFound)
-        }
+        let _ = self.registry.remove_stream(stream_id, |index, generation| {
+            self.reset_index_state(index, generation);
+        });
     }
 
     pub fn set_init(&self, stream_id: u64, data_bytes: Bytes) -> Result<(), CacheError> {
-        if let Some(n) = self.offset(stream_id) {
-            let mut inits_lock = self.inits[n].write().unwrap();
-            *inits_lock = data_bytes;
-            Ok(())
-        } else {
-            Err(CacheError::StreamNotFound)
+        let handle = self
+            .resolve_stream(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        self.set_init_for_handle(handle, data_bytes)
+    }
+
+    pub fn set_init_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        data_bytes: Bytes,
+    ) -> Result<(), CacheError> {
+        if data_bytes.len() > self.max_init_bytes {
+            return Err(CacheError::BufferOverflow);
         }
+        self.registry
+            .with_validated(handle.0, || {
+                let mut init = self.inits[handle.index()]
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *init = Some(StreamInitialization {
+                    stream_id: handle.stream_id(),
+                    generation: handle.generation(),
+                    bytes: data_bytes,
+                });
+                self.bump_version(handle.index());
+            })
+            .ok_or(CacheError::StreamNotFound)
     }
 
     pub fn get_init(&self, stream_id: u64) -> Result<Bytes, CacheError> {
-        if let Some(n) = self.offset(stream_id) {
-            let lock = &self.inits[n];
-            let data = lock.read().unwrap();
-            Ok(data.clone())
-        } else {
-            Err(CacheError::StreamNotFound)
+        let handle = self
+            .resolve_stream(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        self.get_init_for_handle(handle)
+            .ok_or(CacheError::StreamNotFound)
+    }
+
+    pub fn get_init_for_handle(&self, handle: M3u8StreamHandle) -> Option<Bytes> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
         }
+        let init_guard = self.inits[handle.index()]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let init = init_guard.as_ref()?;
+        let bytes = (init.stream_id == handle.stream_id()
+            && init.generation == handle.generation())
+        .then(|| init.bytes.clone());
+        drop(init_guard);
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(bytes)
+            .flatten()
     }
 
     pub fn add(
@@ -237,48 +260,75 @@ impl M3u8Cache {
         idx: usize,
         data: Bytes,
     ) -> Result<u64, CacheError> {
-        if self.offset(stream_id).is_none() {
-            self.add_stream_id(stream_id)?;
+        if idx >= self.options.max_parts_per_segment {
+            return Err(CacheError::IndexOutOfBounds);
         }
-        let (_, generation) = self
-            .offset_and_generation(stream_id)
-            .ok_or(CacheError::StreamNotFound)?;
+        let (full, delta) = self.prepare_variants(&data)?;
+        let handle = self.resolve_or_create_stream(stream_id)?;
+        self.add_prepared_for_handle(handle, segment_id, seq, idx, full, delta)
+    }
 
-        if idx == 0 {
-            self.end_segment(stream_id, segment_id, seq)?;
+    pub fn add_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        segment_id: usize,
+        sequence: usize,
+        part_idx: usize,
+        data: Bytes,
+    ) -> Result<u64, CacheError> {
+        if part_idx >= self.options.max_parts_per_segment {
+            return Err(CacheError::IndexOutOfBounds);
         }
-
-        let h = const_xxh3(&data);
-        let gz = self.compress_data(&data)?;
-        let b = Bytes::from(gz);
-        if segment_id > u32::MAX as usize || b.len() > u32::MAX as usize {
-            return Err(CacheError::BufferOverflow);
-        }
-
-        let mut packet = BytesMut::new();
-        packet.put_u32(segment_id as u32);
-        packet.put_u32(b.len() as u32);
-        packet.put_u64(generation as u64);
-        packet.put_u64(h);
-        packet.put(b);
-
-        if let Some(i) = self.calculate_index(stream_id, segment_id, idx)? {
-            let mut lock = self.buffer[i].write().unwrap();
-            *lock = packet.freeze();
-        }
-
-        if self
-            .offset_and_generation(stream_id)
-            .map(|(_, current_generation)| current_generation)
-            != Some(generation)
-        {
+        if !self.registry.is_current_fast(handle.0) {
             return Err(CacheError::StreamNotFound);
         }
-        self.set_last_seg(stream_id, segment_id)?;
-        self.set_last_part(stream_id, idx)?;
-        self.set_last_seq(stream_id, seq)?;
+        let (full, delta) = self.prepare_variants(&data)?;
 
-        Ok(h)
+        self.add_prepared_for_handle(handle, segment_id, sequence, part_idx, full, delta)
+    }
+
+    fn add_prepared_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        segment_id: usize,
+        sequence: usize,
+        part_idx: usize,
+        full: CachedPlaylist,
+        delta: Option<CachedPlaylist>,
+    ) -> Result<u64, CacheError> {
+        let hash = full.hash;
+        let slot_idx = self.calculate_index(handle.index(), segment_id, part_idx)?;
+
+        self.registry
+            .with_validated(handle.0, || {
+                let snapshot = Arc::new(PlaylistSnapshot {
+                    stream_id: handle.stream_id(),
+                    generation: handle.generation(),
+                    segment_id,
+                    part_idx,
+                    sequence,
+                    full,
+                    delta,
+                });
+                if let Some(slot_idx) = slot_idx {
+                    let mut slot = self.buffer[slot_idx]
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.as_ref().is_some_and(|stored| {
+                        stored.generation == handle.generation()
+                            && (stored.sequence, stored.segment_id, stored.part_idx)
+                                > (sequence, segment_id, part_idx)
+                    }) {
+                        return Err(CacheError::Superseded);
+                    }
+                    *slot = Some(Arc::clone(&snapshot));
+                }
+                self.publish_position(handle.index(), snapshot);
+                Ok(())
+            })
+            .ok_or(CacheError::StreamNotFound)??;
+
+        Ok(hash)
     }
 
     pub fn end_segment(
@@ -287,131 +337,102 @@ impl M3u8Cache {
         segment_id: usize,
         part_id: usize,
     ) -> Result<(), CacheError> {
-        if let Ok(idx) = self.calculate_seg_index(
-            stream_id,
-            segment_id
-                .checked_sub(1)
-                .ok_or(CacheError::ArithmeticOverflow)?,
-        ) {
-            self.seg_parts[idx].store(part_id, Ordering::Release);
-        }
-        if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
-            self.zero_buffer(idx);
-        }
-        Ok(())
-    }
-
-    fn zero_buffer(&self, idx: usize) {
-        let buffer_size_bytes = self.options.buffer_size_kb * 1024;
-        let buffer_repeat_value = Bytes::from(vec![0u8; buffer_size_bytes]);
-
-        let Some(start) = idx.checked_mul(self.options.max_parts_per_segment) else {
-            return;
-        };
-        if start >= self.buffer.len() {
-            return;
-        }
-        let end = start
-            .saturating_add(self.options.max_parts_per_segment)
-            .min(self.buffer.len());
-        for lock in &self.buffer[start..end] {
-            let mut buf = lock.write().unwrap();
-            *buf = buffer_repeat_value.clone();
-        }
+        let handle = self
+            .resolve_stream(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        let previous = segment_id
+            .checked_sub(1)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        self.registry
+            .with_validated(handle.0, || {
+                let mut state = self.stream_states[handle.index()]
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range_idx = previous % self.options.max_segments;
+                if let Some(range) = &mut state.segment_ranges[range_idx] {
+                    if range.segment_id == previous {
+                        range.end_sequence = range.end_sequence.max(part_id);
+                    }
+                }
+            })
+            .ok_or(CacheError::StreamNotFound)
     }
 
     fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(data)?;
         Ok(encoder.finish()?)
     }
 
-    fn decompress_data(&self, data: &[u8]) -> Result<String, CacheError> {
-        let mut decoder = GzDecoder::new(data);
-        let mut decoded = String::new();
-        decoder.read_to_string(&mut decoded)?;
-        Ok(decoded)
-    }
-
-    fn delta_from_gzip(&self, data: &Bytes) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let playlist = self.decompress_data(data)?;
-        let Some(delta) = playlist_delta_update(&playlist) else {
-            return Ok(None);
-        };
-        let h = const_xxh3(delta.as_bytes());
-        Ok(Some((
-            Bytes::from(self.compress_data(delta.as_bytes())?),
-            h,
-        )))
-    }
-
-    fn is_included(&self, stream_id: u64, segment_id: usize, part_idx: usize) -> bool {
-        if let (Some(last_seg), Some(last_part)) =
-            (self.last_seg(stream_id), self.last_part(stream_id))
-        {
-            if segment_id < last_seg || (segment_id == last_seg && part_idx <= last_part) {
-                return true;
-            }
+    fn prepare_variants(
+        &self,
+        data: &[u8],
+    ) -> Result<(CachedPlaylist, Option<CachedPlaylist>), CacheError> {
+        if data.len() > self.max_snapshot_bytes {
+            return Err(CacheError::BufferOverflow);
         }
-
-        false
-    }
-
-    fn calculate_seg_index(&self, stream_id: u64, segment_id: usize) -> Result<usize, CacheError> {
-        if let Some(offset) = self.offset(stream_id) {
-            let segments_per_stream = self.options.max_segments;
-            let wrapped_segment_idx = segment_id % segments_per_stream;
-            offset
-                .checked_mul(segments_per_stream)
-                .and_then(|result| result.checked_add(wrapped_segment_idx))
-                .ok_or(CacheError::ArithmeticOverflow)
-        } else {
-            Err(CacheError::StreamNotFound)
+        let full_hash = const_xxh3(data);
+        let full_bytes = Bytes::from(self.compress_data(data)?);
+        let delta = std::str::from_utf8(data)
+            .ok()
+            .and_then(playlist_delta_update)
+            .map(|delta| {
+                let hash = const_xxh3(delta.as_bytes());
+                self.compress_data(delta.as_bytes())
+                    .map(|bytes| CachedPlaylist {
+                        bytes: Bytes::from(bytes),
+                        hash,
+                    })
+            })
+            .transpose()?;
+        let retained_bytes = full_bytes
+            .len()
+            .checked_add(delta.as_ref().map_or(0, |delta| delta.bytes.len()))
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        if retained_bytes > self.max_snapshot_bytes {
+            return Err(CacheError::BufferOverflow);
         }
+        Ok((
+            CachedPlaylist {
+                bytes: full_bytes,
+                hash: full_hash,
+            },
+            delta,
+        ))
     }
 
     fn calculate_index(
         &self,
-        stream_id: u64,
+        stream_idx: usize,
         segment_id: usize,
-        seq: usize,
+        part_idx: usize,
     ) -> Result<Option<usize>, CacheError> {
-        if segment_id == 0 {
-            return Ok(None);
+        if stream_idx >= self.options.num_playlists {
+            return Err(CacheError::IndexOutOfBounds);
         }
-
-        if let Some(offset) = self.offset(stream_id) {
-            let parts_per_segment = self.options.max_parts_per_segment;
-            let segments_per_stream = self.options.max_segments;
-
-            if seq >= parts_per_segment {
-                return Err(CacheError::IndexOutOfBounds);
-            }
-
-            // Calculate the wrapped segment index
-            let wrapped_segment_idx = (segment_id - 1) % segments_per_stream;
-
-            // Calculate the index within the stream's buffer
-            let stream_index = wrapped_segment_idx
-                .checked_mul(parts_per_segment)
-                .and_then(|result| result.checked_add(seq))
-                .ok_or(CacheError::ArithmeticOverflow)?;
-
-            // Calculate the global index
-            let stream_capacity = segments_per_stream
-                .checked_mul(parts_per_segment)
-                .ok_or(CacheError::ArithmeticOverflow)?;
-            let global_index = offset
-                .checked_mul(stream_capacity)
-                .and_then(|result| result.checked_add(stream_index))
-                .ok_or(CacheError::ArithmeticOverflow)?;
-
-            // Ensure the global index wraps within the total buffer size
-            let total_buffer_size = self.buffer.len();
-            Ok(Some(global_index % total_buffer_size))
-        } else {
-            Err(CacheError::StreamNotFound)
+        if part_idx >= self.options.max_parts_per_segment {
+            return Err(CacheError::IndexOutOfBounds);
         }
+        let stream_capacity = self
+            .options
+            .max_segments
+            .checked_mul(self.options.max_parts_per_segment)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        // Segment zero shares the first ring position with segment one. It is
+        // only used before the first segment closes, and the tagged snapshot
+        // prevents either logical segment from reading the other's value.
+        let wrapped_segment = segment_id.saturating_sub(1) % self.options.max_segments;
+        let stream_slot = wrapped_segment
+            .checked_mul(self.options.max_parts_per_segment)
+            .and_then(|slot| slot.checked_add(part_idx))
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let global_slot = stream_idx
+            .checked_mul(stream_capacity)
+            .and_then(|slot| slot.checked_add(stream_slot))
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        (global_slot < self.buffer.len())
+            .then_some(Some(global_slot))
+            .ok_or(CacheError::IndexOutOfBounds)
     }
 
     pub fn get_idxs(
@@ -419,46 +440,19 @@ impl M3u8Cache {
         stream_id: u64,
         segment_id: usize,
     ) -> Result<Option<(usize, usize)>, CacheError> {
-        if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
-            let mut b = self.seg_parts[idx].load(Ordering::Acquire);
-            if self.last_seg(stream_id) == Some(segment_id) {
-                b = self
-                    .last_seq(stream_id)
-                    .and_then(|last_seq| last_seq.checked_add(1))
-                    .ok_or(CacheError::ArithmeticOverflow)?;
-            }
-            if let Ok(prev_idx) = self.calculate_seg_index(
-                stream_id,
-                segment_id
-                    .checked_sub(1)
-                    .ok_or(CacheError::ArithmeticOverflow)?,
-            ) {
-                let a = self.seg_parts[prev_idx].load(Ordering::Acquire);
-                if a < b {
-                    return Ok(Some((a, b)));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn get_bytes(&self, data: &Bytes) -> Result<(Bytes, usize, usize, u64), CacheError> {
-        if data.len() < M3U8_HEADER_LEN {
-            return Err(CacheError::BufferOverflow);
-        }
-        let seg_id = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
-        let data_size = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
-        let generation = u64::from_be_bytes(data[8..16].try_into().unwrap());
-        let h = u64::from_be_bytes(data[16..24].try_into().unwrap());
-        let end = M3U8_HEADER_LEN
-            .checked_add(data_size)
-            .ok_or(CacheError::BufferOverflow)?;
-        if data.len() < end || generation > usize::MAX as u64 {
-            return Err(CacheError::BufferOverflow);
-        }
-        let payload = data.slice(M3U8_HEADER_LEN..end);
-        Ok((payload, seg_id, generation as usize, h))
+        let Some(handle) = self.resolve_stream(stream_id) else {
+            return Ok(None);
+        };
+        self.registry
+            .with_validated(handle.0, || {
+                let state = self.stream_states[handle.index()]
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = state.segment_ranges[segment_id % self.options.max_segments]?;
+                (range.segment_id == segment_id && range.first_sequence < range.end_sequence)
+                    .then_some((range.first_sequence, range.end_sequence))
+            })
+            .ok_or(CacheError::StreamNotFound)
     }
 
     pub fn get(
@@ -467,26 +461,49 @@ impl M3u8Cache {
         segment_id: usize,
         part_idx: usize,
     ) -> Result<Option<(Bytes, u64)>, CacheError> {
-        if self.is_included(stream_id, segment_id, part_idx) {
-            let (_, generation) = self
-                .offset_and_generation(stream_id)
-                .ok_or(CacheError::StreamNotFound)?;
-            if let Some(idx) = self.calculate_index(stream_id, segment_id, part_idx)? {
-                let lock = self.buffer[idx].read().unwrap();
-                let (payload, seg_id, stored_generation, h) = self.get_bytes(&lock)?;
-                if seg_id != segment_id || stored_generation != generation {
-                    Ok(None)
-                } else if h != 0 {
-                    Ok(Some((payload, h)))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
+        let Some(handle) = self.resolve_stream(stream_id) else {
+            return Ok(None);
+        };
+        self.get_for_handle(handle, segment_id, part_idx)
+    }
+
+    pub fn get_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        segment_id: usize,
+        part_idx: usize,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        if !self.registry.is_current_fast(handle.0) {
+            return Err(CacheError::StreamNotFound);
         }
+        let slot_idx = self.calculate_index(handle.index(), segment_id, part_idx)?;
+        let position = self.stream_states[handle.index()]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position;
+        let included = position.is_some_and(|position| {
+            segment_id < position.segment_id
+                || (segment_id == position.segment_id && part_idx <= position.part_idx)
+        });
+        let result = if included {
+            slot_idx.and_then(|slot_idx| {
+                let slot = self.buffer[slot_idx]
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let snapshot = slot.as_ref()?;
+                (snapshot.stream_id == handle.stream_id()
+                    && snapshot.generation == handle.generation()
+                    && snapshot.segment_id == segment_id
+                    && snapshot.part_idx == part_idx)
+                    .then(|| (snapshot.full.bytes.clone(), snapshot.full.hash))
+            })
+        } else {
+            None
+        };
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(result)
+            .ok_or(CacheError::StreamNotFound)
     }
 
     pub fn get_delta(
@@ -495,40 +512,230 @@ impl M3u8Cache {
         segment_id: usize,
         part_idx: usize,
     ) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let Some((data, _)) = self.get(stream_id, segment_id, part_idx)? else {
+        let Some(handle) = self.resolve_stream(stream_id) else {
             return Ok(None);
         };
-        self.delta_from_gzip(&data)
+        self.get_delta_for_handle(handle, segment_id, part_idx)
+    }
+
+    pub fn get_delta_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        segment_id: usize,
+        part_idx: usize,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        if !self.registry.is_current_fast(handle.0) {
+            return Err(CacheError::StreamNotFound);
+        }
+        let slot_idx = self.calculate_index(handle.index(), segment_id, part_idx)?;
+        let position = self.stream_states[handle.index()]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position;
+        let included = position.is_some_and(|position| {
+            segment_id < position.segment_id
+                || (segment_id == position.segment_id && part_idx <= position.part_idx)
+        });
+        let result = if included {
+            slot_idx.and_then(|slot_idx| {
+                let slot = self.buffer[slot_idx]
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let snapshot = slot.as_ref()?;
+                if snapshot.stream_id != handle.stream_id()
+                    || snapshot.generation != handle.generation()
+                    || snapshot.segment_id != segment_id
+                    || snapshot.part_idx != part_idx
+                {
+                    return None;
+                }
+                snapshot
+                    .delta
+                    .as_ref()
+                    .map(|delta| (delta.bytes.clone(), delta.hash))
+            })
+        } else {
+            None
+        };
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(result)
+            .ok_or(CacheError::StreamNotFound)
     }
 
     pub fn last(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
-        if let (Some(last_seg), Some(last_part)) =
-            (self.last_seg(stream_id), self.last_part(stream_id))
-        {
-            let (_, generation) = self
-                .offset_and_generation(stream_id)
-                .ok_or(CacheError::StreamNotFound)?;
-            if let Some(idx) = self.calculate_index(stream_id, last_seg, last_part)? {
-                let lock = self.buffer[idx].read().unwrap();
-                let (payload, seg_id, stored_generation, h) = self.get_bytes(&lock)?;
-                if seg_id == last_seg && stored_generation == generation && h != 0 {
-                    Ok(Some((payload, h)))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
+        let Some(handle) = self.resolve_stream(stream_id) else {
+            return Ok(None);
+        };
+        self.last_for_handle(handle)
+    }
+
+    pub fn last_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        self.last_variant_for_handle(handle, false)
     }
 
     pub fn last_delta(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let Some((data, _)) = self.last(stream_id)? else {
+        let Some(handle) = self.resolve_stream(stream_id) else {
             return Ok(None);
         };
-        self.delta_from_gzip(&data)
+        self.last_delta_for_handle(handle)
+    }
+
+    pub fn last_delta_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        self.last_variant_for_handle(handle, true)
+    }
+
+    fn last_variant_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        delta: bool,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        if !self.registry.is_current_fast(handle.0) {
+            return Err(CacheError::StreamNotFound);
+        }
+        let snapshot_guard = self.latest[handle.index()].load();
+        let Some(snapshot) = snapshot_guard.as_ref() else {
+            return Ok(None);
+        };
+        let result = if snapshot.stream_id == handle.stream_id()
+            && snapshot.generation == handle.generation()
+        {
+            if delta {
+                snapshot
+                    .delta
+                    .as_ref()
+                    .map(|variant| (variant.bytes.clone(), variant.hash))
+            } else {
+                Some((snapshot.full.bytes.clone(), snapshot.full.hash))
+            }
+        } else {
+            None
+        };
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(result)
+            .ok_or(CacheError::StreamNotFound)
+    }
+
+    pub fn version_for_handle(&self, handle: M3u8StreamHandle) -> Option<u64> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let version = self.stream_states[handle.index()]
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .version;
+        self.registry.is_current_fast(handle.0).then_some(version)
+    }
+
+    /// Scan fixed slots and report retained encoded payload bytes.
+    pub fn memory_stats(&self) -> M3u8CacheMemoryStats {
+        let mut occupied_slots = 0_usize;
+        let mut encoded_playlist_bytes = 0_usize;
+        for slot in &self.buffer {
+            let slot = slot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(snapshot) = slot.as_ref() {
+                occupied_slots = occupied_slots.saturating_add(1);
+                encoded_playlist_bytes = encoded_playlist_bytes
+                    .saturating_add(snapshot.full.bytes.len())
+                    .saturating_add(snapshot.delta.as_ref().map_or(0, |delta| delta.bytes.len()));
+            }
+        }
+        let initialization_bytes = self
+            .inits
+            .iter()
+            .filter_map(|init| init.read().ok())
+            .filter_map(|init| init.as_ref().map(|init| init.bytes.len()))
+            .fold(0_usize, usize::saturating_add);
+        M3u8CacheMemoryStats {
+            occupied_slots,
+            encoded_playlist_bytes,
+            initialization_bytes,
+            maximum_payload_bytes: self
+                .buffer
+                .len()
+                .saturating_mul(self.max_snapshot_bytes)
+                .saturating_add(self.inits.len().saturating_mul(self.max_init_bytes)),
+        }
+    }
+
+    fn publish_position(&self, stream_idx: usize, snapshot: Arc<PlaylistSnapshot>) {
+        let mut state = self.stream_states[stream_idx]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let range_idx = snapshot.segment_id % self.options.max_segments;
+        let end_sequence = snapshot.sequence.saturating_add(1);
+        match &mut state.segment_ranges[range_idx] {
+            Some(range) if range.segment_id == snapshot.segment_id => {
+                range.first_sequence = range.first_sequence.min(snapshot.sequence);
+                range.end_sequence = range.end_sequence.max(end_sequence);
+            }
+            Some(range) if range.segment_id > snapshot.segment_id => {}
+            range => {
+                *range = Some(SegmentRange {
+                    segment_id: snapshot.segment_id,
+                    first_sequence: snapshot.sequence.saturating_sub(snapshot.part_idx),
+                    end_sequence,
+                });
+            }
+        }
+        let position = PlaylistPosition {
+            segment_id: snapshot.segment_id,
+            part_idx: snapshot.part_idx,
+            sequence: snapshot.sequence,
+        };
+        if state.position.is_none_or(|current| {
+            (snapshot.sequence, snapshot.segment_id, snapshot.part_idx)
+                >= (current.sequence, current.segment_id, current.part_idx)
+        }) {
+            state.position = Some(position);
+            self.latest[stream_idx].store(Some(snapshot));
+        }
+        state.version = next_version(state.version);
+    }
+
+    fn bump_version(&self, stream_idx: usize) {
+        let mut state = self.stream_states[stream_idx]
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.version = next_version(state.version);
+    }
+
+    fn reset_index_state(&self, stream_idx: usize, _generation: u64) {
+        if let Some(init) = self.inits.get(stream_idx) {
+            let mut init = init
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *init = None;
+        }
+        if let Some(state) = self.stream_states.get(stream_idx) {
+            let mut state = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.position = None;
+            state.segment_ranges.fill(None);
+            state.version = next_version(state.version);
+        }
+        if let Some(latest) = self.latest.get(stream_idx) {
+            latest.store(None);
+        }
+    }
+}
+
+fn next_version(version: u64) -> u64 {
+    let next = version.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
     }
 }
 
@@ -673,6 +880,7 @@ fn push_lines(output: &mut String, lines: &[&str]) {
 mod tests {
     use super::*;
     use crate::m3u8_manifest::M3u8Manifest;
+    use flate2::read::GzDecoder;
 
     fn decompress(data: &[u8]) -> String {
         let mut decoder = GzDecoder::new(data);
@@ -858,17 +1066,251 @@ mod tests {
     }
 
     #[test]
-    fn truncated_packet_is_rejected_without_panic() {
-        let cache = M3u8Cache::new(Options::default());
-        let mut packet = BytesMut::new();
-        packet.put_u32(1);
-        packet.put_u32(64);
-        packet.put_u64(1);
-        packet.put_u64(99);
+    fn snapshot_size_limit_is_enforced_before_compression() {
+        let cache = M3u8Cache::new(Options {
+            buffer_size_kb: 1,
+            ..Options::default()
+        });
 
         assert!(matches!(
-            cache.get_bytes(&packet.freeze()),
+            cache.add(1, 1, 1, 0, Bytes::from(vec![b'a'; 1025])),
             Err(CacheError::BufferOverflow)
+        ));
+    }
+
+    #[test]
+    fn encoded_snapshot_must_also_fit_the_budget() {
+        let cache = M3u8Cache::new(Options {
+            buffer_size_kb: 1,
+            ..Options::default()
+        });
+        let mut state = 0x1234_5678_u32;
+        let data = (0..1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            cache.add(1, 1, 1, 0, Bytes::from(data)),
+            Err(CacheError::BufferOverflow)
+        ));
+    }
+
+    #[test]
+    fn rejected_mapped_writes_do_not_evict_a_live_stream() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            max_parts_per_segment: 1,
+            buffer_size_kb: 1,
+            ..Options::default()
+        });
+        cache.add(1, 1, 1, 0, Bytes::from_static(b"live")).unwrap();
+        let live = cache.resolve_stream(1).unwrap();
+
+        assert!(matches!(
+            cache.add(2, 1, 1, 1, Bytes::from_static(b"invalid part")),
+            Err(CacheError::IndexOutOfBounds)
+        ));
+        assert!(matches!(
+            cache.add(3, 1, 1, 0, Bytes::from(vec![0_u8; 1025])),
+            Err(CacheError::BufferOverflow)
+        ));
+
+        assert_eq!(cache.resolve_stream(1), Some(live));
+        assert_eq!(cache.resolve_stream(2), None);
+        assert_eq!(cache.resolve_stream(3), None);
+        assert_eq!(
+            cache.last_for_handle(live).unwrap().unwrap().1,
+            const_xxh3(b"live")
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_capacity_arithmetic_overflow() {
+        assert!(matches!(
+            M3u8Cache::try_new(Options {
+                num_playlists: usize::MAX,
+                max_segments: 2,
+                ..Options::default()
+            }),
+            Err(CacheError::ArithmeticOverflow)
+        ));
+    }
+
+    #[test]
+    fn encoded_payload_memory_plateaus_after_ring_rotations() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 2,
+            max_parts_per_segment: 4,
+            buffer_size_kb: 4,
+            segment_min_ms: 1,
+            ..Options::default()
+        };
+        let cache = M3u8Cache::new(options);
+        let mut manifest = M3u8Manifest::new(options);
+        for _ in 0..100 {
+            let (playlist, segment_id, sequence, part_idx, _) = manifest.add_part(1, true);
+            cache
+                .add(1, segment_id, sequence, part_idx, playlist)
+                .unwrap();
+        }
+
+        let stats = cache.memory_stats();
+        assert!(stats.occupied_slots <= options.max_segments * options.max_parts_per_segment);
+        assert!(stats.encoded_playlist_bytes > 0);
+        assert!(
+            stats.encoded_playlist_bytes + stats.initialization_bytes
+                <= stats.maximum_payload_bytes
+        );
+    }
+
+    #[test]
+    fn initial_segment_snapshot_uses_the_bounded_ring() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 1,
+            buffer_size_kb: 1,
+            ..Options::default()
+        });
+        cache
+            .add(1, 0, 0, 0, Bytes::from_static(b"initial"))
+            .unwrap();
+
+        assert!(cache.get(1, 0, 0).unwrap().is_some());
+        assert_eq!(cache.memory_stats().occupied_slots, 1);
+
+        cache.add(1, 1, 1, 0, Bytes::from_static(b"next")).unwrap();
+        assert!(cache.get(1, 0, 0).unwrap().is_none());
+        assert!(cache.get(1, 1, 0).unwrap().is_some());
+        assert_eq!(cache.memory_stats().occupied_slots, 1);
+    }
+
+    #[test]
+    fn new_and_reused_streams_have_no_initialization() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        cache.ensure_stream_id(1).unwrap();
+        assert!(matches!(cache.get_init(1), Err(CacheError::StreamNotFound)));
+        cache
+            .set_init(1, Bytes::from_static(b"first-init"))
+            .unwrap();
+        assert_eq!(
+            cache.get_init(1).unwrap(),
+            Bytes::from_static(b"first-init")
+        );
+
+        cache.ensure_stream_id(2).unwrap();
+        assert!(matches!(cache.get_init(1), Err(CacheError::StreamNotFound)));
+        assert!(matches!(cache.get_init(2), Err(CacheError::StreamNotFound)));
+    }
+
+    #[test]
+    fn stale_handle_cannot_replace_new_playlist_or_initialization() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        let old = cache.resolve_or_create_stream(1).unwrap();
+        cache
+            .add_for_handle(old, 1, 1, 0, Bytes::from_static(b"old"))
+            .unwrap();
+        cache
+            .set_init_for_handle(old, Bytes::from_static(b"old-init"))
+            .unwrap();
+        let (stale_full, stale_delta) = cache
+            .prepare_variants(b"stale")
+            .expect("prepare delayed old-generation write");
+
+        let current = cache.resolve_or_create_stream(2).unwrap();
+        cache
+            .add_for_handle(current, 1, 1, 0, Bytes::from_static(b"current"))
+            .unwrap();
+        cache
+            .set_init_for_handle(current, Bytes::from_static(b"current-init"))
+            .unwrap();
+
+        assert!(matches!(
+            cache.add_prepared_for_handle(old, 1, 1, 0, stale_full, stale_delta),
+            Err(CacheError::StreamNotFound)
+        ));
+        assert!(matches!(
+            cache.set_init_for_handle(old, Bytes::from_static(b"stale-init")),
+            Err(CacheError::StreamNotFound)
+        ));
+        let (playlist, _) = cache.last_for_handle(current).unwrap().unwrap();
+        assert_eq!(decompress(&playlist), "current");
+        assert_eq!(
+            cache.get_init_for_handle(current).unwrap(),
+            Bytes::from_static(b"current-init")
+        );
+    }
+
+    #[test]
+    fn delayed_older_playlist_cannot_overwrite_newer_ring_slot() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 1,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(8).unwrap();
+        cache
+            .add_for_handle(handle, 2, 2, 0, Bytes::from_static(b"newer"))
+            .unwrap();
+
+        assert!(matches!(
+            cache.add_for_handle(handle, 1, 1, 0, Bytes::from_static(b"delayed-older")),
+            Err(CacheError::Superseded)
+        ));
+        let (playlist, _) = cache.last_for_handle(handle).unwrap().unwrap();
+        assert_eq!(decompress(&playlist), "newer");
+        assert_eq!(
+            cache.position_for_handle(handle),
+            Some(PlaylistPosition {
+                segment_id: 2,
+                part_idx: 0,
+                sequence: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn lower_sequence_cannot_overwrite_the_same_playlist_position() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 1,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(9).unwrap();
+        cache
+            .add_for_handle(handle, 2, 3, 0, Bytes::from_static(b"newer-sequence"))
+            .unwrap();
+
+        assert!(matches!(
+            cache.add_for_handle(handle, 2, 2, 0, Bytes::from_static(b"older-sequence")),
+            Err(CacheError::Superseded)
+        ));
+        let (playlist, _) = cache.get_for_handle(handle, 2, 0).unwrap().unwrap();
+        assert_eq!(decompress(&playlist), "newer-sequence");
+    }
+
+    #[test]
+    fn stream_handle_is_bound_to_its_cache() {
+        let first = M3u8Cache::new(Options::default());
+        let second = M3u8Cache::new(Options::default());
+        let handle = first.resolve_or_create_stream(3).unwrap();
+        second.resolve_or_create_stream(3).unwrap();
+
+        assert!(matches!(
+            second.add_for_handle(handle, 1, 1, 0, Bytes::from_static(b"wrong-cache")),
+            Err(CacheError::StreamNotFound)
         ));
     }
 }

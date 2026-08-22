@@ -1,19 +1,36 @@
-use crate::Options;
+use crate::stream_registry::{ResolvedStream, StreamRegistry};
+use crate::{CacheError, Options};
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
-use tokio::sync::mpsc;
 use tokio::sync::{Notify, RwLock};
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
-const EMPTY_LAST: usize = usize::MAX;
 const MAX_EXACT_PART_WAITERS: usize = 65_536;
 const EXACT_PART_WAITER_SHARDS: usize = 64;
 const MAX_EXACT_PART_WAITERS_PER_SHARD: usize =
     MAX_EXACT_PART_WAITERS.div_ceil(EXACT_PART_WAITER_SHARDS);
 
-type ExactPartWaiterShard = StdMutex<HashMap<(u64, usize), Weak<Notify>>>;
+type ExactPartKey = (u64, u64, usize);
+type ExactPartWaiterShard = StdMutex<HashMap<ExactPartKey, Weak<Notify>>>;
+
+/// Cache-owned identity for one logical chunk stream.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StreamHandle(ResolvedStream);
+
+impl StreamHandle {
+    pub fn stream_id(self) -> u64 {
+        self.0.stream_id()
+    }
+
+    pub fn index(self) -> usize {
+        self.0.index()
+    }
+
+    pub fn generation(self) -> u64 {
+        self.0.generation()
+    }
+}
 
 /// Outcome of an immutable write at a stream/slot identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +41,8 @@ pub enum PutIfAbsentResult {
     AlreadyPresent,
     /// The slot identity already contained different bytes.
     HashConflict,
+    /// A newer ring position already occupies the physical slot.
+    Superseded,
 }
 
 /// Bounded exact-part waiter state retained by the rolling chunk cache.
@@ -37,121 +56,146 @@ pub struct ExactPartWaiterStats {
     pub capacity: usize,
 }
 
+/// Snapshot of payload memory retained by the fixed chunk ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkCacheMemoryStats {
+    pub occupied_slots: usize,
+    pub chunk_bytes: usize,
+    pub initialization_bytes: usize,
+    pub maximum_payload_bytes: usize,
+}
+
 #[derive(Clone)]
 struct StreamInitialization {
     stream_id: u64,
-    generation: usize,
+    generation: u64,
     bytes: Bytes,
 }
 
+#[derive(Default)]
+struct ChunkSlot {
+    id: Option<usize>,
+    generation: u64,
+    hash: u64,
+    bytes: Bytes,
+}
+
+struct ChunkStreamState {
+    last: Option<usize>,
+    next_id: usize,
+    version: u64,
+}
+
+impl Default for ChunkStreamState {
+    fn default() -> Self {
+        Self {
+            last: None,
+            next_id: 1,
+            version: 1,
+        }
+    }
+}
+
 pub struct ChunkCache {
-    buffer: Vec<RwLock<Bytes>>,
-    slot_ids: Vec<AtomicUsize>,
-    slot_generations: Vec<AtomicUsize>,
-    slot_hashes: Vec<AtomicU64>,
-    idxs: Vec<AtomicUsize>,
-    next_ids: Vec<AtomicUsize>,
-    generations: Vec<AtomicUsize>,
-    versions: Vec<AtomicU64>,
+    buffer: Vec<RwLock<ChunkSlot>>,
+    stream_states: Vec<StdRwLock<ChunkStreamState>>,
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
-    offsets: StdRwLock<HashMap<u64, usize>>,
+    registry: StreamRegistry,
     exact_part_waiters: Vec<ExactPartWaiterShard>,
-    idx: AtomicUsize,
-    new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
-    new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
     pub options: Options,
 }
 
 impl ChunkCache {
     pub fn new(options: Options) -> Self {
-        let options = options.normalized();
-        let num_playlists: usize = options.num_playlists;
+        Self::try_new(options).expect("valid chunk cache capacity")
+    }
 
+    pub fn try_new(options: Options) -> Result<Self, CacheError> {
+        let options = options.normalized();
         let buffer_size = options
             .num_playlists
             .checked_mul(options.max_parts_per_segment)
             .and_then(|n| n.checked_mul(options.max_segments))
-            .expect("chunk cache buffer size overflow");
-        let buffer = (0..buffer_size)
-            .map(|_| RwLock::new(Bytes::new()))
-            .collect();
-        let slot_ids = (0..buffer_size)
-            .map(|_| AtomicUsize::new(EMPTY_LAST))
-            .collect();
-        let slot_generations = (0..buffer_size).map(|_| AtomicUsize::new(0)).collect();
-        let slot_hashes = (0..buffer_size).map(|_| AtomicU64::new(0)).collect();
-        let idxs = (0..num_playlists)
-            .map(|_| AtomicUsize::new(EMPTY_LAST))
-            .collect();
-        let next_ids = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
-        let generations = (0..num_playlists).map(|_| AtomicUsize::new(1)).collect();
-        let versions = (0..num_playlists).map(|_| AtomicU64::new(1)).collect();
-        let stream_initializations = (0..num_playlists).map(|_| StdRwLock::new(None)).collect();
-        let (new_playlist_tx, new_playlist_rx) = mpsc::unbounded_channel();
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        options
+            .buffer_size_kb
+            .checked_mul(1024)
+            .ok_or(CacheError::ArithmeticOverflow)?;
 
-        Self {
-            buffer,
-            slot_ids,
-            slot_generations,
-            slot_hashes,
-            idxs,
-            next_ids,
-            generations,
-            versions,
-            stream_initializations,
-            offsets: StdRwLock::new(HashMap::new()),
+        Ok(Self {
+            buffer: (0..buffer_size)
+                .map(|_| RwLock::new(ChunkSlot::default()))
+                .collect(),
+            stream_states: (0..options.num_playlists)
+                .map(|_| StdRwLock::new(ChunkStreamState::default()))
+                .collect(),
+            stream_initializations: (0..options.num_playlists)
+                .map(|_| StdRwLock::new(None))
+                .collect(),
+            registry: StreamRegistry::new(options.num_playlists),
             exact_part_waiters: (0..EXACT_PART_WAITER_SHARDS)
                 .map(|_| StdMutex::new(HashMap::new()))
                 .collect(),
-            idx: AtomicUsize::new(0),
-            new_playlist_tx,
-            new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
             options,
-        }
+        })
     }
 
-    pub fn take_new_playlists_rx(&self) -> Option<mpsc::UnboundedReceiver<(u64, usize)>> {
-        self.new_playlist_rx.lock().unwrap().take()
+    /// Resolve a logical stream once for repeated cache operations.
+    pub fn resolve_stream(&self, stream_id: u64) -> Option<StreamHandle> {
+        self.registry.resolve(stream_id).map(StreamHandle)
     }
 
+    /// Resolve a logical stream or atomically assign a reusable physical slot.
+    pub async fn resolve_or_create_stream(&self, stream_id: u64) -> StreamHandle {
+        self.resolve_or_create_stream_sync(stream_id)
+    }
+
+    fn resolve_or_create_stream_sync(&self, stream_id: u64) -> StreamHandle {
+        StreamHandle(
+            self.registry
+                .resolve_or_create(stream_id, |index, generation| {
+                    self.reset_index_state(index, generation);
+                }),
+        )
+    }
+
+    /// Return the physical index that is assigned to a logical stream.
+    ///
+    /// Do not use the returned value with raw-index data operations. Retain the
+    /// [`StreamHandle`] from [`Self::resolve_or_create_stream`] for data access.
     pub async fn get_or_create_stream_idx(&self, stream_id: u64) -> usize {
-        if let Some(idx) = self.get_stream_idx(stream_id).await {
-            idx
-        } else {
-            self.add_stream_id(stream_id).await
-        }
+        self.resolve_or_create_stream_sync(stream_id).index()
     }
 
+    /// Legacy alias for [`Self::get_or_create_stream_idx`].
     pub async fn add_stream_id(&self, stream_id: u64) -> usize {
-        let mut lock = self.offsets.write().unwrap();
-        if let Some(idx) = lock.get(&stream_id).copied() {
-            return idx;
-        }
-
-        let idx = self.idx.fetch_add(1, Ordering::SeqCst) % self.options.num_playlists;
-        if let Some(previous_stream_id) = lock
-            .iter()
-            .find_map(|(candidate, mapped_idx)| (*mapped_idx == idx).then_some(*candidate))
-        {
-            lock.remove(&previous_stream_id);
-        }
-        self.reset_stream_idx(idx);
-        lock.insert(stream_id, idx);
-        drop(lock);
-        let _ = self.new_playlist_tx.send((stream_id, idx));
-        idx
+        self.resolve_or_create_stream_sync(stream_id).index()
     }
 
     pub async fn get_stream_idx(&self, stream_id: u64) -> Option<usize> {
-        let lock = self.offsets.read().unwrap();
-        lock.get(&stream_id).copied()
+        self.resolve_stream(stream_id).map(StreamHandle::index)
     }
 
     pub async fn stream_ids(&self) -> Vec<(u64, usize)> {
-        let lock = self.offsets.read().unwrap();
-        lock.iter()
-            .map(|(stream_id, idx)| (*stream_id, *idx))
-            .collect()
+        let mut streams = self
+            .registry
+            .streams()
+            .into_iter()
+            .map(|stream| (stream.stream_id(), stream.index()))
+            .collect::<Vec<_>>();
+        streams.sort_unstable();
+        streams
+    }
+
+    pub fn stream_handles(&self) -> Vec<StreamHandle> {
+        let mut streams = self
+            .registry
+            .streams()
+            .into_iter()
+            .map(StreamHandle)
+            .collect::<Vec<_>>();
+        streams.sort_unstable_by_key(|stream| stream.stream_id());
+        streams
     }
 
     pub async fn add_for_stream_id(
@@ -160,14 +204,21 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<usize, &'static str> {
-        let _ = self.get_or_create_stream_idx(stream_id).await;
-        let (stream_idx, generation) = self
-            .stream_generation_for_id(stream_id)
-            .ok_or("Stream not found")?;
-        self.add_with_generation(stream_idx, generation, id, data_bytes)
-            .await?;
-        self.notify_exact_part_waiters(stream_id, id);
-        Ok(stream_idx)
+        self.validate_payload(&data_bytes)?;
+        let handle = self.resolve_or_create_stream_sync(stream_id);
+        self.add_for_handle(handle, id, data_bytes).await?;
+        Ok(handle.index())
+    }
+
+    pub async fn add_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        data_bytes: Bytes,
+    ) -> Result<(), &'static str> {
+        self.add_slot_for_handle(handle, id, data_bytes).await?;
+        self.notify_exact_part_waiters(handle, id);
+        Ok(())
     }
 
     /// Store immutable bytes for a canonical stream/slot identity.
@@ -181,20 +232,25 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<PutIfAbsentResult, &'static str> {
-        let _ = self.get_or_create_stream_idx(stream_id).await;
-        let (stream_idx, generation) = self
-            .stream_generation_for_id(stream_id)
-            .ok_or("Stream not found")?;
+        self.validate_payload(&data_bytes)?;
+        let handle = self.resolve_or_create_stream_sync(stream_id);
+        self.put_if_absent_for_handle(handle, id, data_bytes).await
+    }
+
+    pub async fn put_if_absent_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        data_bytes: Bytes,
+    ) -> Result<PutIfAbsentResult, &'static str> {
         let result = self
-            .put_if_absent_with_generation(stream_idx, generation, id, data_bytes)
+            .put_slot_if_absent_for_handle(handle, id, data_bytes, true)
             .await?;
-        if self.generation(stream_idx) != Some(generation) {
-            return Err("Stream index changed");
-        }
-        if result == PutIfAbsentResult::Inserted {
-            self.advance_next_id(stream_idx, id.saturating_add(1));
-            self.publish_last(stream_idx, id);
-            self.notify_exact_part_waiters(stream_id, id);
+        if matches!(
+            result,
+            PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
+        ) {
+            self.notify_exact_part_waiters(handle, id);
         }
         Ok(result)
     }
@@ -212,20 +268,30 @@ impl ChunkCache {
         first_expected_id: usize,
         data_bytes: Bytes,
     ) -> Result<PutIfAbsentResult, &'static str> {
-        let _ = self.get_or_create_stream_idx(stream_id).await;
-        let (stream_idx, generation) = self
-            .stream_generation_for_id(stream_id)
-            .ok_or("Stream not found")?;
+        self.validate_payload(&data_bytes)?;
+        let handle = self.resolve_or_create_stream_sync(stream_id);
+        self.put_if_absent_contiguous_for_handle(handle, id, first_expected_id, data_bytes)
+            .await
+    }
+
+    pub async fn put_if_absent_contiguous_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        first_expected_id: usize,
+        data_bytes: Bytes,
+    ) -> Result<PutIfAbsentResult, &'static str> {
         let result = self
-            .put_if_absent_with_generation(stream_idx, generation, id, data_bytes)
+            .put_slot_if_absent_for_handle(handle, id, data_bytes, false)
             .await?;
-        if self.generation(stream_idx) != Some(generation) {
-            return Err("Stream index changed");
-        }
-        if result == PutIfAbsentResult::Inserted {
-            self.advance_next_id(stream_idx, id.saturating_add(1));
-            self.publish_contiguous_last(stream_idx, generation, first_expected_id);
-            self.notify_exact_part_waiters(stream_id, id);
+        if matches!(
+            result,
+            PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
+        ) {
+            self.advance_next_for_handle(handle, id.saturating_add(1))?;
+            self.publish_contiguous_last(handle, first_expected_id)
+                .await?;
+            self.notify_exact_part_waiters(handle, id);
         }
         Ok(result)
     }
@@ -236,7 +302,10 @@ impl ChunkCache {
     /// recheck the cache before awaiting it. This closes the lookup/register
     /// race without waking unrelated LL-HLS requests for every cache commit.
     pub fn exact_part_waiter(&self, stream_id: u64, id: usize) -> Option<Arc<Notify>> {
-        let key = (stream_id, id);
+        // A read-side waiter must not create a mapping because an arbitrary
+        // unknown stream ID could otherwise evict a live stream.
+        let handle = self.resolve_stream(stream_id)?;
+        let key = (stream_id, handle.generation(), id);
         let mut waiters = self
             .exact_part_waiters
             .get(Self::exact_part_waiter_shard(stream_id, id))?
@@ -287,14 +356,49 @@ impl ChunkCache {
         }
     }
 
-    fn notify_exact_part_waiters(&self, stream_id: u64, id: usize) {
+    /// Scan fixed slots and report retained payload bytes.
+    pub async fn memory_stats(&self) -> ChunkCacheMemoryStats {
+        let mut occupied_slots = 0_usize;
+        let mut chunk_bytes = 0_usize;
+        for slot in &self.buffer {
+            let slot = slot.read().await;
+            if slot.id.is_some() {
+                occupied_slots = occupied_slots.saturating_add(1);
+                chunk_bytes = chunk_bytes.saturating_add(slot.bytes.len());
+            }
+        }
+        let initialization_bytes = self
+            .stream_initializations
+            .iter()
+            .filter_map(|initialization| initialization.read().ok())
+            .filter_map(|initialization| {
+                initialization
+                    .as_ref()
+                    .map(|initialization| initialization.bytes.len())
+            })
+            .fold(0_usize, usize::saturating_add);
+        let per_chunk = self.options.buffer_size_kb.saturating_mul(1024);
+        let per_init = self.options.init_size_kb.saturating_mul(1024);
+        ChunkCacheMemoryStats {
+            occupied_slots,
+            chunk_bytes,
+            initialization_bytes,
+            maximum_payload_bytes: self
+                .buffer
+                .len()
+                .saturating_mul(per_chunk)
+                .saturating_add(self.options.num_playlists.saturating_mul(per_init)),
+        }
+    }
+
+    fn notify_exact_part_waiters(&self, handle: StreamHandle, id: usize) {
         let waiter = self
             .exact_part_waiters
-            .get(Self::exact_part_waiter_shard(stream_id, id))
+            .get(Self::exact_part_waiter_shard(handle.stream_id(), id))
             .expect("exact-part waiter shard index must be in bounds")
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(stream_id, id))
+            .remove(&(handle.stream_id(), handle.generation(), id))
             .and_then(|waiter| waiter.upgrade());
         if let Some(waiter) = waiter {
             waiter.notify_waiters();
@@ -309,8 +413,27 @@ impl ChunkCache {
     }
 
     pub async fn get_for_stream_id(&self, stream_id: u64, id: usize) -> Option<(Bytes, u64)> {
-        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
-        self.get_with_generation(stream_idx, generation, id).await
+        let handle = self.resolve_stream(stream_id)?;
+        self.get_for_handle(handle, id).await
+    }
+
+    pub async fn get_for_handle(&self, handle: StreamHandle, id: usize) -> Option<(Bytes, u64)> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let idx = self.offset(handle.index(), id)?;
+        let slot = if let Ok(slot) = self.buffer[idx].try_read() {
+            slot
+        } else {
+            self.buffer[idx].read().await
+        };
+        let part = (slot.id == Some(id) && slot.generation == handle.generation())
+            .then(|| (slot.bytes.clone(), slot.hash));
+        drop(slot);
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(part)
+            .flatten()
     }
 
     /// Read a contiguous retained range for one logical stream identity.
@@ -329,23 +452,38 @@ impl ChunkCache {
         if count == 0 || count > self.stream_capacity() {
             return None;
         }
+        let handle = self.resolve_stream(stream_id)?;
+        self.get_range_for_handle(handle, first_id, count).await
+    }
+
+    pub async fn get_range_for_handle(
+        &self,
+        handle: StreamHandle,
+        first_id: usize,
+        count: usize,
+    ) -> Option<Vec<(Bytes, u64)>> {
+        if count == 0 || count > self.stream_capacity() {
+            return None;
+        }
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
         let last_id = first_id.checked_add(count - 1)?;
-        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
         let mut parts = Vec::with_capacity(count);
 
         for id in first_id..=last_id {
-            let idx = self.offset(stream_idx, id)?;
-            let part = if let Ok(bytes) = self.buffer[idx].try_read() {
-                self.clone_matching_slot(idx, id, generation, &bytes)
+            let idx = self.offset(handle.index(), id)?;
+            let slot = if let Ok(slot) = self.buffer[idx].try_read() {
+                slot
             } else {
-                let bytes = self.buffer[idx].read().await;
-                self.clone_matching_slot(idx, id, generation, &bytes)
-            }?;
+                self.buffer[idx].read().await
+            };
+            let part = (slot.id == Some(id) && slot.generation == handle.generation())
+                .then(|| (slot.bytes.clone(), slot.hash))?;
             parts.push(part);
         }
 
-        (self.stream_generation_for_id(stream_id) == Some((stream_idx, generation)))
-            .then_some(parts)
+        self.registry.is_current_fast(handle.0).then_some(parts)
     }
 
     /// Store the durable initialization object associated with a stream.
@@ -358,39 +496,66 @@ impl ChunkCache {
         stream_id: u64,
         bytes: Bytes,
     ) -> Result<(), &'static str> {
-        let stream_idx = self.get_or_create_stream_idx(stream_id).await;
-        let generation = self
-            .generation(stream_idx)
-            .ok_or("Stream index out of bounds")?;
-        let slot = self
-            .stream_initializations
-            .get(stream_idx)
-            .ok_or("Stream index out of bounds")?;
-        let mut slot = slot.write().map_err(|_| "Stream initialization poisoned")?;
-        if slot.as_ref().is_some_and(|initialization| {
-            initialization.stream_id == stream_id
-                && initialization.generation == generation
-                && initialization.bytes == bytes
-        }) {
-            return Ok(());
-        }
-        *slot = Some(StreamInitialization {
-            stream_id,
-            generation,
-            bytes,
-        });
-        if let Some(version) = self.versions.get(stream_idx) {
-            version.fetch_add(1, Ordering::Release);
-        }
-        Ok(())
+        self.validate_initialization_payload(&bytes)?;
+        let handle = self.resolve_or_create_stream_sync(stream_id);
+        self.set_stream_initialization_for_handle(handle, bytes)
+    }
+
+    pub fn set_stream_initialization_for_handle(
+        &self,
+        handle: StreamHandle,
+        bytes: Bytes,
+    ) -> Result<(), &'static str> {
+        self.validate_initialization_payload(&bytes)?;
+        self.registry
+            .with_validated(handle.0, || {
+                let slot = self
+                    .stream_initializations
+                    .get(handle.index())
+                    .expect("validated stream index must be in bounds");
+                let mut slot = slot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.as_ref().is_some_and(|initialization| {
+                    initialization.stream_id == handle.stream_id()
+                        && initialization.generation == handle.generation()
+                        && initialization.bytes == bytes
+                }) {
+                    return;
+                }
+                *slot = Some(StreamInitialization {
+                    stream_id: handle.stream_id(),
+                    generation: handle.generation(),
+                    bytes,
+                });
+                self.bump_version_locked(handle.index());
+            })
+            .ok_or("Stale stream handle")
     }
 
     pub fn stream_initialization(&self, stream_id: u64) -> Option<Bytes> {
-        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
-        let slot = self.stream_initializations.get(stream_idx)?.read().ok()?;
+        let handle = self.resolve_stream(stream_id)?;
+        self.stream_initialization_for_handle(handle)
+    }
+
+    pub fn stream_initialization_for_handle(&self, handle: StreamHandle) -> Option<Bytes> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let slot = self
+            .stream_initializations
+            .get(handle.index())?
+            .read()
+            .ok()?;
         let initialization = slot.as_ref()?;
-        (initialization.stream_id == stream_id && initialization.generation == generation)
-            .then(|| initialization.bytes.clone())
+        let bytes = (initialization.stream_id == handle.stream_id()
+            && initialization.generation == handle.generation())
+        .then(|| initialization.bytes.clone());
+        drop(slot);
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(bytes)
+            .flatten()
     }
 
     pub async fn set(&self, stream_idx: usize, id: usize, data: Bytes) -> Result<(), &'static str> {
@@ -404,57 +569,30 @@ impl ChunkCache {
     async fn set_with_generation(
         &self,
         stream_idx: usize,
-        generation: usize,
+        generation: u64,
         id: usize,
         data: Bytes,
     ) -> Result<(), &'static str> {
+        self.validate_payload(&data)?;
         let idx = self
             .offset(stream_idx, id)
             .ok_or("Stream index out of bounds")?;
         let h = const_xxh3(&data);
 
-        let mut lock = self.buffer[idx].write().await;
-        *lock = data;
-        self.slot_ids[idx].store(id, Ordering::Release);
-        self.slot_generations[idx].store(generation, Ordering::Release);
-        self.slot_hashes[idx].store(h, Ordering::Release);
-        if let Some(version) = self.versions.get(stream_idx) {
-            version.fetch_add(1, Ordering::Release);
-        }
-        Ok(())
-    }
-
-    async fn put_if_absent_with_generation(
-        &self,
-        stream_idx: usize,
-        generation: usize,
-        id: usize,
-        data: Bytes,
-    ) -> Result<PutIfAbsentResult, &'static str> {
-        let idx = self
-            .offset(stream_idx, id)
-            .ok_or("Stream index out of bounds")?;
-        let h = const_xxh3(&data);
-
-        let mut lock = self.buffer[idx].write().await;
-        let stored_id = self.slot_ids[idx].load(Ordering::Acquire);
-        let stored_generation = self.slot_generations[idx].load(Ordering::Acquire);
-        if stored_id == id && stored_generation == generation {
-            return if lock.as_ref() == data.as_ref() {
-                Ok(PutIfAbsentResult::AlreadyPresent)
-            } else {
-                Ok(PutIfAbsentResult::HashConflict)
-            };
-        }
-
-        *lock = data;
-        self.slot_ids[idx].store(id, Ordering::Release);
-        self.slot_generations[idx].store(generation, Ordering::Release);
-        self.slot_hashes[idx].store(h, Ordering::Release);
-        if let Some(version) = self.versions.get(stream_idx) {
-            version.fetch_add(1, Ordering::Release);
-        }
-        Ok(PutIfAbsentResult::Inserted)
+        let mut slot = self.buffer[idx].write().await;
+        self.registry
+            .with_generation(stream_idx, generation, || {
+                if slot.generation == generation && slot.id.is_some_and(|stored| stored > id) {
+                    return Err("Chunk id already evicted");
+                }
+                slot.id = Some(id);
+                slot.generation = generation;
+                slot.hash = h;
+                slot.bytes = data;
+                self.bump_version_locked(stream_idx);
+                Ok(())
+            })
+            .ok_or("Stream index changed")?
     }
 
     pub async fn zero_stream_id(&self, stream_id: u64) {
@@ -462,26 +600,30 @@ impl ChunkCache {
     }
 
     pub fn zero_stream_id_sync(&self, stream_id: u64) {
-        let mut offsets_lock = self.offsets.write().unwrap();
-        if let Some(offset) = offsets_lock.remove(&stream_id) {
-            self.reset_stream_idx(offset);
-        }
+        let _ = self.registry.remove_stream(stream_id, |index, generation| {
+            self.reset_index_state(index, generation);
+        });
     }
 
     pub async fn append(&self, stream_idx: usize, data_bytes: Bytes) -> Result<(), &'static str> {
+        self.validate_payload(&data_bytes)?;
         let generation = self
             .generation(stream_idx)
             .ok_or("Stream index out of bounds")?;
-        let next_id = self
-            .next_ids
-            .get(stream_idx)
-            .ok_or("Stream index out of bounds")?;
-        let id = next_id.fetch_add(1, Ordering::AcqRel);
-        if id == EMPTY_LAST {
-            return Err("Stream id overflow");
-        }
+        let id = self.reserve_next_with_generation(stream_idx, generation)?;
         self.add_with_generation(stream_idx, generation, id, data_bytes)
             .await
+    }
+
+    pub async fn append_for_handle(
+        &self,
+        handle: StreamHandle,
+        data_bytes: Bytes,
+    ) -> Result<usize, &'static str> {
+        self.validate_payload(&data_bytes)?;
+        let id = self.reserve_next_for_handle(handle)?;
+        self.add_for_handle(handle, id, data_bytes).await?;
+        Ok(id)
     }
 
     pub async fn add(
@@ -500,19 +642,29 @@ impl ChunkCache {
     async fn add_with_generation(
         &self,
         stream_idx: usize,
-        generation: usize,
+        generation: u64,
         id: usize,
         data_bytes: Bytes,
     ) -> Result<(), &'static str> {
-        self.set_with_generation(stream_idx, generation, id, data_bytes)
-            .await?;
-        if self.generation(stream_idx) != Some(generation) {
-            return Err("Stream index changed");
-        }
-        self.advance_next_id(stream_idx, id.saturating_add(1));
-        self.publish_last(stream_idx, id);
-
-        Ok(())
+        self.validate_payload(&data_bytes)?;
+        let idx = self
+            .offset(stream_idx, id)
+            .ok_or("Stream index out of bounds")?;
+        let hash = const_xxh3(&data_bytes);
+        let mut slot = self.buffer[idx].write().await;
+        self.registry
+            .with_generation(stream_idx, generation, || {
+                if slot.generation == generation && slot.id.is_some_and(|stored| stored > id) {
+                    return Err("Chunk id already evicted");
+                }
+                slot.id = Some(id);
+                slot.generation = generation;
+                slot.hash = hash;
+                slot.bytes = data_bytes;
+                self.update_state_after_slot(stream_idx, id, true, true);
+                Ok(())
+            })
+            .ok_or("Stream index changed")?
     }
 
     pub async fn get_last(&self, stream_idx: usize) -> Option<(usize, Bytes, u64)> {
@@ -526,14 +678,45 @@ impl ChunkCache {
     }
 
     pub fn last(&self, stream_idx: usize) -> Option<usize> {
-        let val = self.idxs.get(stream_idx)?.load(Ordering::Acquire);
-        (val != EMPTY_LAST).then_some(val)
+        let generation = self.generation(stream_idx)?;
+        self.registry
+            .with_generation(stream_idx, generation, || self.state_last(stream_idx))
+            .flatten()
     }
 
     pub fn version(&self, stream_idx: usize) -> Option<u64> {
-        self.versions
-            .get(stream_idx)
-            .map(|version| version.load(Ordering::Acquire))
+        let generation = self.generation(stream_idx)?;
+        self.registry
+            .with_generation(stream_idx, generation, || self.state_version(stream_idx))
+            .flatten()
+    }
+
+    pub fn last_for_handle(&self, handle: StreamHandle) -> Option<usize> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let last = self.state_last(handle.index());
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(last)
+            .flatten()
+    }
+
+    pub fn version_for_handle(&self, handle: StreamHandle) -> Option<u64> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let version = self.state_version(handle.index());
+        self.registry
+            .is_current_fast(handle.0)
+            .then_some(version)
+            .flatten()
+    }
+
+    pub async fn get_last_for_handle(&self, handle: StreamHandle) -> Option<(usize, Bytes, u64)> {
+        let id = self.last_for_handle(handle)?;
+        let (bytes, hash) = self.get_for_handle(handle, id).await?;
+        Some((id, bytes, hash))
     }
 
     pub async fn get(&self, stream_idx: usize, id: usize) -> Option<(Bytes, u64)> {
@@ -544,32 +727,21 @@ impl ChunkCache {
     async fn get_with_generation(
         &self,
         stream_idx: usize,
-        generation: usize,
+        generation: u64,
         id: usize,
     ) -> Option<(Bytes, u64)> {
         let idx = self.offset(stream_idx, id)?;
-        let bytes = self.buffer[idx].read().await;
-        let stored_id = self.slot_ids[idx].load(Ordering::Acquire);
-        let stored_generation = self.slot_generations[idx].load(Ordering::Acquire);
-        let hash = self.slot_hashes[idx].load(Ordering::Acquire);
-        if stored_id == id && stored_generation == generation {
-            Some((bytes.clone(), hash))
+        let slot = if let Ok(slot) = self.buffer[idx].try_read() {
+            slot
         } else {
-            None
-        }
-    }
-
-    fn clone_matching_slot(
-        &self,
-        idx: usize,
-        id: usize,
-        generation: usize,
-        bytes: &Bytes,
-    ) -> Option<(Bytes, u64)> {
-        let stored_id = self.slot_ids.get(idx)?.load(Ordering::Acquire);
-        let stored_generation = self.slot_generations.get(idx)?.load(Ordering::Acquire);
-        let hash = self.slot_hashes.get(idx)?.load(Ordering::Acquire);
-        (stored_id == id && stored_generation == generation).then(|| (bytes.clone(), hash))
+            self.buffer[idx].read().await
+        };
+        self.registry
+            .with_generation(stream_idx, generation, || {
+                (slot.id == Some(id) && slot.generation == generation)
+                    .then(|| (slot.bytes.clone(), slot.hash))
+            })
+            .flatten()
     }
 
     pub fn retained_start(&self, last: usize) -> usize {
@@ -580,17 +752,24 @@ impl ChunkCache {
         self.options.max_parts_per_segment * self.options.max_segments
     }
 
-    fn generation(&self, stream_idx: usize) -> Option<usize> {
-        self.generations
-            .get(stream_idx)
-            .map(|generation| generation.load(Ordering::Acquire))
+    fn generation(&self, stream_idx: usize) -> Option<u64> {
+        self.registry.generation(stream_idx)
     }
 
-    fn stream_generation_for_id(&self, stream_id: u64) -> Option<(usize, usize)> {
-        let lock = self.offsets.read().unwrap();
-        let stream_idx = lock.get(&stream_id).copied()?;
-        let generation = self.generation(stream_idx)?;
-        Some((stream_idx, generation))
+    fn state_last(&self, stream_idx: usize) -> Option<usize> {
+        self.stream_states
+            .get(stream_idx)?
+            .read()
+            .ok()
+            .and_then(|state| state.last)
+    }
+
+    fn state_version(&self, stream_idx: usize) -> Option<u64> {
+        self.stream_states
+            .get(stream_idx)?
+            .read()
+            .ok()
+            .map(|state| state.version)
     }
 
     /// Reset all published state for a physical stream index.
@@ -600,26 +779,9 @@ impl ChunkCache {
     /// retained ring-buffer bytes from the previous logical stream are no
     /// longer visible through `get`, `last`, or initialization lookups.
     pub fn reset_stream_idx(&self, stream_idx: usize) {
-        if let Some(initialization) = self.stream_initializations.get(stream_idx) {
-            if let Ok(mut initialization) = initialization.write() {
-                *initialization = None;
-            }
-        }
-        if let Some(last) = self.idxs.get(stream_idx) {
-            last.store(EMPTY_LAST, Ordering::Release);
-        }
-        if let Some(next_id) = self.next_ids.get(stream_idx) {
-            next_id.store(1, Ordering::Release);
-        }
-        if let Some(generation) = self.generations.get(stream_idx) {
-            let next = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-            if next == 0 {
-                generation.store(1, Ordering::Release);
-            }
-        }
-        if let Some(version) = self.versions.get(stream_idx) {
-            version.fetch_add(1, Ordering::Release);
-        }
+        let _ = self.registry.reset_index(stream_idx, |index, generation| {
+            self.reset_index_state(index, generation);
+        });
     }
 
     fn offset(&self, stream_idx: usize, id: usize) -> Option<usize> {
@@ -633,96 +795,264 @@ impl ChunkCache {
             .filter(|idx| *idx < self.buffer.len())
     }
 
-    fn advance_next_id(&self, stream_idx: usize, next: usize) {
-        let Some(next_id) = self.next_ids.get(stream_idx) else {
-            return;
-        };
-        let mut current = next_id.load(Ordering::Acquire);
-        while current < next {
-            match next_id.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
+    fn reset_index_state(&self, stream_idx: usize, _generation: u64) {
+        if let Some(initialization) = self.stream_initializations.get(stream_idx) {
+            let mut initialization = initialization
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *initialization = None;
+        }
+        if let Some(state) = self.stream_states.get(stream_idx) {
+            let mut state = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last = None;
+            state.next_id = 1;
+            state.version = next_version(state.version);
         }
     }
 
-    fn publish_last(&self, stream_idx: usize, id: usize) {
-        let Some(last) = self.idxs.get(stream_idx) else {
-            return;
-        };
-        let mut current = last.load(Ordering::Acquire);
-        loop {
-            if current != EMPTY_LAST && current >= id {
-                return;
-            }
-            match last.compare_exchange_weak(current, id, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+    pub(crate) fn validate_payload(&self, data: &Bytes) -> Result<(), &'static str> {
+        let max_bytes = self
+            .options
+            .buffer_size_kb
+            .checked_mul(1024)
+            .ok_or("Chunk payload limit overflow")?;
+        (data.len() <= max_bytes)
+            .then_some(())
+            .ok_or("Chunk payload exceeds configured limit")
     }
 
-    fn publish_contiguous_last(
+    pub(crate) fn validate_initialization_payload(&self, data: &Bytes) -> Result<(), &'static str> {
+        let max_bytes = self
+            .options
+            .init_size_kb
+            .checked_mul(1024)
+            .ok_or("Initialization payload limit overflow")?;
+        (data.len() <= max_bytes)
+            .then_some(())
+            .ok_or("Initialization payload exceeds configured limit")
+    }
+
+    async fn add_slot_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        data: Bytes,
+    ) -> Result<(), &'static str> {
+        self.validate_payload(&data)?;
+        let idx = self
+            .offset(handle.index(), id)
+            .ok_or("Stream index out of bounds")?;
+        let hash = const_xxh3(&data);
+        let mut slot = self.buffer[idx].write().await;
+        self.registry
+            .with_validated(handle.0, || {
+                if slot.generation == handle.generation()
+                    && slot.id.is_some_and(|stored| stored > id)
+                {
+                    return Err("Chunk id already evicted");
+                }
+                slot.id = Some(id);
+                slot.generation = handle.generation();
+                slot.hash = hash;
+                slot.bytes = data;
+                self.update_state_after_slot(handle.index(), id, true, true);
+                Ok(())
+            })
+            .ok_or("Stale stream handle")?
+    }
+
+    async fn put_slot_if_absent_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        data: Bytes,
+        publish: bool,
+    ) -> Result<PutIfAbsentResult, &'static str> {
+        self.validate_payload(&data)?;
+        let idx = self
+            .offset(handle.index(), id)
+            .ok_or("Stream index out of bounds")?;
+        let hash = const_xxh3(&data);
+        let mut slot = self.buffer[idx].write().await;
+        self.registry
+            .with_validated(handle.0, || {
+                let result = if slot.id == Some(id) && slot.generation == handle.generation() {
+                    if slot.bytes == data {
+                        PutIfAbsentResult::AlreadyPresent
+                    } else {
+                        PutIfAbsentResult::HashConflict
+                    }
+                } else if slot.generation == handle.generation()
+                    && slot.id.is_some_and(|stored| stored > id)
+                {
+                    PutIfAbsentResult::Superseded
+                } else {
+                    slot.id = Some(id);
+                    slot.generation = handle.generation();
+                    slot.hash = hash;
+                    slot.bytes = data;
+                    PutIfAbsentResult::Inserted
+                };
+                let inserted = result == PutIfAbsentResult::Inserted;
+                let publish = publish
+                    && matches!(
+                        result,
+                        PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
+                    );
+                if inserted || publish {
+                    self.update_state_after_slot(handle.index(), id, inserted, publish);
+                }
+                result
+            })
+            .ok_or("Stale stream handle")
+    }
+
+    fn update_state_after_slot(
         &self,
         stream_idx: usize,
-        generation: usize,
-        first_expected_id: usize,
+        id: usize,
+        bump_version: bool,
+        publish: bool,
     ) {
-        let Some(last) = self.idxs.get(stream_idx) else {
+        let Some(state) = self.stream_states.get(stream_idx) else {
             return;
         };
-        loop {
-            if self.generation(stream_idx) != Some(generation) {
-                return;
-            }
-            let current = last.load(Ordering::Acquire);
-            let published_next = if current == EMPTY_LAST {
-                first_expected_id
-            } else {
-                current.saturating_add(1)
-            };
-            let observed_next = self
-                .next_ids
-                .get(stream_idx)
-                .map(|next| next.load(Ordering::Acquire))
-                .unwrap_or(published_next);
-            let retained_start = observed_next.saturating_sub(self.stream_capacity());
-            let mut candidate = published_next.max(first_expected_id).max(retained_start);
-            let mut contiguous_last = current;
-
-            // One scan can advance by at most the retained ring capacity. This
-            // keeps completion work bounded even for adversarial object IDs.
-            // Once an unresolved gap has fallen behind `retained_start`, the
-            // rolling live publication may resume at the first still-retained
-            // object. The watermark always points at a real stored object; it
-            // never fabricates completeness for a slot that is still retained.
-            for _ in 0..self.stream_capacity() {
-                let Some(slot) = self.offset(stream_idx, candidate) else {
-                    return;
-                };
-                if self.slot_ids[slot].load(Ordering::Acquire) != candidate
-                    || self.slot_generations[slot].load(Ordering::Acquire) != generation
-                {
-                    break;
-                }
-                contiguous_last = candidate;
-                candidate = candidate.saturating_add(1);
-            }
-
-            if contiguous_last == current {
-                return;
-            }
-            match last.compare_exchange_weak(
-                current,
-                contiguous_last,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(_) => continue,
-            }
+        let mut state = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bump_version {
+            state.version = next_version(state.version);
         }
+        if publish {
+            state.next_id = state.next_id.max(id.saturating_add(1));
+            state.last = Some(state.last.map_or(id, |last| last.max(id)));
+        }
+    }
+
+    fn bump_version_locked(&self, stream_idx: usize) {
+        if let Some(state) = self.stream_states.get(stream_idx) {
+            let mut state = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.version = next_version(state.version);
+        }
+    }
+
+    fn reserve_next_for_handle(&self, handle: StreamHandle) -> Result<usize, &'static str> {
+        self.registry
+            .with_validated(handle.0, || self.reserve_next_locked(handle.index()))
+            .ok_or("Stale stream handle")?
+    }
+
+    fn reserve_next_with_generation(
+        &self,
+        stream_idx: usize,
+        generation: u64,
+    ) -> Result<usize, &'static str> {
+        self.registry
+            .with_generation(stream_idx, generation, || {
+                self.reserve_next_locked(stream_idx)
+            })
+            .ok_or("Stream index changed")?
+    }
+
+    fn reserve_next_locked(&self, stream_idx: usize) -> Result<usize, &'static str> {
+        let state = self
+            .stream_states
+            .get(stream_idx)
+            .ok_or("Stream index out of bounds")?;
+        let mut state = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = state.next_id;
+        state.next_id = state.next_id.checked_add(1).ok_or("Stream id overflow")?;
+        Ok(id)
+    }
+
+    fn advance_next_for_handle(
+        &self,
+        handle: StreamHandle,
+        next: usize,
+    ) -> Result<(), &'static str> {
+        self.registry
+            .with_validated(handle.0, || self.advance_next_locked(handle.index(), next))
+            .ok_or("Stale stream handle")
+    }
+
+    fn advance_next_locked(&self, stream_idx: usize, next: usize) {
+        if let Some(state) = self.stream_states.get(stream_idx) {
+            let mut state = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.next_id = state.next_id.max(next);
+        }
+    }
+
+    async fn publish_contiguous_last(
+        &self,
+        handle: StreamHandle,
+        first_expected_id: usize,
+    ) -> Result<(), &'static str> {
+        let (current, next_id) = self
+            .registry
+            .with_validated(handle.0, || {
+                let state = self.stream_states[handle.index()]
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.last, state.next_id)
+            })
+            .ok_or("Stale stream handle")?;
+        let published_next = current
+            .and_then(|last| last.checked_add(1))
+            .unwrap_or(first_expected_id);
+        let retained_start = next_id.saturating_sub(self.stream_capacity());
+        let mut candidate = published_next.max(first_expected_id).max(retained_start);
+        let mut contiguous_last = current;
+
+        for _ in 0..self.stream_capacity() {
+            let slot_idx = self
+                .offset(handle.index(), candidate)
+                .ok_or("Stream index out of bounds")?;
+            let slot = if let Ok(slot) = self.buffer[slot_idx].try_read() {
+                slot
+            } else {
+                self.buffer[slot_idx].read().await
+            };
+            if slot.id != Some(candidate) || slot.generation != handle.generation() {
+                break;
+            }
+            contiguous_last = Some(candidate);
+            let Some(next) = candidate.checked_add(1) else {
+                break;
+            };
+            candidate = next;
+        }
+
+        self.registry
+            .with_validated(handle.0, || {
+                if let Some(contiguous_last) = contiguous_last {
+                    let mut state = self.stream_states[handle.index()]
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.last = Some(
+                        state
+                            .last
+                            .map_or(contiguous_last, |last| last.max(contiguous_last)),
+                    );
+                }
+            })
+            .ok_or("Stale stream handle")
+    }
+}
+
+fn next_version(version: u64) -> u64 {
+    let next = version.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
     }
 }
 
@@ -733,11 +1063,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::task;
-    use tokio::time::{timeout, Duration, Instant};
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn exact_part_waiters_follow_stream_and_sequence_identity() {
         let cache = ChunkCache::new(Options::default());
+        cache.resolve_or_create_stream(77).await;
         let first_waiter = cache.exact_part_waiter(77, 0).unwrap();
         let second_waiter = cache.exact_part_waiter(77, 1).unwrap();
         let first = first_waiter.notified();
@@ -776,6 +1107,7 @@ mod tests {
     #[test]
     fn exact_part_waiters_share_keys_and_replace_cancelled_registrations() {
         let cache = ChunkCache::new(Options::default());
+        cache.resolve_or_create_stream_sync(78);
         let first = cache.exact_part_waiter(78, 12).unwrap();
         let duplicate = cache.exact_part_waiter(78, 12).unwrap();
         assert!(Arc::ptr_eq(&first, &duplicate));
@@ -912,267 +1244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_and_last() {
-        const TEST_DURATION_SECS: u64 = 5;
-        const NUM_READERS: usize = 1;
-        const STREAM_ID: u64 = 1;
-
-        println!("Starting max read test for {TEST_DURATION_SECS}s, {NUM_READERS} readers");
-
-        let options = Options::default();
-        let cache = Arc::new(ChunkCache::new(options));
-        let read_count = Arc::new(AtomicU64::new(0));
-        let write_count = Arc::new(AtomicU64::new(0));
-
-        let stream_idx = cache.get_or_create_stream_idx(STREAM_ID).await;
-
-        let mut reader_handles = Vec::new();
-        for _ in 0..NUM_READERS {
-            let cache_clone = Arc::clone(&cache);
-            let read_count_clone = Arc::clone(&read_count);
-
-            let handle = task::spawn(async move {
-                let start = Instant::now();
-                while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                    if cache_clone.last(stream_idx).is_some() {
-                        read_count_clone.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-            reader_handles.push(handle);
-        }
-
-        let writer_handle = {
-            let cache_clone = Arc::clone(&cache);
-            let write_count_clone = Arc::clone(&write_count);
-
-            task::spawn(async move {
-                let start = Instant::now();
-                let mut id = 0u64;
-                while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                    id += 1;
-                    let mut data = vec![0u8; 64];
-                    data[0..8].copy_from_slice(&id.to_le_bytes());
-                    if cache_clone
-                        .append(stream_idx, Bytes::from(data))
-                        .await
-                        .is_ok()
-                    {
-                        write_count_clone.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-        };
-
-        for handle in reader_handles {
-            handle.await.unwrap();
-        }
-        writer_handle.await.unwrap();
-
-        let total_reads = read_count.load(Ordering::Relaxed);
-        let total_writes = write_count.load(Ordering::Relaxed);
-        let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
-        let writes_per_sec = total_writes as f64 / TEST_DURATION_SECS as f64;
-
-        println!("\n=== Test Results ===");
-        println!("Total reads: {total_reads}");
-        println!("Total writes: {total_writes}");
-        println!("Reads/second: {reads_per_sec:.2}");
-        println!("Writes/second: {writes_per_sec:.2}");
-        println!(
-            "Average reads per write: {:.2}",
-            total_reads as f64 / (total_writes as f64).max(1.0)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_read_write() {
-        const TEST_DURATION_SECS: u64 = 5;
-        const NUM_STREAMS: usize = 8;
-
-        println!("\n=== Concurrent ChunkCache Benchmark ===");
-        println!(
-            "Duration: {TEST_DURATION_SECS}s, Streams: {NUM_STREAMS} (1 writer + 2 readers each)"
-        );
-
-        let options = Options {
-            num_playlists: NUM_STREAMS,
-            buffer_size_kb: 64,
-            max_parts_per_segment: 10000,
-            ..Options::default()
-        };
-        let cache = Arc::new(ChunkCache::new(options));
-
-        let read_count = Arc::new(AtomicU64::new(0));
-        let write_count = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
-
-        // Pre-create streams
-        for i in 0..NUM_STREAMS {
-            cache.get_or_create_stream_idx(i as u64).await;
-            // Seed with initial data so readers have something
-            cache
-                .append(i, Bytes::from(vec![0u8; 64 * 1024]))
-                .await
-                .ok();
-        }
-
-        let mut handles = Vec::new();
-
-        // Each stream gets 1 writer
-        for stream_idx in 0..NUM_STREAMS {
-            let cache_clone = Arc::clone(&cache);
-            let write_count_clone = Arc::clone(&write_count);
-            let write_bytes_clone = Arc::clone(&write_bytes);
-
-            handles.push(task::spawn(async move {
-                let start = Instant::now();
-                let data = Bytes::from(vec![0xABu8; 64 * 1024]); // 64KB chunks
-
-                while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                    if cache_clone.append(stream_idx, data.clone()).await.is_ok() {
-                        write_count_clone.fetch_add(1, Ordering::Relaxed);
-                        write_bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    }
-                }
-            }));
-        }
-
-        // Each stream gets 2 readers
-        for stream_idx in 0..NUM_STREAMS {
-            for _ in 0..2 {
-                let cache_clone = Arc::clone(&cache);
-                let read_count_clone = Arc::clone(&read_count);
-                let read_bytes_clone = Arc::clone(&read_bytes);
-
-                handles.push(task::spawn(async move {
-                    let start = Instant::now();
-                    let mut slot = 1usize;
-
-                    while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                        if let Some((bytes, _hash)) = cache_clone.get(stream_idx, slot).await {
-                            read_count_clone.fetch_add(1, Ordering::Relaxed);
-                            read_bytes_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            // Move to next slot, wrap around
-                            if let Some(last) = cache_clone.last(stream_idx) {
-                                slot = if slot >= last { 1 } else { slot + 1 };
-                            }
-                        }
-                    }
-                }));
-            }
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let total_reads = read_count.load(Ordering::Relaxed);
-        let total_writes = write_count.load(Ordering::Relaxed);
-        let total_read_bytes = read_bytes.load(Ordering::Relaxed);
-        let total_write_bytes = write_bytes.load(Ordering::Relaxed);
-
-        let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
-        let writes_per_sec = total_writes as f64 / TEST_DURATION_SECS as f64;
-        let read_throughput_mb =
-            (total_read_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
-        let write_throughput_mb =
-            (total_write_bytes as f64 / 1024.0 / 1024.0) / TEST_DURATION_SECS as f64;
-
-        println!("\n=== Results ===");
-        println!("Writers: {NUM_STREAMS} streams");
-        println!("Readers: {} total ({} per stream)", NUM_STREAMS * 2, 2);
-        println!("Write: {writes_per_sec:.0}/s ({write_throughput_mb:.0} MB/s)");
-        println!("Read:  {reads_per_sec:.0}/s ({read_throughput_mb:.0} MB/s)");
-        println!(
-            "Combined throughput: {:.0} MB/s",
-            read_throughput_mb + write_throughput_mb
-        );
-    }
-
-    #[tokio::test]
-    async fn test_massive_concurrent_reads() {
-        const TEST_DURATION_SECS: u64 = 3;
-        const NUM_READERS: usize = 1000;
-        const STREAM_ID: u64 = 1;
-
-        println!("\n=== Massive Concurrent Reads Benchmark ===");
-        println!("Duration: {TEST_DURATION_SECS}s, Readers: {NUM_READERS}, Writers: 1");
-
-        let options = Options::default();
-        let cache = Arc::new(ChunkCache::new(options));
-        let read_count = Arc::new(AtomicU64::new(0));
-        let write_count = Arc::new(AtomicU64::new(0));
-
-        let stream_idx = cache.get_or_create_stream_idx(STREAM_ID).await;
-        // Seed with data
-        for i in 1..=100 {
-            cache
-                .add(stream_idx, i, Bytes::from(vec![0xABu8; 1024]))
-                .await
-                .ok();
-        }
-
-        let mut handles = Vec::new();
-
-        // Single writer
-        let cache_clone = Arc::clone(&cache);
-        let write_count_clone = Arc::clone(&write_count);
-        handles.push(task::spawn(async move {
-            let start = Instant::now();
-            let data = Bytes::from(vec![0xCDu8; 1024]);
-            while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                cache_clone.append(stream_idx, data.clone()).await.ok();
-                write_count_clone.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-
-        // Many concurrent readers
-        for _ in 0..NUM_READERS {
-            let cache_clone = Arc::clone(&cache);
-            let read_count_clone = Arc::clone(&read_count);
-
-            handles.push(task::spawn(async move {
-                let start = Instant::now();
-                let mut slot = 1usize;
-                while start.elapsed().as_secs() < TEST_DURATION_SECS {
-                    if let Some(last) = cache_clone.last(stream_idx) {
-                        let retained_start = cache_clone.retained_start(last);
-                        if slot < retained_start || slot > last {
-                            slot = retained_start;
-                        }
-                    }
-                    if cache_clone.get(stream_idx, slot).await.is_some() {
-                        read_count_clone.fetch_add(1, Ordering::Relaxed);
-                    }
-                    slot = slot.saturating_add(1);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let total_reads = read_count.load(Ordering::Relaxed);
-        let total_writes = write_count.load(Ordering::Relaxed);
-        let reads_per_sec = total_reads as f64 / TEST_DURATION_SECS as f64;
-
-        println!("\n=== Results ===");
-        println!("Concurrent readers: {NUM_READERS}");
-        println!(
-            "Total reads: {total_reads} ({:.1}M/s)",
-            reads_per_sec / 1_000_000.0
-        );
-        println!("Total writes: {total_writes}");
-        println!(
-            "Reads per reader: {:.0}",
-            total_reads as f64 / NUM_READERS as f64
-        );
-    }
-
-    #[tokio::test]
     async fn read_heavy_workload_handles_thousands_more_reads_than_writes() {
         const READERS: usize = 64;
         const READS_PER_READER: usize = 4096;
@@ -1186,9 +1257,9 @@ mod tests {
             ..Options::default()
         };
         let cache = Arc::new(ChunkCache::new(options));
-        let stream_idx = cache.add_stream_id(STREAM_ID).await;
+        let stream_handle = cache.resolve_or_create_stream(STREAM_ID).await;
         cache
-            .add(stream_idx, 0, Bytes::from_static(b"seed"))
+            .add_for_handle(stream_handle, 0, Bytes::from_static(b"seed"))
             .await
             .unwrap();
 
@@ -1201,7 +1272,10 @@ mod tests {
             let read_count = Arc::clone(&read_count);
             handles.push(task::spawn(async move {
                 for _ in 0..READS_PER_READER {
-                    let (bytes, hash) = cache.get(stream_idx, 0).await.expect("seed slot");
+                    let (bytes, hash) = cache
+                        .get_for_handle(stream_handle, 0)
+                        .await
+                        .expect("seed slot");
                     assert_eq!(bytes, Bytes::from_static(b"seed"));
                     assert_ne!(hash, 0);
                     read_count.fetch_add(1, Ordering::Relaxed);
@@ -1214,7 +1288,7 @@ mod tests {
         handles.push(task::spawn(async move {
             for id in 1..=WRITES {
                 writer_cache
-                    .add(stream_idx, id, Bytes::from(vec![id as u8; 128]))
+                    .add_for_handle(stream_handle, id, Bytes::from(vec![id as u8; 128]))
                     .await
                     .unwrap();
                 writer_count.fetch_add(1, Ordering::Relaxed);
@@ -1235,81 +1309,183 @@ mod tests {
             "expected at least 10k reads per write, got {total_reads}/{total_writes}"
         );
         assert_eq!(
-            cache.get(stream_idx, WRITES).await.unwrap().0,
+            cache.get_for_handle(stream_handle, WRITES).await.unwrap().0,
             Bytes::from(vec![WRITES as u8; 128])
         );
     }
 
     #[tokio::test]
-    async fn test_new_playlist_notification_sent() {
-        let options = Options::default();
-        let cache = ChunkCache::new(options);
-        let mut rx = cache
-            .take_new_playlists_rx()
-            .expect("receiver already taken");
+    async fn stream_churn_retains_only_the_configured_mapping_capacity() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 2,
+            ..Options::default()
+        });
 
-        let idx = cache.add_stream_id(42).await;
-        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
+        for stream_id in 0..100_000 {
+            cache.add_stream_id(stream_id).await;
+        }
 
-        assert_eq!(stream_id, 42);
-        assert_eq!(notified_idx, idx);
+        let streams = cache.stream_ids().await;
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams, vec![(99_998, 0), (99_999, 1)]);
     }
 
     #[tokio::test]
-    async fn test_no_notification_for_existing_stream_id() {
-        let options = Options::default();
-        let cache = ChunkCache::new(options);
-        let mut rx = cache
-            .take_new_playlists_rx()
-            .expect("receiver already taken");
+    async fn old_handle_cannot_write_after_physical_slot_reuse() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 2,
+            ..Options::default()
+        });
+        let old = cache.resolve_or_create_stream(10).await;
+        cache
+            .add_for_handle(old, 0, Bytes::from_static(b"old"))
+            .await
+            .unwrap();
 
-        let _ = cache.add_stream_id(7).await;
-        let _ = rx.recv().await.expect("missing initial notification");
+        let current = cache.resolve_or_create_stream(11).await;
+        cache
+            .add_for_handle(current, 0, Bytes::from_static(b"current"))
+            .await
+            .unwrap();
 
-        let _ = cache.add_stream_id(7).await;
-        let recv = timeout(Duration::from_millis(50), rx.recv()).await;
-
-        assert!(recv.is_err());
+        assert_eq!(
+            cache
+                .add_for_handle(old, 0, Bytes::from_static(b"stale"))
+                .await,
+            Err("Stale stream handle")
+        );
+        assert_eq!(
+            cache.get_for_handle(current, 0).await.unwrap().0,
+            Bytes::from_static(b"current")
+        );
+        assert!(cache.get_for_handle(old, 0).await.is_none());
     }
 
     #[tokio::test]
-    async fn test_take_new_playlists_rx_single_use() {
-        let options = Options::default();
-        let cache = ChunkCache::new(options);
-        let mut rx = cache
-            .take_new_playlists_rx()
-            .expect("receiver already taken");
+    async fn delayed_older_position_cannot_overwrite_newer_ring_slot() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 2,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(12).await;
+        cache
+            .add_for_handle(handle, 2, Bytes::from_static(b"newer"))
+            .await
+            .unwrap();
 
-        assert!(cache.take_new_playlists_rx().is_none());
-
-        let idx = cache.add_stream_id(13).await;
-        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
-
-        assert_eq!(stream_id, 13);
-        assert_eq!(notified_idx, idx);
+        assert_eq!(
+            cache
+                .add_for_handle(handle, 0, Bytes::from_static(b"delayed-older"))
+                .await,
+            Err("Chunk id already evicted")
+        );
+        assert_eq!(
+            cache.get_for_handle(handle, 2).await.unwrap().0,
+            Bytes::from_static(b"newer")
+        );
+        assert_eq!(
+            cache
+                .put_if_absent_for_handle(handle, 0, Bytes::from_static(b"delayed-older"))
+                .await
+                .unwrap(),
+            PutIfAbsentResult::Superseded
+        );
     }
 
     #[tokio::test]
-    async fn test_notification_after_zero_stream_id() {
-        let options = Options::default();
-        let cache = ChunkCache::new(options);
-        let mut rx = cache
-            .take_new_playlists_rx()
-            .expect("receiver already taken");
+    async fn payload_memory_plateaus_after_ring_rotations() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            buffer_size_kb: 1,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(14).await;
+        for id in 0..100 {
+            cache
+                .add_for_handle(handle, id, Bytes::from(vec![id as u8; 512]))
+                .await
+                .unwrap();
+        }
 
-        let first_idx = cache.add_stream_id(9).await;
-        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification");
+        let stats = cache.memory_stats().await;
+        assert_eq!(stats.occupied_slots, 4);
+        assert_eq!(stats.chunk_bytes, 4 * 512);
+        assert!(stats.chunk_bytes + stats.initialization_bytes <= stats.maximum_payload_bytes);
+    }
 
-        assert_eq!(stream_id, 9);
-        assert_eq!(notified_idx, first_idx);
+    #[tokio::test]
+    async fn exact_part_waiter_does_not_cross_a_stream_generation() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        cache.resolve_or_create_stream(21).await;
+        let waiter = cache.exact_part_waiter(21, 3).unwrap();
+        let notified = waiter.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-        cache.zero_stream_id(9).await;
+        cache.add_stream_id(22).await;
+        cache.zero_stream_id(22).await;
+        cache
+            .add_for_stream_id(21, 3, Bytes::from_static(b"new-generation"))
+            .await
+            .unwrap();
 
-        let second_idx = cache.add_stream_id(9).await;
-        let (stream_id, notified_idx) = rx.recv().await.expect("missing notification after reset");
+        assert!(timeout(Duration::from_millis(10), &mut notified)
+            .await
+            .is_err());
+    }
 
-        assert_eq!(stream_id, 9);
-        assert_eq!(notified_idx, second_idx);
+    #[tokio::test]
+    async fn waiter_for_unknown_stream_does_not_evict_a_live_stream() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        let live = cache.resolve_or_create_stream(31).await;
+
+        assert!(cache.exact_part_waiter(32, 0).is_none());
+        assert_eq!(cache.resolve_stream(31), Some(live));
+        assert_eq!(cache.resolve_stream(32), None);
+    }
+
+    #[tokio::test]
+    async fn rejected_mapped_payloads_do_not_evict_a_live_stream() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            buffer_size_kb: 1,
+            init_size_kb: 1,
+            ..Options::default()
+        });
+        let live = cache.resolve_or_create_stream(41).await;
+        cache
+            .add_for_handle(live, 0, Bytes::from_static(b"live"))
+            .await
+            .unwrap();
+
+        assert!(cache
+            .add_for_stream_id(42, 0, Bytes::from(vec![0_u8; 1025]))
+            .await
+            .is_err());
+        assert!(cache
+            .set_stream_initialization(43, Bytes::from(vec![0_u8; 1025]))
+            .await
+            .is_err());
+
+        assert_eq!(cache.resolve_stream(41), Some(live));
+        assert_eq!(cache.resolve_stream(42), None);
+        assert_eq!(cache.resolve_stream(43), None);
+        assert_eq!(
+            cache.get_for_handle(live, 0).await.unwrap().0,
+            Bytes::from_static(b"live")
+        );
     }
 
     #[tokio::test]
@@ -1321,24 +1497,24 @@ mod tests {
             ..Options::default()
         };
         let cache = ChunkCache::new(options);
-        let stream_idx = cache.add_stream_id(1).await;
+        let stream_handle = cache.resolve_or_create_stream(1).await;
 
         cache
-            .add(stream_idx, 0, Bytes::from_static(b"slot-0"))
+            .add_for_handle(stream_handle, 0, Bytes::from_static(b"slot-0"))
             .await
             .unwrap();
         cache
-            .add(stream_idx, 1, Bytes::from_static(b"slot-1"))
+            .add_for_handle(stream_handle, 1, Bytes::from_static(b"slot-1"))
             .await
             .unwrap();
         cache
-            .add(stream_idx, 2, Bytes::from_static(b"slot-2"))
+            .add_for_handle(stream_handle, 2, Bytes::from_static(b"slot-2"))
             .await
             .unwrap();
 
-        assert!(cache.get(stream_idx, 0).await.is_none());
+        assert!(cache.get_for_handle(stream_handle, 0).await.is_none());
         assert_eq!(
-            cache.get(stream_idx, 2).await.unwrap().0,
+            cache.get_for_handle(stream_handle, 2).await.unwrap().0,
             Bytes::from_static(b"slot-2")
         );
     }
@@ -1462,13 +1638,25 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn constructor_rejects_capacity_arithmetic_overflow() {
+        assert!(matches!(
+            ChunkCache::try_new(Options {
+                num_playlists: usize::MAX,
+                max_segments: 2,
+                ..Options::default()
+            }),
+            Err(CacheError::ArithmeticOverflow)
+        ));
+    }
+
     #[tokio::test]
     async fn concurrent_appends_publish_unique_monotonic_ids() {
         const WRITERS: usize = 8;
         const WRITES_PER_WRITER: usize = 32;
 
         let cache = Arc::new(ChunkCache::new(Options::default()));
-        let stream_idx = cache.add_stream_id(1).await;
+        let stream_handle = cache.resolve_or_create_stream(1).await;
         let mut handles = Vec::new();
 
         for _ in 0..WRITERS {
@@ -1476,7 +1664,7 @@ mod tests {
             handles.push(task::spawn(async move {
                 for _ in 0..WRITES_PER_WRITER {
                     cache
-                        .append(stream_idx, Bytes::from_static(b"part"))
+                        .append_for_handle(stream_handle, Bytes::from_static(b"part"))
                         .await
                         .unwrap();
                 }
@@ -1488,10 +1676,10 @@ mod tests {
         }
 
         let expected_last = WRITERS * WRITES_PER_WRITER;
-        assert_eq!(cache.last(stream_idx), Some(expected_last));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(expected_last));
         for id in 1..=expected_last {
             assert_eq!(
-                cache.get(stream_idx, id).await.unwrap().0,
+                cache.get_for_handle(stream_handle, id).await.unwrap().0,
                 Bytes::from_static(b"part")
             );
         }
@@ -1504,25 +1692,26 @@ mod tests {
             ..Options::default()
         };
         let cache = ChunkCache::new(options);
-        let stream_idx = cache.add_stream_id(1).await;
-        let initial = cache.version(stream_idx).unwrap();
+        let first = cache.resolve_or_create_stream(1).await;
+        let initial = cache.version_for_handle(first).unwrap();
 
         cache
             .add_for_stream_id(1, 0, Bytes::from_static(b"first"))
             .await
             .unwrap();
-        let after_write = cache.version(stream_idx).unwrap();
+        let after_write = cache.version_for_handle(first).unwrap();
         assert!(after_write > initial);
 
-        assert_eq!(cache.add_stream_id(2).await, stream_idx);
-        assert!(cache.version(stream_idx).unwrap() > after_write);
+        let second = cache.resolve_or_create_stream(2).await;
+        assert_eq!(second.index(), first.index());
+        assert!(cache.version_for_handle(second).unwrap() > after_write);
     }
 
     #[tokio::test]
     async fn immutable_put_is_idempotent_and_preserves_original_on_conflict() {
         let cache = ChunkCache::new(Options::default());
-        let stream_idx = cache.add_stream_id(41).await;
-        let version_before = cache.version(stream_idx).unwrap();
+        let stream_handle = cache.resolve_or_create_stream(41).await;
+        let version_before = cache.version_for_handle(stream_handle).unwrap();
 
         assert_eq!(
             cache
@@ -1531,7 +1720,7 @@ mod tests {
                 .unwrap(),
             PutIfAbsentResult::Inserted
         );
-        let version_after_insert = cache.version(stream_idx).unwrap();
+        let version_after_insert = cache.version_for_handle(stream_handle).unwrap();
         assert!(version_after_insert > version_before);
 
         assert_eq!(
@@ -1541,7 +1730,10 @@ mod tests {
                 .unwrap(),
             PutIfAbsentResult::AlreadyPresent
         );
-        assert_eq!(cache.version(stream_idx), Some(version_after_insert));
+        assert_eq!(
+            cache.version_for_handle(stream_handle),
+            Some(version_after_insert)
+        );
 
         assert_eq!(
             cache
@@ -1550,12 +1742,15 @@ mod tests {
                 .unwrap(),
             PutIfAbsentResult::HashConflict
         );
-        assert_eq!(cache.version(stream_idx), Some(version_after_insert));
+        assert_eq!(
+            cache.version_for_handle(stream_handle),
+            Some(version_after_insert)
+        );
         assert_eq!(
             cache.get_for_stream_id(41, 7).await.unwrap().0,
             Bytes::from_static(b"canonical")
         );
-        assert_eq!(cache.last(stream_idx), Some(7));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(7));
     }
 
     #[tokio::test]
@@ -1606,7 +1801,7 @@ mod tests {
     #[tokio::test]
     async fn contiguous_immutable_publication_holds_objects_behind_a_gap() {
         let cache = ChunkCache::new(Options::default());
-        let stream_idx = cache.add_stream_id(61).await;
+        let stream_handle = cache.resolve_or_create_stream(61).await;
 
         assert_eq!(
             cache
@@ -1615,7 +1810,7 @@ mod tests {
                 .unwrap(),
             PutIfAbsentResult::Inserted
         );
-        assert_eq!(cache.last(stream_idx), None);
+        assert_eq!(cache.last_for_handle(stream_handle), None);
         assert_eq!(
             cache.get_for_stream_id(61, 1).await.unwrap().0,
             Bytes::from_static(b"object-1")
@@ -1628,13 +1823,13 @@ mod tests {
                 .unwrap(),
             PutIfAbsentResult::Inserted
         );
-        assert_eq!(cache.last(stream_idx), Some(1));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(1));
     }
 
     #[tokio::test]
     async fn contiguous_immutable_publication_uses_an_explicit_subscription_base() {
         let cache = ChunkCache::new(Options::default());
-        let stream_idx = cache.add_stream_id(62).await;
+        let stream_handle = cache.resolve_or_create_stream(62).await;
 
         cache
             .put_if_absent_contiguous_for_stream_id(
@@ -1646,7 +1841,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(cache.last(stream_idx), Some(8_000));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(8_000));
     }
 
     #[tokio::test]
@@ -1657,7 +1852,7 @@ mod tests {
             max_parts_per_segment: 4,
             ..Options::default()
         });
-        let stream_idx = cache.add_stream_id(63).await;
+        let stream_handle = cache.resolve_or_create_stream(63).await;
 
         cache
             .put_if_absent_contiguous_for_stream_id(63, 0, 0, Bytes::from_static(b"object-0"))
@@ -1675,7 +1870,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(cache.last(stream_idx), Some(0));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(0));
 
         cache
             .put_if_absent_contiguous_for_stream_id(63, 5, 0, Bytes::from_static(b"object-5"))
@@ -1683,7 +1878,7 @@ mod tests {
             .unwrap();
 
         assert!(cache.get_for_stream_id(63, 1).await.is_none());
-        assert_eq!(cache.last(stream_idx), Some(5));
+        assert_eq!(cache.last_for_handle(stream_handle), Some(5));
         assert_eq!(
             cache.get_for_stream_id(63, 5).await.unwrap().0,
             Bytes::from_static(b"object-5")

@@ -10,9 +10,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, warn};
 
 const FRAME_MAGIC: &[u8; 8] = b"PLMESH1\0";
@@ -33,21 +33,22 @@ const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
 const MAX_GOSSIP_PEERS: usize = 256;
 const FEC_OBSERVATION_DATAGRAM_WINDOW: u64 = 8_192;
 const FEC_COMPLETED_BLOCK_WINDOW: usize = 4_096;
+const DEFAULT_MAX_PEERS: usize = 256;
+const DEFAULT_MAX_INFLIGHT_FRAMES: usize = 64;
+const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_REMOTE_SLOTS: usize = 65_536;
+const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_REPLICA_QUEUE_CAPACITY: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheMeshRole {
     /// Compatibility mode for existing local mesh fixtures.
+    #[default]
     Peer,
     /// A regional cache distributor may serve child replicas.
     Distributor,
     /// A leaf playback cache receives from parents and never forwards cache data.
     Edge,
-}
-
-impl Default for CacheMeshRole {
-    fn default() -> Self {
-        Self::Peer
-    }
 }
 
 impl CacheMeshRole {
@@ -128,6 +129,20 @@ pub struct CacheMeshConfig {
     pub max_parents: usize,
     /// Maximum number of child edges served by one distributor tick.
     pub max_children: usize,
+    /// Addresses authorized to send frames or join through gossip.
+    pub allowed_peers: HashSet<SocketAddr>,
+    /// Hard limit on known peer addresses and per-peer metadata.
+    pub max_peers: usize,
+    /// Hard limit on incomplete FEC objects retained across all peers.
+    pub max_inflight_frames: usize,
+    /// Largest decoded mesh frame accepted or transmitted.
+    pub max_frame_bytes: usize,
+    /// Hard limit on remote-origin cache-slot hints.
+    pub max_remote_slots: usize,
+    /// Decoded frames waiting for cache or discovery work.
+    pub frame_queue_capacity: usize,
+    /// Replica requests waiting for range service.
+    pub replica_queue_capacity: usize,
 }
 
 impl CacheMeshConfig {
@@ -151,16 +166,33 @@ impl CacheMeshConfig {
             role: CacheMeshRole::Peer,
             max_parents: 2,
             max_children: 8,
+            allowed_peers: HashSet::new(),
+            max_peers: DEFAULT_MAX_PEERS,
+            max_inflight_frames: DEFAULT_MAX_INFLIGHT_FRAMES,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_remote_slots: DEFAULT_MAX_REMOTE_SLOTS,
+            frame_queue_capacity: DEFAULT_FRAME_QUEUE_CAPACITY,
+            replica_queue_capacity: DEFAULT_REPLICA_QUEUE_CAPACITY,
         }
     }
 
     pub fn with_peer(mut self, peer: SocketAddr) -> Self {
         self.peers.push(peer);
+        self.allowed_peers.insert(peer);
         self
     }
 
     pub fn with_peers(mut self, peers: impl IntoIterator<Item = SocketAddr>) -> Self {
-        self.peers.extend(peers);
+        for peer in peers {
+            self.peers.push(peer);
+            self.allowed_peers.insert(peer);
+        }
+        self
+    }
+
+    /// Authorize peers that may be learned through a trusted seed.
+    pub fn with_allowed_peers(mut self, peers: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.allowed_peers.extend(peers);
         self
     }
 
@@ -181,6 +213,36 @@ impl CacheMeshConfig {
 
     pub fn with_max_children(mut self, max_children: usize) -> Self {
         self.max_children = max_children.max(1);
+        self
+    }
+
+    pub fn with_max_peers(mut self, max_peers: usize) -> Self {
+        self.max_peers = max_peers.max(1);
+        self
+    }
+
+    pub fn with_max_inflight_frames(mut self, max_inflight_frames: usize) -> Self {
+        self.max_inflight_frames = max_inflight_frames.max(1);
+        self
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes.max(1);
+        self
+    }
+
+    pub fn with_max_remote_slots(mut self, max_remote_slots: usize) -> Self {
+        self.max_remote_slots = max_remote_slots.max(1);
+        self
+    }
+
+    pub fn with_frame_queue_capacity(mut self, capacity: usize) -> Self {
+        self.frame_queue_capacity = capacity.max(1);
+        self
+    }
+
+    pub fn with_replica_queue_capacity(mut self, capacity: usize) -> Self {
+        self.replica_queue_capacity = capacity.max(1);
         self
     }
 }
@@ -206,6 +268,21 @@ pub struct CacheMeshFecStats {
     pub rx_decode_errors: u64,
     pub rx_expired_objects: u64,
     pub rx_inflight_objects: u64,
+    pub rx_evicted_objects: u64,
+    pub rx_oversized_objects: u64,
+    pub rx_unauthorized_datagrams: u64,
+    pub peer_limit_drops: u64,
+    pub remote_slot_evictions: u64,
+    pub frame_queue_depth: u64,
+    pub frame_queue_max_depth: u64,
+    pub frame_queue_drops: u64,
+    pub replica_queue_depth: u64,
+    pub replica_queue_max_depth: u64,
+    pub replica_queue_drops: u64,
+    pub decode_nanoseconds: u64,
+    pub replica_requests_serviced: u64,
+    pub replica_service_errors: u64,
+    pub replica_service_nanoseconds: u64,
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +306,21 @@ struct CacheMeshFecCounters {
     rx_decode_errors: AtomicU64,
     rx_expired_objects: AtomicU64,
     rx_inflight_objects: AtomicU64,
+    rx_evicted_objects: AtomicU64,
+    rx_oversized_objects: AtomicU64,
+    rx_unauthorized_datagrams: AtomicU64,
+    peer_limit_drops: AtomicU64,
+    remote_slot_evictions: AtomicU64,
+    frame_queue_depth: AtomicU64,
+    frame_queue_max_depth: AtomicU64,
+    frame_queue_drops: AtomicU64,
+    replica_queue_depth: AtomicU64,
+    replica_queue_max_depth: AtomicU64,
+    replica_queue_drops: AtomicU64,
+    decode_nanoseconds: AtomicU64,
+    replica_requests_serviced: AtomicU64,
+    replica_service_errors: AtomicU64,
+    replica_service_nanoseconds: AtomicU64,
 }
 
 impl CacheMeshFecCounters {
@@ -255,8 +347,33 @@ impl CacheMeshFecCounters {
             rx_decode_errors: self.rx_decode_errors.load(Ordering::Relaxed),
             rx_expired_objects: self.rx_expired_objects.load(Ordering::Relaxed),
             rx_inflight_objects: self.rx_inflight_objects.load(Ordering::Relaxed),
+            rx_evicted_objects: self.rx_evicted_objects.load(Ordering::Relaxed),
+            rx_oversized_objects: self.rx_oversized_objects.load(Ordering::Relaxed),
+            rx_unauthorized_datagrams: self.rx_unauthorized_datagrams.load(Ordering::Relaxed),
+            peer_limit_drops: self.peer_limit_drops.load(Ordering::Relaxed),
+            remote_slot_evictions: self.remote_slot_evictions.load(Ordering::Relaxed),
+            frame_queue_depth: self.frame_queue_depth.load(Ordering::Relaxed),
+            frame_queue_max_depth: self.frame_queue_max_depth.load(Ordering::Relaxed),
+            frame_queue_drops: self.frame_queue_drops.load(Ordering::Relaxed),
+            replica_queue_depth: self.replica_queue_depth.load(Ordering::Relaxed),
+            replica_queue_max_depth: self.replica_queue_max_depth.load(Ordering::Relaxed),
+            replica_queue_drops: self.replica_queue_drops.load(Ordering::Relaxed),
+            decode_nanoseconds: self.decode_nanoseconds.load(Ordering::Relaxed),
+            replica_requests_serviced: self.replica_requests_serviced.load(Ordering::Relaxed),
+            replica_service_errors: self.replica_service_errors.load(Ordering::Relaxed),
+            replica_service_nanoseconds: self.replica_service_nanoseconds.load(Ordering::Relaxed),
         }
     }
+}
+
+#[derive(Debug)]
+struct MeshShared {
+    peers: RwLock<HashSet<SocketAddr>>,
+    allowed_peers: RwLock<HashSet<SocketAddr>>,
+    peer_regions: RwLock<HashMap<SocketAddr, String>>,
+    peer_roles: RwLock<HashMap<SocketAddr, CacheMeshRole>>,
+    remote_slots: RwLock<HashSet<(u64, u64, usize)>>,
+    counters: Arc<CacheMeshFecCounters>,
 }
 
 #[derive(Clone)]
@@ -273,43 +390,60 @@ impl CacheMesh {
     pub async fn start(self) -> Result<CacheMeshHandle, MeshError> {
         let socket = Arc::new(UdpSocket::bind(self.config.bind_addr).await?);
         let local_addr = socket.local_addr()?;
-        let peers = Arc::new(RwLock::new(
-            self.config.peers.iter().copied().collect::<HashSet<_>>(),
-        ));
-        let peer_regions = Arc::new(RwLock::new(HashMap::new()));
-        let peer_roles = Arc::new(RwLock::new(HashMap::new()));
-        let remote_slots = Arc::new(RwLock::new(HashSet::new()));
-        let fec_counters = Arc::new(CacheMeshFecCounters::default());
+        let max_peers = self.config.max_peers.max(1);
+        let initial_peers = self
+            .config
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| self.config.allowed_peers.contains(peer))
+            .take(max_peers)
+            .collect::<HashSet<_>>();
+        let shared = Arc::new(MeshShared {
+            peers: RwLock::new(initial_peers),
+            allowed_peers: RwLock::new(self.config.allowed_peers.clone()),
+            peer_regions: RwLock::new(HashMap::new()),
+            peer_roles: RwLock::new(HashMap::new()),
+            remote_slots: RwLock::new(HashSet::new()),
+            counters: Arc::new(CacheMeshFecCounters::default()),
+        });
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (frame_tx, frame_rx) = mpsc::channel(self.config.frame_queue_capacity.max(1));
+        let (replica_tx, replica_rx) = mpsc::channel(self.config.replica_queue_capacity.max(1));
 
         tokio::spawn(receive_task(
             Arc::clone(&socket),
-            Arc::clone(&self.cache),
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            Arc::clone(&remote_slots),
-            Arc::clone(&fec_counters),
+            Arc::clone(&shared),
             self.config.clone(),
+            frame_tx,
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(frame_task(
+            Arc::clone(&self.cache),
+            Arc::clone(&shared),
+            self.config.clone(),
+            frame_rx,
+            replica_tx,
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(replica_task(
+            Arc::clone(&socket),
+            Arc::clone(&self.cache),
+            Arc::clone(&shared),
+            self.config.clone(),
+            replica_rx,
             shutdown_rx.clone(),
         ));
         tokio::spawn(announce_task(
             Arc::clone(&socket),
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            Arc::clone(&fec_counters),
+            Arc::clone(&shared),
             self.config.clone(),
             shutdown_rx.clone(),
         ));
         tokio::spawn(sync_task(
             Arc::clone(&socket),
-            self.cache,
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            remote_slots,
-            Arc::clone(&fec_counters),
+            Arc::clone(&self.cache),
+            Arc::clone(&shared),
             self.config.clone(),
             shutdown_rx,
         ));
@@ -323,44 +457,42 @@ impl CacheMesh {
 
         Ok(CacheMeshHandle {
             shutdown_tx,
-            peers,
-            peer_regions,
-            peer_roles,
+            shared,
             socket,
             node_id: self.config.node_id,
             repair_symbols: self.config.repair_symbols,
             repair_ratio: self.config.repair_ratio,
             max_repair_symbols: self.config.max_repair_symbols,
             symbol_size: self.config.symbol_size,
-            fec_counters,
             request_block_id: Arc::new(AtomicU32::new(REQUEST_BLOCK_ID_BASE)),
             local_addr,
             region: self.config.region,
             same_region_only: self.config.same_region_only,
             role: self.config.role,
             max_parents: self.config.max_parents.max(1),
+            max_peers,
+            max_frame_bytes: self.config.max_frame_bytes.max(1),
         })
     }
 }
 
 pub struct CacheMeshHandle {
     shutdown_tx: watch::Sender<()>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
+    shared: Arc<MeshShared>,
     socket: Arc<UdpSocket>,
     node_id: String,
     repair_symbols: u32,
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
-    fec_counters: Arc<CacheMeshFecCounters>,
     request_block_id: Arc<AtomicU32>,
     local_addr: SocketAddr,
     region: String,
     same_region_only: bool,
     role: CacheMeshRole,
     max_parents: usize,
+    max_peers: usize,
+    max_frame_bytes: usize,
 }
 
 impl CacheMeshHandle {
@@ -369,18 +501,28 @@ impl CacheMeshHandle {
     }
 
     pub async fn peers(&self) -> Vec<SocketAddr> {
-        self.peers.read().await.iter().copied().collect()
+        self.shared.peers.read().await.iter().copied().collect()
     }
 
     pub async fn add_peer(&self, peer: SocketAddr) -> bool {
         if peer == self.local_addr {
             return false;
         }
-        self.peers.write().await.insert(peer)
+        let mut allowed_peers = self.shared.allowed_peers.write().await;
+        let mut peers = self.shared.peers.write().await;
+        if !peers.contains(&peer) && peers.len() >= self.max_peers {
+            self.shared
+                .counters
+                .peer_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        allowed_peers.insert(peer);
+        peers.insert(peer)
     }
 
     pub fn fec_stats(&self) -> CacheMeshFecStats {
-        self.fec_counters.snapshot()
+        self.shared.counters.snapshot()
     }
 
     pub async fn request_replica(
@@ -400,8 +542,9 @@ impl CacheMeshHandle {
             self.max_repair_symbols,
             self.symbol_size,
             block_id,
-            Arc::clone(&self.fec_counters),
+            Arc::clone(&self.shared.counters),
         );
+        sender.max_frame_bytes = self.max_frame_bytes;
         let frame = MeshFrame::replica_request(self.node_id.clone(), stream_id, from_slot as u64)
             .encode()?;
         let mut sent = 0usize;
@@ -417,9 +560,16 @@ impl CacheMeshHandle {
     }
 
     async fn allowed_peers(&self) -> Vec<SocketAddr> {
-        let peers = self.peers.read().await.iter().copied().collect::<Vec<_>>();
-        let regions = self.peer_regions.read().await;
-        let roles = self.peer_roles.read().await;
+        let peers = self
+            .shared
+            .peers
+            .read()
+            .await
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let regions = self.shared.peer_regions.read().await;
+        let roles = self.shared.peer_roles.read().await;
         let mut peers = peers
             .into_iter()
             .filter(|peer| {
@@ -629,7 +779,7 @@ impl MeshFrame {
         Ok(out.freeze())
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, MeshError> {
+    fn decode(bytes: Bytes) -> Result<Self, MeshError> {
         if bytes.len() < FRAME_MAGIC.len() + 4 {
             return Err(MeshError::InvalidFrame("frame too short"));
         }
@@ -695,7 +845,7 @@ impl MeshFrame {
                 if buf.remaining() != payload_len {
                     return Err(MeshError::InvalidFrame("chunk payload length mismatch"));
                 }
-                let payload = Bytes::copy_from_slice(&buf[..payload_len]);
+                let payload = buf.copy_to_bytes(payload_len);
                 Ok(Self::Chunk {
                     node_id,
                     stream_id,
@@ -726,7 +876,7 @@ impl MeshFrame {
                         "initialization payload length mismatch",
                     ));
                 }
-                let payload = Bytes::copy_from_slice(&buf[..payload_len]);
+                let payload = buf.copy_to_bytes(payload_len);
                 Ok(Self::Initialization {
                     node_id,
                     stream_id,
@@ -738,7 +888,7 @@ impl MeshFrame {
     }
 }
 
-fn read_string(buf: &mut &[u8]) -> Result<String, MeshError> {
+fn read_string(buf: &mut Bytes) -> Result<String, MeshError> {
     if buf.remaining() < 2 {
         return Err(MeshError::InvalidFrame("missing string length"));
     }
@@ -757,6 +907,7 @@ struct FecSender {
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
+    max_frame_bytes: usize,
     stats: Arc<CacheMeshFecCounters>,
 }
 
@@ -774,14 +925,16 @@ impl FecSender {
     }
 
     fn from_config(config: &CacheMeshConfig, stats: Arc<CacheMeshFecCounters>) -> Self {
-        Self::with_policy_and_initial_block_id(
+        let mut sender = Self::with_policy_and_initial_block_id(
             config.repair_symbols,
             config.repair_ratio,
             config.max_repair_symbols,
             config.symbol_size,
             0,
             stats,
-        )
+        );
+        sender.max_frame_bytes = config.max_frame_bytes.max(1);
+        sender
     }
 
     fn from_config_with_initial_block_id(
@@ -789,14 +942,16 @@ impl FecSender {
         initial_block_id: u32,
         stats: Arc<CacheMeshFecCounters>,
     ) -> Self {
-        Self::with_policy_and_initial_block_id(
+        let mut sender = Self::with_policy_and_initial_block_id(
             config.repair_symbols,
             config.repair_ratio,
             config.max_repair_symbols,
             config.symbol_size,
             initial_block_id,
             stats,
-        )
+        );
+        sender.max_frame_bytes = config.max_frame_bytes.max(1);
+        sender
     }
 
     fn with_policy_and_initial_block_id(
@@ -818,6 +973,7 @@ impl FecSender {
             repair_ratio: repair_ratio.max(0.0),
             max_repair_symbols,
             symbol_size: symbol_size.max(1),
+            max_frame_bytes: usize::MAX,
             stats,
         }
     }
@@ -836,6 +992,12 @@ impl FecSender {
         peer: SocketAddr,
         frame: &[u8],
     ) -> Result<(), MeshError> {
+        if frame.len() > self.max_frame_bytes {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(MeshError::InvalidFrame(
+                "mesh frame exceeds configured limit",
+            ));
+        }
         let repair_symbols = self.repair_symbols_for(frame.len());
         let source_symbols = usize::from(source_symbol_count(frame.len(), self.symbol_size));
         let packets = match self
@@ -894,23 +1056,52 @@ struct FecRecoveryObservation {
 
 struct FecReceiver {
     decoders: HashMap<SocketAddr, DatagramFecDecoder>,
+    decoder_order: VecDeque<SocketAddr>,
     observations: HashMap<(SocketAddr, u32), FecBlockObservation>,
+    observation_order: VecDeque<(SocketAddr, u32)>,
+    observation_expiries: VecDeque<(u64, (SocketAddr, u32))>,
     completed: HashSet<(SocketAddr, u32)>,
     completed_order: VecDeque<(SocketAddr, u32)>,
     recoveries: HashMap<(SocketAddr, u32), FecRecoveryObservation>,
+    recovery_expiries: VecDeque<(u64, (SocketAddr, u32))>,
     observed_datagrams: u64,
+    max_decoder_peers: usize,
+    max_inflight_frames: usize,
+    max_frame_bytes: usize,
     stats: Arc<CacheMeshFecCounters>,
 }
 
 impl FecReceiver {
+    #[cfg(test)]
     fn new(stats: Arc<CacheMeshFecCounters>) -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_PEERS,
+            DEFAULT_MAX_INFLIGHT_FRAMES,
+            DEFAULT_MAX_FRAME_BYTES,
+            stats,
+        )
+    }
+
+    fn with_limits(
+        max_decoder_peers: usize,
+        max_inflight_frames: usize,
+        max_frame_bytes: usize,
+        stats: Arc<CacheMeshFecCounters>,
+    ) -> Self {
         Self {
             decoders: HashMap::new(),
+            decoder_order: VecDeque::new(),
             observations: HashMap::new(),
+            observation_order: VecDeque::new(),
+            observation_expiries: VecDeque::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
             recoveries: HashMap::new(),
+            recovery_expiries: VecDeque::new(),
             observed_datagrams: 0,
+            max_decoder_peers: max_decoder_peers.max(1),
+            max_inflight_frames: max_inflight_frames.max(1),
+            max_frame_bytes: max_frame_bytes.max(1),
             stats,
         }
     }
@@ -929,6 +1120,16 @@ impl FecReceiver {
                 return Err(err);
             }
         };
+        if header.transfer_length as usize > self.max_frame_bytes {
+            self.stats
+                .rx_oversized_objects
+                .fetch_add(1, Ordering::Relaxed);
+            self.record_decode_error();
+            return Err(DatagramFecError::PayloadTooLargeForBlock {
+                actual: header.transfer_length as usize,
+                max: self.max_frame_bytes,
+            });
+        }
         if bytes.len() < HEADER_LEN + 4 {
             let err = DatagramFecError::PacketTooShort {
                 actual: bytes.len(),
@@ -975,31 +1176,45 @@ impl FecReceiver {
                     self.recoveries.remove(&key);
                 }
             }
-            self.prune_observations();
+            self.maybe_prune_observations();
             self.stats
                 .rx_inflight_objects
                 .store(self.observations.len() as u64, Ordering::Relaxed);
             return Ok(None);
         }
 
-        let decoder = self.decoders.entry(peer).or_default();
+        self.admit_decoder_peer(peer);
+        if !self.observations.contains_key(&key) {
+            self.make_observation_room();
+        }
+        let decoder = self
+            .decoders
+            .get_mut(&peer)
+            .expect("admitted decoder peer must exist");
         let decoded = match decoder.push_datagram(bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
+                decoder.expire_block(header.block_id);
+                self.observations.remove(&key);
+                self.stats
+                    .rx_inflight_objects
+                    .store(self.observations.len() as u64, Ordering::Relaxed);
                 self.record_decode_error();
                 return Err(err);
             }
         };
 
-        let observation = self
-            .observations
-            .entry(key)
-            .or_insert_with(|| FecBlockObservation {
+        let observation = self.observations.entry(key).or_insert_with(|| {
+            self.observation_order.push_back(key);
+            FecBlockObservation {
                 source_symbols: header.source_symbols,
                 received_source_symbols: HashSet::new(),
                 last_seen_datagram: self.observed_datagrams,
-            });
+            }
+        });
         observation.last_seen_datagram = self.observed_datagrams;
+        self.observation_expiries
+            .push_back((self.observed_datagrams, key));
         if is_source {
             observation
                 .received_source_symbols
@@ -1041,11 +1256,17 @@ impl FecReceiver {
                         completed_at_datagram: self.observed_datagrams,
                     },
                 );
+                self.recovery_expiries
+                    .push_back((self.observed_datagrams, key));
             }
             self.remember_completed(key);
+            if self.observation_order.len() > self.max_inflight_frames.saturating_mul(2) {
+                self.observation_order
+                    .retain(|candidate| self.observations.contains_key(candidate));
+            }
         }
 
-        self.prune_observations();
+        self.maybe_prune_observations();
         self.stats
             .rx_inflight_objects
             .store(self.observations.len() as u64, Ordering::Relaxed);
@@ -1068,6 +1289,50 @@ impl FecReceiver {
         }
     }
 
+    fn admit_decoder_peer(&mut self, peer: SocketAddr) {
+        if self.decoders.contains_key(&peer) {
+            return;
+        }
+        while self.decoders.len() >= self.max_decoder_peers {
+            let Some(expired_peer) = self.decoder_order.pop_front() else {
+                break;
+            };
+            if self.decoders.remove(&expired_peer).is_none() {
+                continue;
+            }
+            let before = self.observations.len();
+            self.observations
+                .retain(|(candidate, _), _| *candidate != expired_peer);
+            self.completed
+                .retain(|(candidate, _)| *candidate != expired_peer);
+            self.recoveries
+                .retain(|(candidate, _), _| *candidate != expired_peer);
+            self.stats.rx_evicted_objects.fetch_add(
+                before.saturating_sub(self.observations.len()) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        self.decoders.insert(peer, DatagramFecDecoder::default());
+        self.decoder_order.push_back(peer);
+    }
+
+    fn make_observation_room(&mut self) {
+        while self.observations.len() >= self.max_inflight_frames {
+            let Some(key) = self.observation_order.pop_front() else {
+                break;
+            };
+            if self.observations.remove(&key).is_none() {
+                continue;
+            }
+            if let Some(decoder) = self.decoders.get_mut(&key.0) {
+                decoder.expire_block(key.1);
+            }
+            self.stats
+                .rx_evicted_objects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn finalize_recovery(&mut self, key: (SocketAddr, u32)) {
         let Some(recovery) = self.recoveries.remove(&key) else {
             return;
@@ -1078,46 +1343,78 @@ impl FecReceiver {
         );
     }
 
+    fn maybe_prune_observations(&mut self) {
+        if self.observed_datagrams.is_multiple_of(256) {
+            self.prune_observations();
+        }
+    }
+
     fn prune_observations(&mut self) {
         let cutoff = self
             .observed_datagrams
             .saturating_sub(FEC_OBSERVATION_DATAGRAM_WINDOW);
-        let before = self.observations.len();
-        self.observations
-            .retain(|_, observation| observation.last_seen_datagram >= cutoff);
-        self.stats.rx_expired_objects.fetch_add(
-            before.saturating_sub(self.observations.len()) as u64,
-            Ordering::Relaxed,
-        );
-
-        let expired_recoveries = self
-            .recoveries
-            .iter()
-            .filter(|(_, recovery)| recovery.completed_at_datagram < cutoff)
-            .map(|(key, _)| *key)
-            .collect::<Vec<_>>();
-        for key in expired_recoveries {
-            self.finalize_recovery(key);
+        let mut expired = 0_u64;
+        while self
+            .observation_expiries
+            .front()
+            .is_some_and(|(seen_at, _)| *seen_at < cutoff)
+        {
+            let (seen_at, key) = self
+                .observation_expiries
+                .pop_front()
+                .expect("expiry entry checked above");
+            let is_current_expiry = self
+                .observations
+                .get(&key)
+                .is_some_and(|observation| observation.last_seen_datagram == seen_at);
+            if !is_current_expiry {
+                continue;
+            }
+            self.observations.remove(&key);
+            if let Some(decoder) = self.decoders.get_mut(&key.0) {
+                decoder.expire_block(key.1);
+            }
+            expired = expired.saturating_add(1);
         }
+        self.stats
+            .rx_expired_objects
+            .fetch_add(expired, Ordering::Relaxed);
+
+        while self
+            .recovery_expiries
+            .front()
+            .is_some_and(|(seen_at, _)| *seen_at < cutoff)
+        {
+            let (seen_at, key) = self
+                .recovery_expiries
+                .pop_front()
+                .expect("expiry entry checked above");
+            if self
+                .recoveries
+                .get(&key)
+                .is_some_and(|recovery| recovery.completed_at_datagram == seen_at)
+            {
+                self.finalize_recovery(key);
+            }
+        }
+        self.stats
+            .rx_inflight_objects
+            .store(self.observations.len() as u64, Ordering::Relaxed);
     }
 }
 
 async fn receive_task(
     socket: Arc<UdpSocket>,
-    cache: Arc<ChunkCache>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    stats: Arc<CacheMeshFecCounters>,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
+    frame_tx: mpsc::Sender<FrameWork>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut receiver = FecReceiver::new(Arc::clone(&stats));
-    let mut reply_sender = FecSender::from_config_with_initial_block_id(
-        &config,
-        REQUEST_BLOCK_ID_BASE.saturating_add(1 << 20),
-        stats,
+    let mut receiver = FecReceiver::with_limits(
+        config.max_peers,
+        config.max_inflight_frames,
+        config.max_frame_bytes,
+        Arc::clone(&shared.counters),
     );
     let mut buf = vec![0u8; 65_536];
 
@@ -1136,50 +1433,212 @@ async fn receive_task(
                     }
                 };
 
-                let decoded = match receiver.push(peer, &buf[..len]) {
+                if !shared.allowed_peers.read().await.contains(&peer) {
+                    shared
+                        .counters
+                        .rx_unauthorized_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                let decode_started = Instant::now();
+                let decoded_result = receiver.push(peer, &buf[..len]);
+                let decoded = match decoded_result {
                     Ok(Some(decoded)) => decoded,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        shared.counters.decode_nanoseconds.fetch_add(
+                            elapsed_nanoseconds(decode_started),
+                            Ordering::Relaxed,
+                        );
+                        continue;
+                    }
                     Err(err) => {
+                        shared.counters.decode_nanoseconds.fetch_add(
+                            elapsed_nanoseconds(decode_started),
+                            Ordering::Relaxed,
+                        );
                         warn!(peer = %peer, error = %err, "cache mesh FEC decode failed");
                         continue;
                     }
                 };
-                match MeshFrame::decode(&decoded) {
+                match MeshFrame::decode(decoded) {
                     Ok(frame) => {
+                        shared.counters.decode_nanoseconds.fetch_add(
+                            elapsed_nanoseconds(decode_started),
+                            Ordering::Relaxed,
+                        );
                         if frame.node_id() == config.node_id {
                             continue;
                         }
-                        handle_frame(
-                            frame,
-                            peer,
-                            FrameHandler {
-                                socket: &socket,
-                                cache: &cache,
-                                peers: &peers,
-                                peer_regions: &peer_regions,
-                                peer_roles: &peer_roles,
-                                remote_slots: &remote_slots,
-                                config: &config,
-                                reply_sender: &mut reply_sender,
-                            },
-                        ).await;
+                        try_enqueue(
+                            &frame_tx,
+                            &shared.counters.frame_queue_depth,
+                            &shared.counters.frame_queue_max_depth,
+                            &shared.counters.frame_queue_drops,
+                            FrameWork { frame, peer },
+                        );
                     }
-                    Err(err) => warn!(peer = %peer, error = %err, "cache mesh frame decode failed"),
+                    Err(err) => {
+                        shared.counters.decode_nanoseconds.fetch_add(
+                            elapsed_nanoseconds(decode_started),
+                            Ordering::Relaxed,
+                        );
+                        warn!(peer = %peer, error = %err, "cache mesh frame decode failed");
+                    }
                 }
             }
         }
     }
 }
 
+fn elapsed_nanoseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn try_enqueue<T>(
+    sender: &mpsc::Sender<T>,
+    depth: &AtomicU64,
+    max_depth: &AtomicU64,
+    drops: &AtomicU64,
+    value: T,
+) -> bool {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            let current = depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let _ = max_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |maximum| {
+                (current > maximum).then_some(current)
+            });
+            permit.send(value);
+            true
+        }
+        Err(_) => {
+            drops.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn decrement_depth(depth: &AtomicU64) {
+    let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+struct FrameWork {
+    frame: MeshFrame,
+    peer: SocketAddr,
+}
+
+struct ReplicaWork {
+    requester_node_id: String,
+    peer: SocketAddr,
+    stream_id: u64,
+    from_slot: u64,
+}
+
+async fn frame_task(
+    cache: Arc<ChunkCache>,
+    shared: Arc<MeshShared>,
+    config: CacheMeshConfig,
+    mut frame_rx: mpsc::Receiver<FrameWork>,
+    replica_tx: mpsc::Sender<ReplicaWork>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                debug!("cache mesh frame task shutting down");
+                return;
+            }
+            work = frame_rx.recv() => {
+                let Some(work) = work else {
+                    return;
+                };
+                decrement_depth(&shared.counters.frame_queue_depth);
+                handle_frame(
+                    work.frame,
+                    work.peer,
+                    FrameHandler {
+                        cache: &cache,
+                        shared: &shared,
+                        config: &config,
+                        replica_tx: &replica_tx,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn replica_task(
+    socket: Arc<UdpSocket>,
+    cache: Arc<ChunkCache>,
+    shared: Arc<MeshShared>,
+    config: CacheMeshConfig,
+    mut replica_rx: mpsc::Receiver<ReplicaWork>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        REQUEST_BLOCK_ID_BASE.saturating_add(1 << 20),
+        Arc::clone(&shared.counters),
+    );
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                debug!("cache mesh replica task shutting down");
+                return;
+            }
+            work = replica_rx.recv() => {
+                let Some(work) = work else {
+                    return;
+                };
+                decrement_depth(&shared.counters.replica_queue_depth);
+                let started = Instant::now();
+                let service_result = serve_replica_request(
+                    &socket,
+                    &cache,
+                    &mut sender,
+                    &config,
+                    work.peer,
+                    work.stream_id,
+                    work.from_slot,
+                    #[cfg(test)]
+                    None,
+                )
+                .await;
+                shared
+                    .counters
+                    .replica_requests_serviced
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = service_result {
+                    shared
+                        .counters
+                        .replica_service_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        requester = work.requester_node_id,
+                        peer = %work.peer,
+                        stream_id = work.stream_id,
+                        error = %err,
+                        "cache mesh replica request could not be served"
+                    );
+                }
+                shared.counters.replica_service_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(started),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
 struct FrameHandler<'a> {
-    socket: &'a Arc<UdpSocket>,
     cache: &'a Arc<ChunkCache>,
-    peers: &'a Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: &'a Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: &'a Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: &'a Arc<RwLock<HashSet<(u64, usize)>>>,
+    shared: &'a Arc<MeshShared>,
     config: &'a CacheMeshConfig,
-    reply_sender: &'a mut FecSender,
+    replica_tx: &'a mpsc::Sender<ReplicaWork>,
 }
 
 async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<'_>) {
@@ -1191,36 +1650,43 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             peers,
         } => {
             if handler.config.same_region_only && region != handler.config.region {
-                handler.peers.write().await.remove(&peer);
-                handler.peer_regions.write().await.remove(&peer);
-                handler.peer_roles.write().await.remove(&peer);
+                handler.shared.peers.write().await.remove(&peer);
+                handler.shared.peer_regions.write().await.remove(&peer);
+                handler.shared.peer_roles.write().await.remove(&peer);
                 debug!(node_id, region, peer = %peer, "ignored cache mesh peer from another region");
                 return;
             }
             let mut discovered = 0usize;
-            let mut advertised = Vec::new();
+            let mut admitted = Vec::new();
+            if let Some(inserted) = admit_peer(handler.shared, peer, handler.config.max_peers).await
             {
-                let mut peer_set = handler.peers.write().await;
-                if peer_set.insert(peer) {
+                if inserted {
                     discovered = discovered.saturating_add(1);
                 }
-                for advertised_peer in peers {
-                    if advertised_peer == peer || advertised_peer == handler.config.bind_addr {
-                        continue;
-                    }
-                    if peer_set.insert(advertised_peer) {
+                admitted.push(peer);
+            }
+            for advertised_peer in peers {
+                if advertised_peer == peer || advertised_peer == handler.config.bind_addr {
+                    continue;
+                }
+                if let Some(inserted) =
+                    admit_peer(handler.shared, advertised_peer, handler.config.max_peers).await
+                {
+                    if inserted {
                         discovered = discovered.saturating_add(1);
                     }
-                    advertised.push(advertised_peer);
+                    admitted.push(advertised_peer);
                 }
             }
-            let mut peer_regions = handler.peer_regions.write().await;
-            peer_regions.insert(peer, region.clone());
-            for advertised_peer in advertised {
-                peer_regions.insert(advertised_peer, region.clone());
+            let peer_admitted = admitted.contains(&peer);
+            let mut peer_regions = handler.shared.peer_regions.write().await;
+            for admitted_peer in admitted {
+                peer_regions.insert(admitted_peer, region.clone());
             }
             drop(peer_regions);
-            handler.peer_roles.write().await.insert(peer, role);
+            if peer_admitted {
+                handler.shared.peer_roles.write().await.insert(peer, role);
+            }
             debug!(node_id, region, peer = %peer, discovered, "cache mesh peer discovered");
         }
         MeshFrame::Chunk {
@@ -1232,6 +1698,10 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             if !peer_is_allowed(peer, &handler).await {
                 return;
             }
+            if let Err(err) = handler.cache.validate_payload(&payload) {
+                warn!(node_id, stream_id, error = err, "cache mesh chunk rejected");
+                return;
+            }
             let Ok(slot_id) = usize::try_from(slot_id) else {
                 warn!(
                     node_id,
@@ -1239,11 +1709,8 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             };
-            if let Err(err) = handler
-                .cache
-                .add_for_stream_id(stream_id, slot_id, payload)
-                .await
-            {
+            let handle = handler.cache.resolve_or_create_stream(stream_id).await;
+            if let Err(err) = handler.cache.add_for_handle(handle, slot_id, payload).await {
                 warn!(
                     node_id,
                     stream_id,
@@ -1253,11 +1720,22 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             }
-            handler
-                .remote_slots
-                .write()
-                .await
-                .insert((stream_id, slot_id));
+            if handler.config.role != CacheMeshRole::Edge {
+                let mut remote_slots = handler.shared.remote_slots.write().await;
+                if !remote_slots.contains(&(stream_id, handle.generation(), slot_id))
+                    && remote_slots.len() >= handler.config.max_remote_slots.max(1)
+                {
+                    if let Some(evicted) = remote_slots.iter().next().copied() {
+                        remote_slots.remove(&evicted);
+                        handler
+                            .shared
+                            .counters
+                            .remote_slot_evictions
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                remote_slots.insert((stream_id, handle.generation(), slot_id));
+            }
             debug!(node_id, stream_id, slot_id, "cache mesh slot applied");
         }
         MeshFrame::Initialization {
@@ -1268,11 +1746,20 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             if !peer_is_allowed(peer, &handler).await {
                 return;
             }
+            if let Err(err) = handler.cache.validate_initialization_payload(&payload) {
+                warn!(
+                    node_id,
+                    stream_id,
+                    error = err,
+                    "cache mesh initialization rejected"
+                );
+                return;
+            }
             let bytes = payload.len();
+            let handle = handler.cache.resolve_or_create_stream(stream_id).await;
             if let Err(err) = handler
                 .cache
-                .set_stream_initialization(stream_id, payload)
-                .await
+                .set_stream_initialization_for_handle(handle, payload)
             {
                 warn!(
                     node_id,
@@ -1296,24 +1783,22 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             {
                 return;
             }
-            handler.peers.write().await.insert(peer);
-            if let Err(err) = serve_replica_request(
-                handler.socket,
-                handler.cache,
-                handler.reply_sender,
-                handler.config,
-                peer,
-                stream_id,
-                from_slot,
-            )
-            .await
-            {
+            if !try_enqueue(
+                handler.replica_tx,
+                &handler.shared.counters.replica_queue_depth,
+                &handler.shared.counters.replica_queue_max_depth,
+                &handler.shared.counters.replica_queue_drops,
+                ReplicaWork {
+                    requester_node_id: node_id,
+                    peer,
+                    stream_id,
+                    from_slot,
+                },
+            ) {
                 debug!(
-                    requester = node_id,
                     peer = %peer,
                     stream_id,
-                    error = %err,
-                    "cache mesh replica request could not be served"
+                    "cache mesh replica request queue full"
                 );
             }
         }
@@ -1321,7 +1806,11 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
 }
 
 async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
+    if !handler.shared.allowed_peers.read().await.contains(&peer) {
+        return false;
+    }
     let region_allowed = handler
+        .shared
         .peer_regions
         .read()
         .await
@@ -1333,6 +1822,7 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     }
     if handler.config.role == CacheMeshRole::Edge {
         return handler
+            .shared
             .peer_roles
             .read()
             .await
@@ -1342,6 +1832,31 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     true
 }
 
+async fn admit_peer(shared: &MeshShared, peer: SocketAddr, max_peers: usize) -> Option<bool> {
+    if !shared.allowed_peers.read().await.contains(&peer) {
+        return None;
+    }
+    let mut peers = shared.peers.write().await;
+    if peers.contains(&peer) {
+        return Some(false);
+    }
+    if peers.len() >= max_peers.max(1) {
+        shared
+            .counters
+            .peer_limit_drops
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(peers.insert(peer))
+}
+
+#[cfg(test)]
+struct ReplicaServiceHook {
+    first_chunk_sent: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn serve_replica_request(
     socket: &UdpSocket,
     cache: &ChunkCache,
@@ -1350,18 +1865,21 @@ async fn serve_replica_request(
     peer: SocketAddr,
     stream_id: u64,
     from_slot: u64,
+    #[cfg(test)] hook: Option<&ReplicaServiceHook>,
 ) -> Result<usize, MeshError> {
-    let Some(stream_idx) = cache.get_stream_idx(stream_id).await else {
+    let Some(handle) = cache.resolve_stream(stream_id) else {
         return Ok(0);
     };
     let mut sent = 0usize;
-    if let Some(initialization) = cache.stream_initialization(stream_id) {
+    #[cfg(test)]
+    let mut chunks_sent = 0usize;
+    if let Some(initialization) = cache.stream_initialization_for_handle(handle) {
         let frame = MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
             .encode()?;
         sender.send(socket, peer, &frame).await?;
         sent = sent.saturating_add(1);
     }
-    let Some(last) = cache.last(stream_idx) else {
+    let Some(last) = cache.last_for_handle(handle) else {
         return Ok(sent);
     };
     let from_slot = usize::try_from(from_slot).unwrap_or(usize::MAX);
@@ -1370,7 +1888,10 @@ async fn serve_replica_request(
     }
     let from_slot = from_slot.max(cache.retained_start(last));
     for slot_id in from_slot..=last {
-        let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+        let Some((payload, hash)) = cache.get_for_handle(handle, slot_id).await else {
+            if cache.last_for_handle(handle).is_none() {
+                break;
+            }
             continue;
         };
         if hash == 0 && payload.is_empty() {
@@ -1380,6 +1901,17 @@ async fn serve_replica_request(
             .encode()?;
         sender.send(socket, peer, &frame).await?;
         sent = sent.saturating_add(1);
+        #[cfg(test)]
+        {
+            chunks_sent = chunks_sent.saturating_add(1);
+        }
+        #[cfg(test)]
+        if chunks_sent == 1 {
+            if let Some(hook) = hook {
+                hook.first_chunk_sent.wait().await;
+                hook.resume.wait().await;
+            }
+        }
     }
     debug!(peer = %peer, stream_id, sent, "cache mesh replica request served");
     Ok(sent)
@@ -1387,14 +1919,11 @@ async fn serve_replica_request(
 
 async fn announce_task(
     socket: Arc<UdpSocket>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    _peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    stats: Arc<CacheMeshFecCounters>,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut sender = FecSender::from_config(&config, stats);
+    let mut sender = FecSender::from_config(&config, Arc::clone(&shared.counters));
     let mut interval = tokio::time::interval(config.announce_interval);
 
     loop {
@@ -1404,8 +1933,8 @@ async fn announce_task(
                 return;
             }
             _ = interval.tick() => {
-                let current_peers = peers.read().await.iter().copied().collect::<Vec<_>>();
-                let peer_regions = peer_regions.read().await;
+                let current_peers = shared.peers.read().await.iter().copied().collect::<Vec<_>>();
+                let peer_regions = shared.peer_regions.read().await;
                 let advertised_peers = if config.role == CacheMeshRole::Edge {
                     Vec::new()
                 } else {
@@ -1448,21 +1977,20 @@ async fn announce_task(
 async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    stats: Arc<CacheMeshFecCounters>,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     if config.role == CacheMeshRole::Edge {
         return;
     }
-    let mut sender =
-        FecSender::from_config_with_initial_block_id(&config, CHUNK_BLOCK_ID_BASE, stats);
-    let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
-    let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        CHUNK_BLOCK_ID_BASE,
+        Arc::clone(&shared.counters),
+    );
+    let mut sent: HashMap<(u64, u64, SocketAddr), usize> = HashMap::new();
+    let mut sent_initializations: HashMap<(u64, u64, SocketAddr), Bytes> = HashMap::new();
     let mut child_cursor = 0usize;
     let mut interval = tokio::time::interval(config.sync_interval);
 
@@ -1474,9 +2002,9 @@ async fn sync_task(
             }
             _ = interval.tick() => {
                 let peers = {
-                    let regions = peer_regions.read().await;
-                    let roles = peer_roles.read().await;
-                    let mut peers = peers
+                    let regions = shared.peer_regions.read().await;
+                    let roles = shared.peer_roles.read().await;
+                    let mut peers = shared.peers
                         .read()
                         .await
                         .iter()
@@ -1504,26 +2032,46 @@ async fn sync_task(
                     }
                     peers
                 };
+
+                let handles = cache.stream_handles();
+                let live_streams = handles
+                    .iter()
+                    .map(|handle| (handle.stream_id(), handle.generation()))
+                    .collect::<HashSet<_>>();
+                let known_peers = shared.peers.read().await.clone();
+                sent.retain(|(stream_id, generation, peer), _| {
+                    live_streams.contains(&(*stream_id, *generation))
+                        && known_peers.contains(peer)
+                });
+                sent_initializations.retain(|(stream_id, generation, peer), _| {
+                    live_streams.contains(&(*stream_id, *generation))
+                        && known_peers.contains(peer)
+                });
+
+                let retained_ranges = handles
+                    .iter()
+                    .filter_map(|handle| {
+                        cache.last_for_handle(*handle).map(|last| {
+                            (
+                                (handle.stream_id(), handle.generation()),
+                                (cache.retained_start(last), last),
+                            )
+                        })
+                    })
+                    .collect::<HashMap<_, _>>();
+                shared.remote_slots.write().await.retain(|(stream_id, generation, slot_id)| {
+                    retained_ranges.get(&(*stream_id, *generation)).is_some_and(
+                        |(start, last)| slot_id >= start && slot_id <= last,
+                    )
+                });
                 if peers.is_empty() {
                     continue;
                 }
 
-                let stream_ids = cache.stream_ids().await;
-                let retained_ranges = stream_ids
-                    .iter()
-                    .filter_map(|(stream_id, stream_idx)| {
-                        cache
-                            .last(*stream_idx)
-                            .map(|last| (*stream_id, (cache.retained_start(last), last)))
-                    })
-                    .collect::<HashMap<_, _>>();
-                remote_slots.write().await.retain(|(stream_id, slot_id)| {
-                    retained_ranges
-                        .get(stream_id)
-                        .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
-                });
-                for (stream_id, stream_idx) in stream_ids {
-                    if let Some(initialization) = cache.stream_initialization(stream_id) {
+                for handle in handles {
+                    let stream_id = handle.stream_id();
+                    let generation = handle.generation();
+                    if let Some(initialization) = cache.stream_initialization_for_handle(handle) {
                         let frame = match MeshFrame::initialization(
                             config.node_id.clone(),
                             stream_id,
@@ -1536,7 +2084,7 @@ async fn sync_task(
                             }
                         };
                         for peer in &peers {
-                            let key = (stream_id, stream_idx, *peer);
+                            let key = (stream_id, generation, *peer);
                             if sent_initializations.get(&key) == Some(&initialization) {
                                 continue;
                             }
@@ -1550,13 +2098,13 @@ async fn sync_task(
                             }
                         }
                     }
-                    let Some(last) = cache.last(stream_idx) else {
+                    let Some(last) = cache.last_for_handle(handle) else {
                         continue;
                     };
                     let retained_start = cache.retained_start(last);
                     for peer in &peers {
                         let next = sent
-                            .get(&(stream_id, stream_idx, *peer))
+                            .get(&(stream_id, generation, *peer))
                             .copied()
                             .and_then(|slot| slot.checked_add(1))
                             .unwrap_or(retained_start)
@@ -1567,12 +2115,19 @@ async fn sync_task(
 
                         for slot_id in next..=last {
                             if config.role != CacheMeshRole::Distributor
-                                && remote_slots.read().await.contains(&(stream_id, slot_id))
+                                && shared.remote_slots.read().await.contains(&(
+                                    stream_id,
+                                    generation,
+                                    slot_id,
+                                ))
                             {
-                                sent.insert((stream_id, stream_idx, *peer), slot_id);
+                                sent.insert((stream_id, generation, *peer), slot_id);
                                 continue;
                             }
-                            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                            let Some((payload, hash)) = cache.get_for_handle(handle, slot_id).await else {
+                                if cache.last_for_handle(handle).is_none() {
+                                    break;
+                                }
                                 continue;
                             };
                             if hash == 0 && payload.is_empty() {
@@ -1592,7 +2147,7 @@ async fn sync_task(
                             };
                             match sender.send(&socket, *peer, &frame).await {
                                 Ok(()) => {
-                                    sent.insert((stream_id, stream_idx, *peer), slot_id);
+                                    sent.insert((stream_id, generation, *peer), slot_id);
                                 }
                                 Err(err) => {
                                     debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh chunk send failed");
@@ -1629,23 +2184,23 @@ mod tests {
     fn mesh_frame_roundtrips() {
         let frame = MeshFrame::chunk("uk", 42, 7, Bytes::from_static(b"media"));
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let frame = MeshFrame::initialization("uk", 42, Bytes::from_static(b"ftyp-moov-init"));
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let frame = MeshFrame::hello_with_peers("us", "us-east", Vec::new());
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let peer: SocketAddr = "127.0.0.1:9911".parse().unwrap();
         let frame = MeshFrame::hello_with_peers("us", "us-east", vec![peer]);
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let mut legacy_hello = BytesMut::new();
@@ -1657,13 +2212,13 @@ mod tests {
         legacy_hello.put_u16(7);
         legacy_hello.put_slice(b"uk-west");
         assert_eq!(
-            MeshFrame::decode(&legacy_hello).unwrap(),
+            MeshFrame::decode(legacy_hello.freeze()).unwrap(),
             MeshFrame::hello_with_peers("uk", "uk-west", Vec::new())
         );
 
         let frame = MeshFrame::replica_request("jp", 42, 3);
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
     }
 
@@ -1787,6 +2342,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(parent_cache.get_for_stream_id(8, 0).await.is_none());
+        assert!(edge.shared.remote_slots.read().await.is_empty());
 
         parent.shutdown();
         edge.shutdown();
@@ -1946,7 +2502,9 @@ mod tests {
         let cache_b = Arc::new(ChunkCache::new(options));
         let cache_c = Arc::new(ChunkCache::new(options));
 
-        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a).with_peer(addr_b);
+        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a)
+            .with_peer(addr_b)
+            .with_allowed_peers([addr_c]);
         config_a.announce_interval = Duration::from_millis(20);
         config_a.sync_interval = Duration::from_secs(60);
         let mut config_b = CacheMeshConfig::new("us", "us", addr_b)
@@ -1954,7 +2512,9 @@ mod tests {
             .with_peer(addr_c);
         config_b.announce_interval = Duration::from_millis(20);
         config_b.sync_interval = Duration::from_secs(60);
-        let mut config_c = CacheMeshConfig::new("jp", "jp", addr_c).with_peer(addr_b);
+        let mut config_c = CacheMeshConfig::new("jp", "jp", addr_c)
+            .with_peer(addr_b)
+            .with_allowed_peers([addr_a]);
         config_c.announce_interval = Duration::from_millis(20);
         config_c.sync_interval = Duration::from_secs(60);
 
@@ -2048,6 +2608,89 @@ mod tests {
 
         mesh_a.shutdown();
         mesh_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn replica_response_stops_when_its_stream_index_is_reused() {
+        let cache = Arc::new(ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        }));
+        let old = cache.resolve_or_create_stream(801).await;
+        cache
+            .add_for_handle(old, 0, Bytes::from_static(b"old-0"))
+            .await
+            .unwrap();
+        cache
+            .add_for_handle(old, 1, Bytes::from_static(b"old-1"))
+            .await
+            .unwrap();
+
+        let sender_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let first_chunk_sent = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let service = {
+            let cache = Arc::clone(&cache);
+            let sender_socket = Arc::clone(&sender_socket);
+            let hook = ReplicaServiceHook {
+                first_chunk_sent: Arc::clone(&first_chunk_sent),
+                resume: Arc::clone(&resume),
+            };
+            tokio::spawn(async move {
+                let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+                let config =
+                    CacheMeshConfig::new("source", "uk", sender_socket.local_addr().unwrap());
+                serve_replica_request(
+                    &sender_socket,
+                    &cache,
+                    &mut sender,
+                    &config,
+                    receiver_addr,
+                    801,
+                    0,
+                    Some(&hook),
+                )
+                .await
+            })
+        };
+
+        first_chunk_sent.wait().await;
+        let current = cache.resolve_or_create_stream(802).await;
+        cache
+            .add_for_handle(current, 0, Bytes::from_static(b"new-0"))
+            .await
+            .unwrap();
+        cache
+            .add_for_handle(current, 1, Bytes::from_static(b"new-1"))
+            .await
+            .unwrap();
+        resume.wait().await;
+
+        assert_eq!(service.await.unwrap().unwrap(), 1);
+        let mut datagram = vec![0_u8; 65_536];
+        let (len, peer) = timeout(
+            Duration::from_millis(100),
+            receiver_socket.recv_from(&mut datagram),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let frame = receiver.push(peer, &datagram[..len]).unwrap().unwrap();
+        assert_eq!(
+            MeshFrame::decode(frame).unwrap(),
+            MeshFrame::chunk("source", 801, 0, Bytes::from_static(b"old-0"))
+        );
+        assert!(timeout(
+            Duration::from_millis(20),
+            receiver_socket.recv_from(&mut datagram)
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -2167,6 +2810,185 @@ mod tests {
         assert_eq!(stats.rx_repaired_source_datagrams, 1);
         assert_eq!(stats.rx_late_source_datagrams, 0);
         assert_eq!(stats.rx_presumed_lost_source_datagrams, 1);
+    }
+
+    #[test]
+    fn fec_receiver_rejects_declared_transfer_before_allocating_decoder_state() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(1);
+        let datagrams = encoder.encode_object(&[7_u8; 128]).unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(2, 2, 64, Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9920".parse().unwrap();
+
+        assert!(matches!(
+            receiver.push(peer, &datagrams[0]),
+            Err(DatagramFecError::PayloadTooLargeForBlock {
+                actual: 128,
+                max: 64
+            })
+        ));
+        assert!(receiver.decoders.is_empty());
+        assert!(receiver.observations.is_empty());
+        assert_eq!(stats.snapshot().rx_oversized_objects, 1);
+    }
+
+    #[test]
+    fn fec_decode_error_expires_partial_decoder_state() {
+        let mut first_encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0)
+            .with_initial_block_id(7);
+        let mut conflicting_encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0)
+            .with_initial_block_id(7);
+        let first = first_encoder.encode_object(&[1_u8; 32]).unwrap();
+        let conflicting = conflicting_encoder.encode_object(&[2_u8; 40]).unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(1, 2, 1024, Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9921".parse().unwrap();
+
+        assert!(receiver.push(peer, &first[0]).unwrap().is_none());
+        assert_eq!(receiver.observations.len(), 1);
+        assert!(matches!(
+            receiver.push(peer, &conflicting[0]),
+            Err(DatagramFecError::InconsistentBlockGeometry { block_id: 7 })
+        ));
+        assert!(receiver.observations.is_empty());
+        assert_eq!(receiver.decoders[&peer].in_flight_block_count(), 0);
+        assert_eq!(stats.snapshot().rx_inflight_objects, 0);
+    }
+
+    #[test]
+    fn fec_receiver_bounds_peers_and_incomplete_objects() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(2, 3, 1024, Arc::clone(&stats));
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0);
+
+        for block in 0..10_u16 {
+            let payload = [block as u8; 32];
+            let datagrams = encoder.encode_object(&payload).unwrap();
+            let peer: SocketAddr = format!("127.0.0.1:{}", 10_000 + block).parse().unwrap();
+            assert!(receiver.push(peer, &datagrams[0]).unwrap().is_none());
+        }
+
+        assert!(receiver.decoders.len() <= 2);
+        assert!(receiver.observations.len() <= 3);
+        assert!(
+            receiver
+                .decoders
+                .values()
+                .map(DatagramFecDecoder::in_flight_block_count)
+                .sum::<usize>()
+                <= 3
+        );
+        assert!(stats.snapshot().rx_evicted_objects > 0);
+    }
+
+    #[test]
+    fn fec_receiver_expiry_queue_stays_within_the_datagram_window() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(1, 1, 1024, stats);
+        let peer: SocketAddr = "127.0.0.1:9930".parse().unwrap();
+        let key = (peer, 1);
+
+        for observed in 1..=FEC_OBSERVATION_DATAGRAM_WINDOW * 3 {
+            receiver.observed_datagrams = observed;
+            receiver.observations.insert(
+                key,
+                FecBlockObservation {
+                    source_symbols: 1,
+                    received_source_symbols: HashSet::new(),
+                    last_seen_datagram: observed,
+                },
+            );
+            receiver.observation_expiries.push_back((observed, key));
+            receiver.maybe_prune_observations();
+        }
+
+        assert!(
+            receiver.observation_expiries.len() <= FEC_OBSERVATION_DATAGRAM_WINDOW as usize + 256
+        );
+        assert_eq!(receiver.observations.len(), 1);
+    }
+
+    #[test]
+    fn bounded_mesh_queue_drops_work_when_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let depth = AtomicU64::new(0);
+        let max_depth = AtomicU64::new(0);
+        let drops = AtomicU64::new(0);
+
+        assert!(try_enqueue(&sender, &depth, &max_depth, &drops, 1_u8));
+        assert!(!try_enqueue(&sender, &depth, &max_depth, &drops, 2_u8));
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+        assert_eq!(max_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.try_recv(), Ok(1));
+        decrement_depth(&depth);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mesh_drops_unauthorized_datagrams_before_fec_decode() {
+        let bind_addr = loopback_addr();
+        let cache = Arc::new(ChunkCache::new(Options::default()));
+        let mesh = CacheMesh::new(cache, CacheMeshConfig::new("closed", "uk", bind_addr))
+            .start()
+            .await
+            .unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        sender
+            .send(&attacker, mesh.local_addr(), b"unauthorized")
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if mesh.fec_stats().rx_unauthorized_datagrams > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let stats = mesh.fec_stats();
+        assert_eq!(stats.rx_wire_datagrams, 0);
+        assert_eq!(stats.rx_inflight_objects, 0);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rejected_runtime_peer_does_not_expand_the_allowlist() {
+        let bind_addr = loopback_addr();
+        let first_peer = loopback_addr();
+        let rejected_peer = loopback_addr();
+        let mesh = CacheMesh::new(
+            Arc::new(ChunkCache::new(Options::default())),
+            CacheMeshConfig::new("bounded", "uk", bind_addr).with_max_peers(1),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        assert!(mesh.add_peer(first_peer).await);
+        assert!(!mesh.add_peer(rejected_peer).await);
+        assert!(mesh.shared.allowed_peers.read().await.contains(&first_peer));
+        assert!(!mesh
+            .shared
+            .allowed_peers
+            .read()
+            .await
+            .contains(&rejected_peer));
+        assert_eq!(mesh.peers().await, vec![first_peer]);
+
+        mesh.shutdown();
     }
 
     #[test]

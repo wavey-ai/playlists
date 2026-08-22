@@ -2,6 +2,10 @@ use crate::Options;
 
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
+use std::collections::VecDeque;
+
+const MAX_RENDITION_REPORTS: usize = 256;
+const MAX_RENDITION_URI_BYTES: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaByteRange {
@@ -17,7 +21,7 @@ impl MediaByteRange {
 
 #[derive(Clone, Copy, Debug)]
 struct PartInfo {
-    sequence: u32,
+    sequence: usize,
     duration_ms: u32,
     independent: bool,
     byte_range: Option<MediaByteRange>,
@@ -51,17 +55,23 @@ impl RenditionReport {
 }
 
 pub struct M3u8Manifest {
-    dur: u32,
-    seq: u32,
-    seg_dur: u32,
+    seq: usize,
+    seg_dur: u64,
     seg_byte_len: u64,
-    seg_id: u32,
-    seg_durs: Vec<u32>,
+    seg_id: usize,
+    completed_segments: VecDeque<CompletedSegment>,
     seg_parts: Vec<Vec<PartInfo>>,
-    start_time: DateTime<Utc>,
-    idx: u32,
+    open_start_time: DateTime<Utc>,
+    idx: usize,
     options: Options,
     rendition_reports: Vec<RenditionReport>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompletedSegment {
+    id: usize,
+    duration_ms: u64,
+    start_time: DateTime<Utc>,
 }
 
 impl M3u8Manifest {
@@ -74,14 +84,13 @@ impl M3u8Manifest {
         }
 
         Self {
-            dur: 0,
             seq: 0,
             seg_dur: 0,
             seg_byte_len: 0,
             seg_id: 1,
-            seg_durs: Vec::new(),
+            completed_segments: VecDeque::with_capacity(options.max_segments.saturating_sub(1)),
             seg_parts,
-            start_time: Utc::now(),
+            open_start_time: Utc::now(),
             idx: 0,
             options,
             rendition_reports: Vec::new(),
@@ -89,47 +98,25 @@ impl M3u8Manifest {
     }
 
     pub fn set_rendition_reports(&mut self, reports: Vec<RenditionReport>) {
-        self.rendition_reports = reports;
+        self.rendition_reports = reports
+            .into_iter()
+            .filter(|report| report.uri.len() <= MAX_RENDITION_URI_BYTES)
+            .take(MAX_RENDITION_REPORTS)
+            .collect();
     }
 
-    fn retained_segment_limit(&self) -> u32 {
-        self.options
-            .max_segments
-            .saturating_sub(1)
-            .min(u32::MAX as usize) as u32
+    fn retained_segment_limit(&self) -> usize {
+        self.options.max_segments.saturating_sub(1)
     }
 
-    fn full_segments(&self) -> Vec<(u32, u32)> {
-        let retained_segments = self.retained_segment_limit();
-        if retained_segments == 0 {
-            return Vec::new();
+    fn advance_open_start_time(&mut self, duration_ms: u64) {
+        let duration_ms = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        if let Some(next) = self
+            .open_start_time
+            .checked_add_signed(Duration::milliseconds(duration_ms))
+        {
+            self.open_start_time = next;
         }
-
-        let start = if self.seg_id <= retained_segments {
-            1
-        } else {
-            self.seg_id - retained_segments
-        };
-
-        let len = self.seg_id - start;
-        let mut res = Vec::with_capacity(len as usize);
-
-        for i in start..self.seg_id {
-            res.push((i, self.seg_durs[(i - 1) as usize]));
-        }
-
-        res
-    }
-
-    fn segment_start_time(&self, segment_id: u32) -> DateTime<Utc> {
-        let skipped_ms = self
-            .seg_durs
-            .iter()
-            .take(segment_id.saturating_sub(1) as usize)
-            .fold(0_i64, |total, duration| {
-                total.saturating_add(i64::from(*duration))
-            });
-        self.start_time + Duration::milliseconds(skipped_ms)
     }
 
     pub fn add_part(&mut self, duration: u32, key: bool) -> (Bytes, usize, usize, usize, bool) {
@@ -162,29 +149,38 @@ impl M3u8Manifest {
         byte_len: Option<u64>,
     ) -> (Bytes, usize, usize, usize, bool) {
         let mut new_seg = false;
-        if key && (self.seg_dur) >= self.options.segment_min_ms {
-            self.seg_durs.push(self.seg_dur);
-            self.seg_id += 1;
+        let open_segment_full = self.seg_parts[self.seg_id % self.options.max_segments].len()
+            >= self.options.max_parts_per_segment;
+        if (key && self.seg_dur >= u64::from(self.options.segment_min_ms)) || open_segment_full {
+            self.completed_segments.push_back(CompletedSegment {
+                id: self.seg_id,
+                duration_ms: self.seg_dur,
+                start_time: self.open_start_time,
+            });
+            while self.completed_segments.len() > self.retained_segment_limit() {
+                self.completed_segments.pop_front();
+            }
+            self.advance_open_start_time(self.seg_dur);
+            self.seg_id = self.seg_id.saturating_add(1);
             self.seg_dur = 0;
             self.seg_byte_len = 0;
             self.idx = 0;
 
-            let seg_index = self.seg_id as usize % self.options.max_segments;
+            let seg_index = self.seg_id % self.options.max_segments;
             self.seg_parts[seg_index].clear();
             new_seg = true;
         }
         let idx = self.idx;
-        self.idx += 1;
-        self.seq += 1;
-        self.dur += duration;
-        self.seg_dur += duration;
+        self.idx = self.idx.saturating_add(1);
+        self.seq = self.seq.saturating_add(1);
+        self.seg_dur = self.seg_dur.saturating_add(u64::from(duration));
         let byte_range = byte_range.or_else(|| MediaByteRange::new(byte_len?, self.seg_byte_len));
         if let Some(range) = byte_range {
             self.seg_byte_len = self
                 .seg_byte_len
                 .max(range.offset.saturating_add(range.length));
         }
-        let seg_index = self.seg_id as usize % self.options.max_segments;
+        let seg_index = self.seg_id % self.options.max_segments;
 
         self.seg_parts[seg_index].push(PartInfo {
             sequence: self.seq,
@@ -193,46 +189,39 @@ impl M3u8Manifest {
             byte_range,
         });
 
-        (
-            self.m3u8(),
-            self.seg_id as usize,
-            self.seq as usize,
-            idx as usize,
-            new_seg,
-        )
+        (self.m3u8(), self.seg_id, self.seq, idx, new_seg)
     }
 
     pub fn m3u8(&self) -> Bytes {
         let mut ph = String::new();
         let mut ps = String::new();
 
-        let segs = self.full_segments();
+        let mut pt = self
+            .completed_segments
+            .front()
+            .map_or(self.open_start_time, |segment| segment.start_time);
 
-        let mut segment_durations = Vec::new();
-        let mut pt = segs
-            .first()
-            .map(|(segment_id, _)| self.segment_start_time(*segment_id))
-            .unwrap_or_else(|| self.segment_start_time(self.seg_id));
-
-        for seg in &segs {
-            let segment_parts = &self.seg_parts[seg.0 as usize % self.options.max_segments];
+        for segment in &self.completed_segments {
+            let segment_parts = &self.seg_parts[segment.id % self.options.max_segments];
             ps.push_str(&format!(
                 "#EXT-X-PROGRAM-DATE-TIME:{}\n",
                 pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
             ));
             for p in segment_parts {
-                append_part_line(&mut ps, seg.0, p);
+                append_part_line(&mut ps, segment.id, p);
             }
-            let secs = seg.1 as f64 / 1000.0;
+            let secs = segment.duration_ms as f64 / 1000.0;
             ps.push_str(&format!("#EXTINF:{secs:.5},\n"));
             append_segment_byte_range(&mut ps, segment_parts);
-            ps.push_str(&format!("s{}.mp4\n", seg.0));
-            pt += Duration::milliseconds(seg.1 as i64);
-            segment_durations.push(seg.1);
+            ps.push_str(&format!("s{}.mp4\n", segment.id));
+            let duration_ms = i64::try_from(segment.duration_ms).unwrap_or(i64::MAX);
+            if let Some(next) = pt.checked_add_signed(Duration::milliseconds(duration_ms)) {
+                pt = next;
+            }
         }
 
-        let mut open_parent_duration_ms = 0_u32;
-        let seg_index = self.seg_id as usize % self.options.max_segments;
+        let mut open_parent_duration_ms = 0_u64;
+        let seg_index = self.seg_id % self.options.max_segments;
         let open_parts = &self.seg_parts[seg_index];
         if !open_parts.is_empty() {
             ps.push_str(&format!(
@@ -240,7 +229,8 @@ impl M3u8Manifest {
                 pt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
             ));
             for p in open_parts {
-                open_parent_duration_ms = open_parent_duration_ms.saturating_add(p.duration_ms);
+                open_parent_duration_ms =
+                    open_parent_duration_ms.saturating_add(u64::from(p.duration_ms));
                 append_part_line(&mut ps, self.seg_id, p);
             }
         }
@@ -254,14 +244,16 @@ impl M3u8Manifest {
         let hold_back = (target_duration as f64) * 3_f64;
         let can_skip_until = target_duration * 6;
         let can_skip_until_ms = can_skip_until.saturating_mul(1000);
-        let can_skip = segment_durations
-            .first()
-            .map(|first_duration| {
-                let retained_ms: u32 = segment_durations
+        let can_skip = self
+            .completed_segments
+            .front()
+            .map(|first_segment| {
+                let retained_ms = self
+                    .completed_segments
                     .iter()
-                    .copied()
-                    .fold(open_parent_duration_ms, u32::saturating_add);
-                retained_ms.saturating_sub(*first_duration) > can_skip_until_ms
+                    .map(|segment| segment.duration_ms)
+                    .fold(open_parent_duration_ms, u64::saturating_add);
+                retained_ms.saturating_sub(first_segment.duration_ms) > u64::from(can_skip_until_ms)
             })
             .unwrap_or(false);
 
@@ -280,9 +272,10 @@ impl M3u8Manifest {
             ));
         }
 
-        let seq = segs
-            .first()
-            .map(|(segment_id, _)| *segment_id)
+        let seq = self
+            .completed_segments
+            .front()
+            .map(|segment| segment.id)
             .unwrap_or(self.seg_id);
         ph.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={part_target:.5}\n"));
         ph.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
@@ -292,7 +285,7 @@ impl M3u8Manifest {
     }
 }
 
-fn append_part_line(playlist: &mut String, segment_id: u32, part: &PartInfo) {
+fn append_part_line(playlist: &mut String, segment_id: usize, part: &PartInfo) {
     let secs = part.duration_ms as f64 / 1000.0;
     let mut line = if let Some(byte_range) = part.byte_range {
         format!(
@@ -321,7 +314,7 @@ fn append_segment_byte_range(playlist: &mut String, parts: &[PartInfo]) {
     }
 }
 
-fn append_preload_hint(playlist: &mut String, segment_id: u32, parts: &[PartInfo]) {
+fn append_preload_hint(playlist: &mut String, segment_id: usize, parts: &[PartInfo]) {
     let Some(last_part) = parts.last() else {
         return;
     };
@@ -588,5 +581,61 @@ mod tests {
         assert!(
             playlist.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s2.mp4\",BYTERANGE-START=40")
         );
+    }
+
+    #[test]
+    fn long_running_manifest_keeps_only_the_retained_timeline() {
+        let options = Options {
+            max_segments: 4,
+            segment_min_ms: 1000,
+            target_duration_ms: 1000,
+            part_target_ms: 1000,
+            ..Options::default()
+        };
+        let mut manifest = M3u8Manifest::new(options);
+        let started = manifest.open_start_time;
+
+        for _ in 0..20_000 {
+            manifest.add_part(1000, true);
+        }
+
+        assert_eq!(manifest.completed_segments.len(), 3);
+        assert_eq!(manifest.completed_segments.front().unwrap().id, 19_997);
+        assert_eq!(manifest.completed_segments.back().unwrap().id, 19_999);
+        assert_eq!(
+            manifest
+                .open_start_time
+                .signed_duration_since(started)
+                .num_milliseconds(),
+            19_999_000
+        );
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:19997"));
+        assert!(playlist.contains("s19997.mp4"));
+        assert!(!playlist.contains("s19996.mp4"));
+        assert!(playlist.len() < 16 * 1024);
+    }
+
+    #[test]
+    fn non_independent_input_cannot_grow_an_open_segment_without_bound() {
+        let options = Options {
+            max_segments: 4,
+            max_parts_per_segment: 4,
+            segment_min_ms: u32::MAX,
+            ..Options::default()
+        };
+        let mut manifest = M3u8Manifest::new(options);
+
+        for _ in 0..10_000 {
+            manifest.add_part(1, false);
+        }
+
+        assert!(manifest
+            .seg_parts
+            .iter()
+            .all(|parts| parts.len() <= options.max_parts_per_segment));
+        assert_eq!(manifest.completed_segments.len(), 3);
+        assert!(manifest.m3u8().len() < 16 * 1024);
     }
 }

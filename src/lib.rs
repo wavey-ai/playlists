@@ -4,6 +4,7 @@ pub mod m3u8_manifest;
 #[cfg(feature = "mesh")]
 pub mod mesh;
 pub mod multivariant;
+mod stream_registry;
 pub mod tail_bundle;
 
 use access_unit::Fmp4;
@@ -11,7 +12,7 @@ use chunk_cache::ChunkCache;
 use m3u8_cache::M3u8Cache;
 use m3u8_manifest::M3u8Manifest;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::info;
@@ -28,6 +29,8 @@ pub enum CacheError {
     BufferOverflow,
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("Write was superseded by a newer ring position")]
+    Superseded,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -75,18 +78,38 @@ impl Options {
 pub struct Playlists {
     pub chunk_cache: Arc<ChunkCache>,
     m3u8_cache: Arc<M3u8Cache>,
-    playlists: Mutex<BTreeMap<u64, M3u8Manifest>>,
+    playlists: Mutex<BTreeMap<u64, Arc<PlaylistEntry>>>,
     active: AtomicUsize,
     options: Options,
 }
 
-impl Playlists {
-    pub fn new(options: Options) -> (Arc<Self>, Arc<ChunkCache>, Arc<M3u8Cache>) {
-        let options = options.normalized();
-        let chunk_cache = Arc::new(ChunkCache::new(options));
-        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+struct PlaylistEntry {
+    closing: AtomicBool,
+    manifest: Mutex<M3u8Manifest>,
+}
 
-        (
+pub type PlaylistCacheBundle = (Arc<Playlists>, Arc<ChunkCache>, Arc<M3u8Cache>);
+
+impl PlaylistEntry {
+    fn new(options: Options) -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            manifest: Mutex::new(M3u8Manifest::new(options)),
+        }
+    }
+}
+
+impl Playlists {
+    pub fn new(options: Options) -> PlaylistCacheBundle {
+        Self::try_new(options).expect("valid playlist capacities")
+    }
+
+    pub fn try_new(options: Options) -> Result<PlaylistCacheBundle, CacheError> {
+        let options = options.normalized();
+        let chunk_cache = Arc::new(ChunkCache::try_new(options)?);
+        let m3u8_cache = Arc::new(M3u8Cache::try_new(options)?);
+
+        Ok((
             Arc::new(Self {
                 chunk_cache: Arc::clone(&chunk_cache),
                 m3u8_cache: Arc::clone(&m3u8_cache),
@@ -96,55 +119,111 @@ impl Playlists {
             }),
             Arc::clone(&chunk_cache),
             Arc::clone(&m3u8_cache),
-        )
+        ))
     }
 
     pub fn active(&self) -> usize {
-        self.active.load(Ordering::SeqCst)
+        self.active.load(Ordering::Acquire)
     }
 
     pub fn fin(&self, id: u64) {
-        let removed = {
-            let mut playlists = self.playlists.lock().unwrap();
-            playlists.remove(&id).is_some()
+        let entry = {
+            let playlists = self
+                .playlists
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = playlists.get(&id) else {
+                self.m3u8_cache.zero_stream_id(id);
+                self.chunk_cache.zero_stream_id_sync(id);
+                return;
+            };
+            entry.closing.store(true, Ordering::Release);
+            Arc::clone(entry)
         };
-        if removed {
-            self.active.fetch_sub(1, Ordering::SeqCst);
-        }
+
+        // An add holds this lock through its cache commit. Once acquired, no
+        // operation using the old entry can publish after cache teardown.
+        let _manifest = entry
+            .manifest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.m3u8_cache.zero_stream_id(id);
         self.chunk_cache.zero_stream_id_sync(id);
+
+        let removed = {
+            let mut playlists = self
+                .playlists
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if playlists
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                playlists.remove(&id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     pub fn add(&self, stream_id: u64, fmp4: Fmp4) -> bool {
-        let mut playlists = self.playlists.lock().unwrap();
-
-        if !playlists.contains_key(&stream_id) {
-            if self.active.load(Ordering::SeqCst) >= self.chunk_cache.options.num_playlists {
-                return false;
-            }
-
-            let n = self.active.fetch_add(1, Ordering::SeqCst);
-            info!("PLAY:NEW active={}", n + 1);
+        let max_init_bytes = self.options.init_size_kb * 1024;
+        if fmp4
+            .init
+            .as_ref()
+            .is_some_and(|init| init.len() > max_init_bytes)
+        {
+            return false;
         }
-
-        let (m3u8, seg, seq, idx, new_seg) = {
-            let playlist: &mut M3u8Manifest = playlists
-                .entry(stream_id)
-                .or_insert_with(|| M3u8Manifest::new(self.options));
-            playlist.add_part_with_byte_len(fmp4.duration, fmp4.key, fmp4.data.len())
+        let entry = {
+            let mut playlists = self
+                .playlists
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = playlists.get(&stream_id) {
+                if entry.closing.load(Ordering::Acquire) {
+                    return false;
+                }
+                Arc::clone(entry)
+            } else {
+                if playlists.len() >= self.chunk_cache.options.num_playlists {
+                    return false;
+                }
+                let entry = Arc::new(PlaylistEntry::new(self.options));
+                playlists.insert(stream_id, Arc::clone(&entry));
+                let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+                info!("PLAY:NEW active={active}");
+                entry
+            }
         };
-        drop(playlists);
+
+        let mut playlist = entry
+            .manifest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entry.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let (m3u8, seg, seq, idx, new_seg) =
+            playlist.add_part_with_byte_len(fmp4.duration, fmp4.key, fmp4.data.len());
 
         if new_seg {
             info!("PLAY:UP active={}", self.active());
         }
 
-        if fmp4.init.is_some() {
-            let _ = self.m3u8_cache.ensure_stream_id(stream_id);
-        }
-
         if let Some(init) = fmp4.init {
-            let _ = self.m3u8_cache.set_init(stream_id, init);
+            if self
+                .m3u8_cache
+                .ensure_stream_id(stream_id)
+                .and_then(|()| self.m3u8_cache.set_init(stream_id, init))
+                .is_err()
+            {
+                return false;
+            }
         }
         //self.fmp4_cache.add(stream_id, seq as usize, fmp4.data);
         self.m3u8_cache.add(stream_id, seg, seq, idx, m3u8).is_ok()
@@ -155,6 +234,7 @@ impl Playlists {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::thread;
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
@@ -189,5 +269,83 @@ mod tests {
         .await;
 
         assert!(cleared.is_ok());
+    }
+
+    #[test]
+    fn closing_entry_rejects_add_and_cannot_resurrect_cache_state() {
+        let options = Options {
+            num_playlists: 1,
+            ..Options::default()
+        };
+        let (playlists, _chunk_cache, m3u8_cache) = Playlists::new(options);
+        let part = || Fmp4 {
+            init: None,
+            key: true,
+            data: Bytes::from_static(b"part"),
+            duration: 500,
+        };
+        assert!(playlists.add(7, part()));
+
+        let entry = Arc::clone(
+            playlists
+                .playlists
+                .lock()
+                .unwrap()
+                .get(&7)
+                .expect("live entry"),
+        );
+        let manifest_guard = entry.manifest.lock().unwrap();
+        let finisher = {
+            let playlists = Arc::clone(&playlists);
+            thread::spawn(move || playlists.fin(7))
+        };
+        while !entry.closing.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        assert!(!playlists.add(7, part()));
+        drop(manifest_guard);
+        finisher.join().unwrap();
+
+        assert_eq!(playlists.active(), 0);
+        assert_eq!(m3u8_cache.last_position(7), None);
+    }
+
+    #[test]
+    fn playlist_add_reports_an_initialization_budget_failure() {
+        let options = Options {
+            init_size_kb: 1,
+            ..Options::default()
+        };
+        let (playlists, _chunk_cache, m3u8_cache) = Playlists::new(options);
+        let added = playlists.add(
+            8,
+            Fmp4 {
+                init: Some(Bytes::from(vec![0_u8; 1025])),
+                key: true,
+                data: Bytes::from_static(b"part"),
+                duration: 500,
+            },
+        );
+
+        assert!(!added);
+        assert!(matches!(
+            m3u8_cache.get_init(8),
+            Err(CacheError::StreamNotFound)
+        ));
+        assert_eq!(m3u8_cache.last_position(8), None);
+        assert_eq!(playlists.active(), 0);
+    }
+
+    #[test]
+    fn playlists_constructor_rejects_capacity_arithmetic_overflow() {
+        assert!(matches!(
+            Playlists::try_new(Options {
+                num_playlists: usize::MAX,
+                max_segments: 2,
+                ..Options::default()
+            }),
+            Err(CacheError::ArithmeticOverflow)
+        ));
     }
 }

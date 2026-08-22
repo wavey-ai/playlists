@@ -1,354 +1,407 @@
-# Concurrency and Capacity TODO
+# Concurrency and Capacity Work
 
-This document records the concurrency and capacity review from 2026-08-22. It covers correctness, read and write throughput, CPU use, and memory use.
+This document records the concurrency review from 2026-08-22 and its
+implementation status.
 
-The measured values are local baselines. They are not service-level guarantees. Repeat each benchmark on a dedicated host before you set a release target.
+The crate code tasks are complete. The final section lists downstream migration
+work and tests that need a stable host or an HTTP service.
 
 ## Terms
 
-- A **logical stream** is the stream that a caller identifies with a `u64` stream ID.
-- A **physical index** is a reusable slot in a fixed-size cache.
-- A **generation** is the version of one physical index. It changes when the cache assigns that index to another logical stream.
-- A **stream handle** is an opaque value that contains a stream ID, a physical index, and a generation.
-- A **mapped operation** resolves a logical stream ID for each cache operation.
-- An **indexed operation** uses a physical index directly.
-- The **retained window** is the configured set of segments and parts that the cache can still serve.
-- RSS means resident set size. It is the memory that the operating system reports as resident for the process.
+- A **logical stream** has a caller-supplied `u64` stream ID.
+- A **physical index** is one reusable position in the fixed stream capacity.
+- A **generation** identifies one assignment of a physical index.
+- A **stream handle** contains a cache identity, stream ID, physical index, and
+  generation.
+- A **mapped operation** resolves a logical stream ID for each operation.
+- The **retained window** contains the segments and parts that the cache can
+  still serve.
+- RSS is the resident set size that the operating system reports.
 
 ## Implementation rules
 
-- Fix data isolation before throughput.
 - Treat the generation as part of every cache identity.
-- Do not use a raw physical index as a stable logical identity.
-- Put a hard bound on every queue and collection that can grow from stream churn or network input.
-- Do not wait for capacity while holding a map or cache-slot lock.
-- Resolve a stream once per request or batch. Reuse its handle for the rest of that operation.
-- Keep `Bytes` payloads zero-copy on cache hits. A `Bytes` clone copies metadata, not the payload.
-- Measure one material change at a time. Record throughput, CPU time, allocation count, and RSS.
-- Keep correctness tests deterministic. Use barriers or test hooks to force race order.
+- Do not use a raw physical index as a durable logical identity.
+- Put a hard bound on state that accepts churn or network input.
+- Do not wait for capacity while you hold a map or slot lock.
+- Resolve a stream once for a request or batch.
+- Reuse its handle for repeated work.
+- Keep `Bytes` payloads zero-copy on cache hits.
+- Use deterministic barriers or held locks to test race order.
+- Keep timed throughput work out of unit tests.
 
 ## P0: Correctness and bounded state
 
-P0 work blocks a production claim for safe high-concurrency use.
+### [x] Isolate initialization data in `M3u8Cache`
 
-### [ ] Isolate initialization data in `M3u8Cache`
+The cache now stores `Option<StreamInitialization>` for each physical stream.
+Each value contains the stream ID, generation, and `Bytes` payload.
 
-`M3u8Cache::reset_stream_idx` resets position and generation state. It does not reset `inits`. `set_init` and `get_init` store only `Bytes`, so a reused physical index exposes the previous stream's initialization bytes.
+Assignment clears the initialization while it holds the exclusive reuse gate.
+Set operations validate a complete `M3u8StreamHandle` while they hold the shared
+gate. Get operations validate the generation before and after the read.
 
-A new stream also receives the preallocated zero-filled initialization value. The API cannot distinguish this value from a real initialization.
+The constructor does not allocate zero-filled initialization payloads. A missing
+value returns `CacheError::StreamNotFound`.
 
-Implement this change as follows:
-
-1. Replace each `RwLock<Bytes>` entry in `inits` with `RwLock<Option<StreamInitialization>>`.
-2. Store `stream_id`, `generation`, and `Bytes` in `StreamInitialization`.
-3. Clear the initialization while the physical index is reset.
-4. Resolve one generation-bearing handle before `set_init` or `get_init` accesses the slot.
-5. Hold the stream reuse guard while `set_init` validates the handle and writes the value.
-6. Return `None` or a specific missing-initialization error unless both the stream ID and generation match.
-7. Remove the zero-filled initialization allocation from `M3u8Cache::new`.
-
-Add these tests:
+Tests cover these conditions:
 
 - A new stream has no initialization.
-- A physical index does not expose initialization from its previous stream.
-- An old writer cannot replace the initialization for a new generation.
-- The HTTP integration returns `404` or its documented equivalent when initialization is absent.
+- A reused index does not expose the previous initialization.
+- A stale writer cannot replace initialization for a new generation.
+- A handle from a different cache cannot access initialization.
 
-### [ ] Make cache writes safe across physical-index reuse
+The crate has no HTTP layer. The HTTP service must map
+`CacheError::StreamNotFound` to its documented missing-resource response.
 
-`ChunkCache::set_with_generation` writes a slot before `add_with_generation` checks the current generation. A delayed writer for an old generation can therefore replace data from a new generation. The later error does not restore the new data.
+### [x] Make writes safe across physical-index reuse
 
-`ChunkCache::put_if_absent_with_generation` has the same race. `M3u8Cache::add` also calculates a physical slot before its final generation check, so it can commit stale data after reassignment.
+`StreamRegistry` owns all logical mappings and reverse ownership state. A map
+entry contains one complete `ResolvedStream` value.
 
-Use this lifecycle design:
+Each physical index has an owner `RwLock`. Assignment closes publication, waits
+for the exclusive owner lock, advances the generation, and resets cache state.
+Writes hold a shared owner lock through slot and publication changes.
 
-1. Add an opaque `StreamHandle` with private `stream_id`, `index`, and `generation` fields.
-2. Add `resolve_stream(stream_id)` and `resolve_or_create_stream(stream_id)` methods.
-3. Store the generation in the map entry. Return the complete handle from one map lookup.
-4. Add a reuse gate for each physical index. A normal operation holds a shared permit. Reassignment holds an exclusive permit.
-5. Validate the complete handle after the shared permit is acquired and before a slot changes.
-6. Keep the shared permit until the slot write and its publication metadata are complete.
-7. Advance the generation and reset the slot while the exclusive permit is held.
-8. Update the forward and reverse mappings as one assignment operation.
-9. Never hold the global map lock while waiting for an asynchronous permit.
+`ChunkCache` keeps ID, generation, hash, and payload in one locked `ChunkSlot`.
+`M3u8Cache` keeps identity, position, and encoded variants in one
+`PlaylistSnapshot`.
 
-The lock order must be consistent. Assignment should use an assignment lock, then the per-index exclusive reuse permit, and then the short map write. Normal operations should resolve the map, release the map lock, acquire the shared reuse permit, and validate the handle.
+Both caches reject a delayed writer from an old generation. They also reject a
+delayed older position from the current generation. The latter case returns
+`PutIfAbsentResult::Superseded` or `CacheError::Superseded`.
 
-Consider one lock-protected slot value with `id`, `generation`, `hash`, and `Bytes`. This layout makes payload and identity changes atomic to readers. Measure it against the current separate atomics before adoption.
+Mapped writes validate sizes and indices before they assign stream capacity.
+An invalid write cannot evict a valid stream before it returns an error.
 
-Add deterministic tests for both caches. Pause an old writer after handle resolution. Reassign the physical index and complete a new write. Resume the old writer. The old write must fail, and the new bytes must remain readable.
+Deterministic tests hold a target slot lock, reassign the physical index, and
+then release the old writer. The new generation remains readable.
 
-### [ ] Remove the raw-index identity hazard
+### [x] Remove the raw-index identity hazard
 
-`ChunkCache::get(stream_idx, id)` loads the current generation. A caller that retained an old physical index can therefore read bytes for a different logical stream after index reuse.
+`StreamHandle` and `M3u8StreamHandle` are the public identities for repeated
+operations. Their identity fields are private.
 
-The mesh replica path resolves an index once and then uses the direct indexed read in a loop. Reassignment can make that response contain bytes from a new stream while the response still names the old stream.
+Raw-index methods now operate only on physical indices that have no logical
+owner. They reject an index that the registry assigned to a stream.
 
-Make the stream handle the public identity for repeated cache access. Require `get(handle, id)`, `add(handle, id, bytes)`, and initialization operations to validate the handle. Keep a raw-index API only for internal code that owns the physical index lifecycle. Deprecate the public raw-index API if compatibility permits.
+This behavior is an intentional compatibility restriction. Existing callers
+must replace this sequence:
 
-Add a mesh regression test. Reassign an index during a replica response. The response must stop or fail. It must never return data from the new stream under the old stream ID.
+```text
+get_or_create_stream_idx(stream_id) -> add/get(raw_index, ...)
+```
 
-### [ ] Publish playlist position as one consistent value
+with this sequence:
 
-`M3u8Cache` stores `last_seg`, `last_part`, and `last_seq` in separate atomics. A reader can observe fields from different writes.
+```text
+resolve_or_create_stream(stream_id) -> add/get_for_handle(handle, ...)
+```
 
-Store `segment`, `part`, `sequence`, and `generation` in one per-stream state value. Protect the value with the stream lock or use a versioned retry protocol. Publish the state only after the data slot is complete.
+Mesh synchronization and replica service use handles. A reassignment stops the
+old response. It cannot send new-stream bytes under the old stream ID.
 
-Start with the lock-protected design. Use a versioned atomic design only if profiling shows that the lock is material.
+### [x] Publish playlist position as one value
 
-Add a test hook between field updates in the old flow. Verify that the new implementation returns either the old complete position or the new complete position.
+`PlaylistPosition` contains segment, part, and sequence. The generation is in
+the tagged snapshot and handle.
 
-### [ ] Bound new-playlist notifications
+The cache publishes a complete snapshot only after it writes the ring slot.
+The latest path reads the complete snapshot through `ArcSwapOption`.
 
-`ChunkCache` owns an unbounded channel for new-playlist notifications. The crate has no production consumer of `take_new_playlists_rx`.
+Readers can see the complete old position or the complete new position. They
+cannot combine fields from different writes.
 
-A local churn probe queued every notification. It increased maximum RSS by about 2.13 MB for 100,000 assignments and 20.63 MB for 1,000,000 assignments.
+### [x] Remove the unbounded new-playlist notification channel
 
-First audit downstream users of the public receiver. Remove the channel if no downstream user needs it.
+The workspace had no user of `take_new_playlists_rx`. The implementation removes
+the channel and its receiver API.
 
-If the event remains, treat it as a bounded hint:
+`stream_ids` and `stream_handles` are authoritative bounded snapshots. Stream
+churn retains at most `num_playlists` mappings.
 
-1. Use a bounded channel.
-2. Send after the map lock is released.
-3. Use `try_send` so a missing or slow consumer cannot block cache assignment.
-4. Set a `rescan_required` flag when the channel is full.
-5. Make the consumer reconcile with the authoritative `stream_ids()` snapshot after a gap.
-6. Document lag and duplicate-event behavior.
+Exact-part waiters remain because request code uses them. Their keys include the
+stream generation. The implementation uses 64 shards with a total limit of
+65,536 retained keys.
 
-Add a churn test with no consumer and a slow consumer. Queue memory must stay within its configured bound. The consumer must converge after reconciliation.
+An unknown-stream waiter does not create a mapping. This rule prevents a read
+request from evicting a live stream.
 
-### [ ] Bound mesh state and validate trust assumptions
+### [x] Bound mesh state and define trust
 
-The mesh feature is marked as a prototype. It still needs explicit limits before production use.
+The mesh now applies these configurable limits:
 
-Known unbounded or stale state includes `remote_slots`, `sent`, `sent_initializations`, peer state, and decoder state. Edge nodes record `remote_slots`, but their sync task returns before the current pruning code.
+- known peers
+- decoder peers and incomplete FEC objects
+- decoded frame bytes
+- completed-frame queue entries
+- replica-request queue entries
+- remote slot hints
 
-Implement these changes:
+The default incomplete-object and frame-queue limits are 64. The default frame
+limit is 1 MiB.
 
-- Do not record `remote_slots` on an Edge node, or prune it in the receive path.
-- Prune `sent` and `sent_initializations` against the current stream handles and peer set on every sync tick.
-- Limit peers, active decoders, in-flight frames, decoded payload size, and completed-frame queues.
-- Define an eviction rule and a metric for every limit.
-- Require authentication or an allowlist for production peers. Do not accept arbitrary frames when `same_region_only` is false.
+Each limit has a drop, expiry, or eviction rule. `fec_stats` reports the related
+counters.
 
-Run churn and hostile-input tests. Memory must plateau at the configured limits.
+The receive path rejects an unauthorized source before FEC state allocation.
+It also rejects an oversized declared transfer before decoder allocation.
+
+Configured peers are authorized automatically. Gossip can add only addresses in
+`allowed_peers`. Edge nodes do not retain remote-forwarding slot hints.
+
+Tests cover oversized declarations, unauthorized datagrams, peer limits,
+incomplete-object limits, remote-slot limits, and ordered-expiry bounds.
 
 ## P1: Throughput and CPU
 
-### [ ] Remove the global map from the repeated read path
+### [x] Remove the global map from repeated chunk reads
 
-Mapped reads contend on `ChunkCache::offsets`. The contention dominates at higher worker counts. The same map also causes two lookups on the common `add_for_stream_id` path.
+Handle reads use two lock-free generation checks and one slot read. They do not
+lock the global stream map or the owner gate.
 
-The first implementation should use the generation-bearing stream handle from P0:
+Mapped convenience methods still use one map lookup. `resolve_or_create_stream`
+uses one lifecycle operation and O(1) reverse ownership state.
 
-1. Resolve the stream once at the request or batch boundary.
-2. Pass the handle through all repeated reads and writes.
-3. Make `resolve_or_create_stream` return a handle from one map operation.
-4. Add `Vec<Option<u64>>` reverse ownership state. Remove the current full map scan during physical-index reuse.
-5. Keep mapped convenience methods for one-shot calls.
+The generation checks use this publication protocol:
 
-After this change, benchmark the remaining map. Consider a sharded map or a read-optimized map only if handle resolution remains material.
+1. Assignment stores published generation zero with release ordering.
+2. Assignment resets cache state while it holds the exclusive owner lock.
+3. Assignment stores the stream ID.
+4. Assignment publishes the new generation with release ordering.
+5. A reader loads generation, stream ID, and generation with acquire ordering.
 
-The local read baseline shows the current cost:
+The second generation load rejects a transition that starts during the read.
 
-| Workers | Mapped reads/s | Indexed reads/s | Indexed/mapped |
-| ---: | ---: | ---: | ---: |
-| 1 | 6.601 M | 7.880 M | 1.19x |
-| 2 | 14.296 M | 36.531 M | 2.56x |
-| 4 | 11.266 M | 45.704 M | 4.06x |
-| 8 | 3.320 M | 61.168 M | 18.42x |
+### [x] Remove repeated map locks from `M3u8Cache`
 
-The test used two streams and 5,760-byte parts. Each hit cloned a `Bytes` value. The byte rate is a logical payload rate, not a memory-copy or network rate.
+Mapped access resolves one handle. Handle access calculates the physical slot
+from that handle.
 
-### [ ] Remove repeated map locks from `M3u8Cache::get`
+Explicit historical reads validate position and the tagged ring snapshot. Latest
+full and delta reads use one `ArcSwapOption` load.
 
-One hit can acquire the offsets lock several times through `is_included`, position helpers, `offset_and_generation`, and index calculation.
+Tests cover direct hits, mapped misses, stale handles, cross-cache handles, and
+index-reuse races. `playlist_cache` supplies the matching benchmark modes.
 
-Resolve one handle. Load one consistent position. Calculate the physical slot from the handle's index. Read the slot. Validate its segment, part, generation, and stream identity before return.
+### [x] Shard playlist creation and rendering by stream
 
-Add separate benchmarks for a direct handle hit, a mapped hit, a miss, and an index-reuse race.
+The global map stores `Arc<PlaylistEntry>`. Each entry has its own manifest
+mutex and closing flag.
 
-### [ ] Shard playlist creation and rendering by stream
+`Playlists::add` releases the map lock before it renders or compresses a
+playlist. It keeps the entry lock through the cache commit.
 
-`Playlists::add` holds one global `Mutex<BTreeMap<...>>` while it mutates and renders a manifest. Writes to unrelated streams therefore serialize.
+`Playlists::fin` marks the exact entry as closing before it waits for that entry.
+It clears cache state before it removes the same `Arc` from the map.
 
-Change the map value to an `Arc<PlaylistEntry>`. Give each entry its own manifest lock, generation, and live or closed state.
+A deterministic test proves that an old `Arc` cannot resurrect a closed stream.
+The `playlist_writes` benchmark compares independent streams with one hot stream.
 
-Use this operation order:
+### [x] Cache delta playlists on write
 
-1. Hold the map lock only to find or create an entry and update the active count.
-2. Release the map lock.
-3. Lock only the selected entry.
-4. Confirm that the entry is live.
-5. Update and render the manifest.
-6. Write the rendered value with the same stream handle.
+A write builds the full and delta variants from the raw manifest. It compresses
+each available variant once and stores both variants in one snapshot.
 
-`fin` must remove the exact entry from the map and mark that entry closed. It must then wait for or reject an in-flight add before cache cleanup. An add that already owns an old `Arc` must not resurrect a closed generation.
+A delta hit clones cached `Bytes`. It performs no decompression, parse, or
+compression work.
 
-Add a benchmark with independent streams and one writer per stream. Add deterministic `add` versus `fin` tests.
+Playlist writes use `Compression::fast`. A short local A/B check improved write
+throughput by 32% to 48%. Retained encoded bytes increased by 5% to 9%.
 
-### [ ] Cache delta playlists on write
+These percentages are diagnostic samples. The release host must confirm the
+CPU and memory tradeoff.
 
-`M3u8Cache::last_delta` decompresses, parses, and recompresses the stored playlist on every read.
+Equivalence tests cover skip boundaries and the absent-delta case. The
+`playlist_cache` benchmark measures full and delta variants separately.
 
-In a steady 32-segment probe, a full cached hit reached 11.070 million reads/s. A delta hit reached 967 reads/s. The delta path was about 11,448 times slower.
+### [x] Bound manifest history and use constant-time base-time updates
 
-Build both variants when the manifest changes:
+`M3u8Manifest` stores completed segments in a bounded `VecDeque`. Each entry has
+its logical ID, duration, and start time.
 
-1. Generate the full playlist and its delta from the uncompressed manifest bytes.
-2. Compress each available variant once.
-3. Store the full bytes, full hash, optional delta bytes, and delta hash in the same versioned slot.
-4. Return the cached delta without decompression or parsing.
-5. Preserve the current absent result when the playlist cannot use `EXT-X-SKIP`.
+The manifest advances `open_start_time` when it removes an old duration. It does
+not scan history to calculate the retained base time.
 
-Add equivalence tests that compare the cached delta with the current delta generator. Benchmark full and delta hits separately. A cached delta hit should be within two times the CPU cost of a full cached hit.
+Sequence, segment, and part counters use `usize`. Duration totals use `u64`.
+Saturating operations prevent integer wrap.
 
-### [ ] Bound manifest history and make time lookup constant-time
+An open segment rolls when it reaches `max_parts_per_segment`. Rendition reports
+and report URI lengths also have hard limits.
 
-`M3u8Manifest::seg_durs` grows for the lifetime of a stream. `segment_start_time` scans from the start of that vector during every render.
+Tests cover 20,000 segment rotations and 10,000 non-independent input parts.
 
-With four retained segments, the measured render cost rose from 4.19 microseconds per part after 2,000 completed segments to 14.53 microseconds after 20,000 completed segments.
+### [x] Re-evaluate nonblocking chunk slot reads
 
-Replace `seg_durs` with a bounded `VecDeque` or ring:
+The selected path makes one `try_read` attempt. It waits on the fair Tokio lock
+if that attempt fails. It does not spin.
 
-1. Store only durations that the retained playlist can reference.
-2. Track the logical ID of the first retained segment.
-3. Track the program date-time of that first retained segment.
-4. Advance the base time when a duration leaves the ring.
-5. Make `full_segments` use ring-relative indices.
-6. Remove `dur`. The crate increments it but does not read it.
+A short local A/B check compared this path with an unconditional fair read. The
+`try_read` path was 4.32x, 1.80x, 1.36x, and 1.04x faster at 1, 2, 4, and 8
+workers.
 
-Review `seq`, `seg_id`, and `idx` at the same time. Use checked operations or wider types for long-lived streams. The current unused `u32` duration counter wraps after about 49.7 days of accumulated milliseconds.
+The same short run reported 30.11, 48.35, 42.80, and 54.11 million handle reads
+per second. These values are diagnostic samples, not release results.
 
-Add a long-run test that crosses many retained-window rotations. Assert stable output cost and correct program date-times.
-
-### [ ] Re-evaluate nonblocking slot reads after map work
-
-A temporary `try_read` and `try_write` experiment improved the one-worker read result. It reduced some two-worker and four-worker mapped results. The experiment was reverted.
-
-Do not land this change alone. Remove global map contention first. Then compare fair locking, bounded spin, and `try_read` fallback behavior under read-only and mixed workloads. Include tail latency and writer progress in the decision.
+The mixed benchmark also showed progress for readers and writers with no write
+failures. A dedicated-host median is still required for a release claim.
 
 ## P2: Memory, layout, and mesh pipeline
 
-### [ ] Define and enforce the playlist memory budget
+### [x] Define and enforce the playlist memory budget
 
-`M3u8Cache::new` forces `buffer_size_kb` to 5. Stored `Bytes` values are dynamic, so this value does not cap a playlist snapshot.
+`buffer_size_kb` limits both raw manifest input and combined encoded snapshot
+bytes. `init_size_kb` limits one initialization value.
 
-A probe used 5 ms parts, 100 parts per segment, 32 segments, and 3,400 writes per stream. One stream retained 3,100 gzip snapshots with 19,710,512 payload bytes and added 26,804,224 bytes of RSS. Five streams retained 15,500 snapshots with 98,579,823 payload bytes and added 123,240,448 bytes of RSS.
+`M3u8Cache::try_new` uses checked multiplication. It returns a configuration
+error instead of an overflow panic.
 
-Choose one explicit policy:
+Every snapshot, including segment zero, occupies a tagged ring slot. The latest
+pointer shares that slot's `Arc` and does not duplicate payload bytes.
 
-- Treat the option as a maximum encoded playlist size and reject larger values.
-- Remove the option and expose a calculated memory budget based on stream count, retained slots, and observed payload sizes.
+`memory_stats` reports retained encoded bytes and the calculated maximum. Tests
+fill multiple ring rotations and verify that payload bytes plateau.
 
-Use checked multiplication in the constructor. Return a configuration error instead of panicking or overflowing. Add a test that fills at least two complete retained-window rotations. Live payload bytes and RSS growth must plateau after warm-up.
+### [x] Remove eager playlist-slot zeroing
 
-### [ ] Prove whether eager playlist-slot zeroing is necessary
+Stream reset and segment rollover do not write filler data to every slot. Tagged
+stream, generation, segment, and part fields reject stale data.
 
-`M3u8Cache::end_segment` locks every part slot for the new ring segment and replaces each value with a shared 5 KB filler. This adds rollover latency and lock traffic.
+Tests cover stale reads after stream reuse and ring wrap. The cache replaces a
+slot only when a new snapshot uses that slot.
 
-The packet header already contains segment ID and generation fields. First add tests that show these fields reject every stale slot. If the proof holds, remove eager zeroing and use lazy replacement. Measure rollover latency, peak RSS, and stale-read behavior before and after the change.
+### [x] Group per-stream and per-slot state
 
-### [ ] Group per-stream state and test cache-line alignment
+`ChunkStreamState` groups last ID, next ID, and version. `PlaylistStreamState`
+groups position, segment ranges, and version.
 
-The caches keep per-stream atomics in separate vectors. Concurrent streams can update adjacent atomics on the same cache line.
+The chunk hash is in `ChunkSlot`. Playlist hashes are in the immutable snapshot.
+The implementation removed separate sequentially-consistent slot atomics.
 
-Group generation, position, sequence, and version state in one `StreamState`. Isolate frequently written fields from read-mostly fields. Test explicit cache-line alignment only after a profile shows false sharing. Report memory overhead with the throughput result.
+No explicit cache-line alignment was added. Current profiles do not show enough
+false-sharing evidence to justify its memory cost.
 
-Move a slot hash into the lock-protected slot value if all readers already hold the slot lock. Remove the extra atomic only when the benchmark shows no regression.
+### [x] Separate mesh receive work from replica service
 
-Review `SeqCst` operations after the lifecycle redesign. Use weaker ordering only with a written happens-before argument and a concurrency test.
+The datagram task performs source authorization, FEC decode, frame decode, and a
+bounded enqueue. It does not await a cache write or a replica range.
 
-### [ ] Separate mesh receive work from replica serving
+A frame task applies discovery and cache work. It sends replica requests to a
+separate bounded task.
 
-The receive loop awaits complete frame handling. A replica request can serve a complete retained range in that path, so it can delay packet receive and FEC recovery.
+Both queues use `try_reserve`. Full queues drop new retryable work and increment
+drop counters. Counters also record current depth, peak depth, decode time,
+service attempts, service errors, and service time.
 
-Use a bounded pipeline:
+FEC observation and recovery state use ordered expiry queues. Cleanup runs every
+256 datagrams and does not scan all observation maps.
 
-1. Keep the datagram loop limited to validation, decode, and bounded enqueue.
-2. Send completed frames to a bounded worker queue.
-3. Send replica work to a separate bounded queue.
-4. Define drop or retry behavior for each full queue.
-5. Record queue depth, drops, decode time, and replica service time.
-
-`FecReceiver::prune_observations` scans maps on each datagram. Replace this with periodic pruning and an ordered expiry queue. Consider a bit set for source-symbol observations. Bound the total decoder and peer state before micro-optimizing FEC counters.
-
-Pass `Bytes` into frame decoding and return slices where ownership permits. Avoid copying decoded payloads into new buffers.
+Frame decoding takes ownership of `Bytes`. Chunk and initialization payloads are
+zero-copy slices of the decoded frame.
 
 ## Benchmark work
 
-### [x] Prevent scheduler phase locking in `distribution_capacity`
+### [x] Prevent scheduler phase locking
 
-The old latency sample interval was 4,096 operations. It aligned with Tokio's cooperative scheduling boundary and biased samples toward forced-yield events.
+Latency sampling uses the prime interval 4,093. Cooperative yielding uses 4,096.
+Deadline checks use 256 operations.
 
-The benchmark now samples every 4,093 operations. It also yields explicitly every 4,096 operations. The explicit yield gives all workers progress and makes the deadline check reliable.
+### [x] Move timed loops out of unit tests
 
-### [ ] Move timed loops out of unit tests
+The implementation removes all three timed throughput tests from
+`src/chunk_cache.rs`. Deterministic fixed-operation concurrency tests remain.
 
-`test_append_and_last` can run on a single-thread Tokio test runtime. Its reader loop does not yield when cache hits complete immediately. A local run produced zero reader operations, delayed the writer, and took about 10 seconds instead of the intended 5 seconds.
+### [x] Add permanent named scenarios
 
-Keep correctness assertions in unit tests. Move all timed throughput loops to `benches/`. The Rust test runner can run timed unit tests together and contaminate their results.
+| Binary | Scenarios |
+| --- | --- |
+| `distribution_capacity` | raw, mapped, and handle chunk reads |
+| `chunk_workloads` | raw, mapped, and handle writes; 15:1 mixed load; churn |
+| `playlist_cache` | full and delta hits; misses; reuse race |
+| `playlist_writes` | manifest render; cache write; independent and hot `Playlists::add` |
+| `mesh_pipeline` | UDP/FEC receive; one-source recovery; replica range service |
 
-### [ ] Add permanent benchmark scenarios
+Each report contains these measurements:
 
-Extend the custom benchmark runner with named scenarios:
+- wall time and operations per second
+- process CPU time and CPU nanoseconds per operation
+- p50, p95, p99, and maximum sampled latency
+- allocator, reallocator, and deallocator call counts
+- process live allocation bytes and the summed per-shard peak upper bound
+- retained and maximum cache payload bytes
+- platform `ru_maxrss`
+- failures and queue drops where applicable
 
-- Chunk reads by raw index, stream ID, and stream handle.
-- Chunk writes by raw index, stream ID, and stream handle.
-- Mixed reads and writes at fixed ratios.
-- Stream creation, eviction, and reuse under churn.
-- Manifest render and `M3u8Cache` writes.
-- Full `Playlists::add` with independent streams and with one hot stream.
-- Full and delta playlist reads.
-- Mesh receive, FEC recovery, and replica service when the feature is enabled.
-
-Use a barrier to start workers. Use a prime latency-sampling interval. Yield at a separate fixed interval. Record wall time, process CPU time, CPU nanoseconds per operation, latency percentiles, allocation counts, live payload bytes, current RSS where available, and maximum RSS.
-
-Run each scenario at 1, 2, 4, and 8 workers when the host has enough CPUs. Use at least five samples on a quiet dedicated host. Report the median and range. Do not label logical `Bytes` length as memory or network bandwidth.
-
-## Local baseline
-
-The following release-mode probes ran on an Apple M1 with eight logical CPUs. They used reused 5,760-byte `Bytes` values unless the row says otherwise. Temporary probe sources were removed after the review.
-
-| Operation | 1 worker | 2 workers | 4 workers | 8 workers |
-| --- | ---: | ---: | ---: | ---: |
-| Indexed chunk writes/s | 375,227 | 710,251 | 1,132,002 | 1,418,402 |
-| Mapped chunk writes/s | 379,974 | 731,641 | 1,097,372 | 1,078,453 |
-| Manifest renders/s | 21,545 | 40,572 | 57,516 | 77,053 |
-| Small gzip playlist writes/s | 103,609 | 171,320 | 189,459 | 197,711 |
-| Full `Playlists::add` calls/s | 4,877 | 9,049 | 12,890 | 10,990 |
-
-The corrected read benchmark reported these CPU costs:
-
-| Workers | Mapped CPU ns/read | Indexed CPU ns/read |
-| ---: | ---: | ---: |
-| 1 | 59.59 | 37.04 |
-| 2 | 101.82 | 32.84 |
-| 4 | 272.68 | 53.13 |
-| 8 | 1,992.21 | 88.46 |
-
-## Release acceptance gates
-
-- All tests pass with all features in release mode.
-- `cargo check --all-targets --all-features` passes.
-- `cargo fmt --check` passes.
-- Deterministic tests cover index reuse during chunk, playlist, initialization, and replica writes.
-- No queue or collection that accepts churn or network input can grow without a configured bound.
-- Live cache memory reaches a stable plateau after the retained window is full.
-- Indexed or handle-based throughput does not regress by more than 5% for a change that targets another path. Use the median of at least five dedicated-host runs.
-- The mapped or handle-based read path does not lose throughput from four to eight workers after the map redesign.
-- The independent-stream `Playlists::add` path does not lose throughput from four to eight workers after playlist sharding.
-- A cached delta hit uses no decompression and no compression. Its CPU cost is at most two times the full cached-hit cost.
-- Mixed-load benchmarks show forward progress for readers and writers. Report p50, p95, p99, and maximum latency.
-
-Exact numeric release targets need a stable benchmark host and a production workload profile. Record those targets after the permanent scenarios exist.
+Allocator counters use 64 shards to reduce measurement contention. They still
+add instrumentation cost. Use the same instrumentation for both comparisons.
 
 ## Maintenance
 
-### [ ] Clean strict Clippy findings
+### [x] Clean strict Clippy findings
 
-`cargo clippy --all-targets --all-features -- -D warnings` currently reports three nonfunctional findings. Derive `Default` for `CacheMeshRole` where possible. Refactor or explicitly allow the two mesh functions with many arguments after the mesh pipeline design is stable.
+`CacheMeshRole` derives `Default`. The mesh pipeline refactor reduces the former
+large handler argument sets.
 
-### [ ] Refresh public performance claims
+`cargo clippy --all-features --all-targets -- -D warnings` is clean.
 
-Update README performance examples only after the permanent suite runs on a dedicated host. Include the crate commit, Rust version, target, host CPUs, duration, scenario, and payload semantics with every published result.
+### [x] Refresh public performance documentation
+
+The README removes old throughput claims that had incomplete test metadata. It
+documents all permanent scenarios and the required result metadata.
+
+Publish a number only after five dedicated-host samples. Include the commit,
+Rust version, target, CPU, duration, mode, payload meaning, median, and range.
+
+## Verification status
+
+The local implementation checks have these results:
+
+- [x] All-feature library tests pass: 93 tests.
+- [x] The local all-feature, all-target release run passes.
+- [x] Strict all-feature, all-target Clippy passes with warnings denied.
+- [x] All benchmark targets compile in release mode.
+- [x] Formatting and diff whitespace checks pass.
+- [x] Deterministic reuse tests cover chunks, playlists, initialization, and
+  replica reads.
+- [x] Deterministic memory tests show a payload plateau after ring rotations.
+- [x] Hostile mesh tests enforce configured state limits.
+
+## External release qualification
+
+These checks do not block this crate implementation. They block a production
+performance or integration claim.
+
+- [ ] Run `cargo test --all-features --all-targets --release` on the release
+  toolchain and target.
+- [ ] Run each applicable benchmark at least five times on a quiet dedicated
+  host.
+- [ ] Record the median and range for 1, 2, 4, and 8 workers.
+- [ ] Confirm that handle throughput does not regress by more than 5%.
+- [ ] Confirm that handle reads do not fall from 4 to 8 workers.
+- [ ] Record mapped reads as a contended control. Do not use them as the
+  high-concurrency release path.
+- [ ] Confirm that independent `Playlists::add` does not fall from 4 to 8
+  workers.
+- [ ] Confirm that cached delta CPU cost is at most twice full-hit CPU cost.
+- [ ] Run a long mesh churn and hostile-input RSS soak at configured limits.
+- [ ] Run a long cache churn RSS soak after the retained windows are full.
+- [ ] Add the downstream HTTP test for missing initialization and its 404
+  mapping.
+- [ ] Migrate active downstream users from numeric indices to `StreamHandle`.
+
+Use this migration procedure:
+
+1. Update `av-service/av-hls`, `av-contrib`, `io`, `av-mesh`, and
+   `av-mesh-ops-telemetry`.
+2. Replace `get_or_create_stream_idx` and `add_stream_id` with
+   `resolve_or_create_stream`.
+3. Replace `get_stream_idx` with `resolve_stream` when the stream must exist.
+4. Store `StreamHandle` for a request, subscription, or ingest lifetime.
+5. Replace `get`, `get_last`, `last`, and `version` with their `_for_handle`
+   forms.
+6. Replace `add` and `append` with `add_for_handle` and `append_for_handle`.
+7. Use `zero_stream_id` for logical-stream teardown.
+8. Keep raw-index operations only for fixed lanes that never use the stream
+   registry.
+9. Add a capacity-one reuse test to each migrated service.
+10. Verify that an old request stops after another stream reuses its index.

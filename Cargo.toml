@@ -12,6 +12,7 @@ default = []
 mesh = ["dep:raptorq-datagram-fec"]
 
 [dependencies]
+arc-swap = "1.7"
 bytes = "1.6.0"
 chrono = "0.4.38"
 flate2 = "1.0.28"
@@ -31,3 +32,20 @@ serde_json = "1.0"
 [[bench]]
 name = "distribution_capacity"
 harness = false
+
+[[bench]]
+name = "chunk_workloads"
+harness = false
+
+[[bench]]
+name = "playlist_cache"
+harness = false
+
+[[bench]]
+name = "playlist_writes"
+harness = false
+
+[[bench]]
+name = "mesh_pipeline"
+harness = false
+required-features = ["mesh"]
