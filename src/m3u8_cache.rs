@@ -467,6 +467,14 @@ impl M3u8Cache {
         let Some(handle) = self.resolve_stream(stream_id) else {
             return Ok(None);
         };
+        self.get_idxs_for_handle(handle, segment_id)
+    }
+
+    pub fn get_idxs_for_handle(
+        &self,
+        handle: M3u8StreamHandle,
+        segment_id: usize,
+    ) -> Result<Option<(usize, usize)>, CacheError> {
         self.registry
             .with_validated(handle.0, || {
                 let state = self.stream_states[handle.index()]
