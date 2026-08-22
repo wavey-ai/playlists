@@ -56,6 +56,32 @@ The raw-index methods are only for code that owns an unassigned physical index.
 They reject indices that belong to the logical-stream registry. Do not keep a
 raw index from `get_stream_idx` and use it as a durable identity.
 
+## Migrate from numeric stream indices
+
+Older integrations can resolve a logical stream and then retain its physical
+index. That index can refer to a different stream after capacity reuse.
+
+Use these replacements for registry-owned streams:
+
+| Old operation | Generation-safe operation |
+| --- | --- |
+| `get_or_create_stream_idx` or `add_stream_id` | `resolve_or_create_stream` |
+| `get_stream_idx` | `resolve_stream` |
+| `get` | `get_for_handle` |
+| `get_last` | `get_last_for_handle` |
+| `last` | `last_for_handle` |
+| `version` | `version_for_handle` |
+| `add` | `add_for_handle` |
+| `append` | `append_for_handle` |
+
+Store one `StreamHandle` for each request, subscription, or ingest lifetime.
+Resolve a new handle after teardown or an unsuccessful handle operation. Use
+`zero_stream_id` to remove a logical stream.
+
+Raw-index operations remain available for fixed lanes. A fixed lane must not
+use `resolve_stream`, `resolve_or_create_stream`, or another registry method.
+Call `reset_stream_idx` before the lane starts a new logical lifetime.
+
 ## Concurrency design
 
 `ChunkCache` stores the slot ID, generation, hash, and payload under one slot
