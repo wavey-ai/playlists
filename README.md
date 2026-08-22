@@ -96,6 +96,12 @@ version.
 - compressed full playlist and hash
 - optional compressed delta playlist and hash
 
+`M3u8Cache::update_notifier_for_handle` exposes one fixed notification source
+per physical stream lane. A blocking-reload server can enable a notification,
+recheck the cache, and sleep until playlist publication, segment closure, or
+stream reset. This avoids a polling task for each waiting client and does not
+grow retained state with the number of requests.
+
 The cache builds and compresses both playlist variants on a write. A latest-full
 or latest-delta hit loads one `ArcSwap` snapshot. It does not decompress, parse,
 or recompress the playlist. Writes use the speed-optimized gzip level.

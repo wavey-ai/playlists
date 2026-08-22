@@ -6,6 +6,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::prelude::*;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +91,7 @@ pub struct M3u8Cache {
     latest: Vec<ArcSwapOption<PlaylistSnapshot>>,
     stream_states: Vec<RwLock<PlaylistStreamState>>,
     inits: Vec<RwLock<Option<StreamInitialization>>>,
+    update_notifiers: Vec<Arc<Notify>>,
     registry: StreamRegistry,
     options: Options,
     max_snapshot_bytes: usize,
@@ -136,6 +138,9 @@ impl M3u8Cache {
                 .collect(),
             inits: (0..options.num_playlists)
                 .map(|_| RwLock::new(None))
+                .collect(),
+            update_notifiers: (0..options.num_playlists)
+                .map(|_| Arc::new(Notify::new()))
                 .collect(),
             registry: StreamRegistry::new(options.num_playlists),
             options,
@@ -184,6 +189,20 @@ impl M3u8Cache {
             .is_current_fast(handle.0)
             .then_some(position)
             .flatten()
+    }
+
+    /// Return the bounded notification source for one playlist lifetime.
+    ///
+    /// Callers must create and enable a `notified` future, then recheck the
+    /// cache before they await it. Publication, segment closure, and stream
+    /// reset all wake current waiters. The retained handle lets callers detect
+    /// that a wake belongs to stream teardown instead of new playlist data.
+    pub fn update_notifier_for_handle(&self, handle: M3u8StreamHandle) -> Option<Arc<Notify>> {
+        if !self.registry.is_current_fast(handle.0) {
+            return None;
+        }
+        let notifier = Arc::clone(self.update_notifiers.get(handle.index())?);
+        self.registry.is_current_fast(handle.0).then_some(notifier)
     }
 
     pub fn ensure_stream_id(&self, stream_id: u64) -> Result<(), CacheError> {
@@ -343,7 +362,8 @@ impl M3u8Cache {
         let previous = segment_id
             .checked_sub(1)
             .ok_or(CacheError::ArithmeticOverflow)?;
-        self.registry
+        let result = self
+            .registry
             .with_validated(handle.0, || {
                 let mut state = self.stream_states[handle.index()]
                     .write()
@@ -355,7 +375,11 @@ impl M3u8Cache {
                     }
                 }
             })
-            .ok_or(CacheError::StreamNotFound)
+            .ok_or(CacheError::StreamNotFound);
+        if result.is_ok() {
+            self.notify_update(handle.index());
+        }
+        result
     }
 
     fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
@@ -700,6 +724,8 @@ impl M3u8Cache {
             self.latest[stream_idx].store(Some(snapshot));
         }
         state.version = next_version(state.version);
+        drop(state);
+        self.notify_update(stream_idx);
     }
 
     fn bump_version(&self, stream_idx: usize) {
@@ -707,6 +733,14 @@ impl M3u8Cache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.version = next_version(state.version);
+        drop(state);
+        self.notify_update(stream_idx);
+    }
+
+    fn notify_update(&self, stream_idx: usize) {
+        if let Some(notifier) = self.update_notifiers.get(stream_idx) {
+            notifier.notify_waiters();
+        }
     }
 
     fn reset_index_state(&self, stream_idx: usize, _generation: u64) {
@@ -727,6 +761,7 @@ impl M3u8Cache {
         if let Some(latest) = self.latest.get(stream_idx) {
             latest.store(None);
         }
+        self.notify_update(stream_idx);
     }
 }
 
@@ -1312,5 +1347,34 @@ mod tests {
             second.add_for_handle(handle, 1, 1, 0, Bytes::from_static(b"wrong-cache")),
             Err(CacheError::StreamNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn update_notifier_wakes_for_publication_and_stream_reset() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(41).unwrap();
+        let notifier = cache.update_notifier_for_handle(handle).unwrap();
+        let published = notifier.notified();
+        tokio::pin!(published);
+        published.as_mut().enable();
+
+        cache
+            .add_for_handle(handle, 1, 1, 0, Bytes::from_static(b"playlist"))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), published)
+            .await
+            .expect("playlist publication must wake an enabled waiter");
+
+        let reset = notifier.notified();
+        tokio::pin!(reset);
+        reset.as_mut().enable();
+        cache.zero_stream_id(41);
+        tokio::time::timeout(std::time::Duration::from_secs(1), reset)
+            .await
+            .expect("stream reset must wake an enabled waiter");
+        assert!(cache.update_notifier_for_handle(handle).is_none());
     }
 }
