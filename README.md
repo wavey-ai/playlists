@@ -307,3 +307,62 @@ cargo check --all-features --all-targets
 cargo clippy --all-features --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## Test results
+
+### GCP HLS-shaped HTTP serving, 2026-08-22
+
+The downstream `web-services` test used two GCP hosts in London
+(`europe-west2-b`). The server was an `n2-highcpu-4`. The load generator was a
+`c4-highcpu-8`. Traffic used the private network. Each response contained one
+fixed 5,760-byte `Bytes` payload. This is the size of 5 ms of 48 kHz, 24-bit PCM
+for eight channels.
+
+The one-hour H3 soak used 32 persistent connections and a pipeline depth of
+eight. It ran as 12 consecutive five-minute samples against one server process.
+
+| Result | Value |
+| --- | ---: |
+| Successful responses | 269,074,634 |
+| Weighted mean | 74,734 responses/s |
+| Five-minute range | 73,675 to 76,232 responses/s |
+| Mean payload rate | 3.444 Gbit/s |
+| Reported errors | 0 |
+| Scheduling backpressure events | 0 |
+| Highest sampled p99 latency | 32.55 ms |
+| Server CPU average | 3.68 cores |
+| Server RSS range | 5.5 to 20.6 MiB |
+
+The server RSS reached about 20 MiB during load and remained near that level.
+The short saturation controls reached these maximum observed rates:
+
+| Protocol | Duration | Responses/s | Payload or application rate | Server CPU |
+| --- | ---: | ---: | ---: | ---: |
+| H3 | 20 s | 76,976 | 3.547 Gbit/s payload | 3.12 cores |
+| H2 | 20 s | 134,606 | 743.52 MB/s reported by `h2load` | 3.56 cores |
+| H1.1 | 20 s | 145,064 | 846.52 MB/s reported by `h2load` | 3.63 cores |
+
+These are HTTP read-path results, not `playlists` crate benchmarks. The server
+returned one static payload. The test did not call this crate and did not test
+cache writes, playlist rendering, stream churn, encoding, or storage. It proves
+that the downstream HTTP stack can serve an HLS-part-shaped retained payload at
+these rates on this topology. It does not prove end-to-end stream capacity.
+
+### Crate diagnostic maxima, 2026-08-22
+
+The crate's own short local tests ran on an eight-core Apple M1 with a 5,760-byte
+logical media payload. These are the highest observed one-second samples. They
+are useful diagnostics, but they are not dedicated-host release results.
+
+| Operation | Workers | Maximum observed rate | Failures |
+| --- | ---: | ---: | ---: |
+| Chunk handle read | 8 | 54,106,316 reads/s | 0 |
+| Chunk handle write to independent streams | 8 | 606,000 writes/s | 0 |
+| Cached delta-playlist handle read | 1 | 46,644,788 reads/s | 0 |
+| Complete `Playlists::add` to independent streams | 8 | 109,083 writes/s | 0 |
+
+The chunk and playlist read tests clone shared `Bytes`. Their logical payload
+rates are not memory-copy or network rates. The complete playlist write includes
+manifest update, full and delta rendering, compression, hashing, and cache
+publication. Run at least five samples on a quiet dedicated host before using
+these figures as release or capacity claims.
