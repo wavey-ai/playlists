@@ -457,6 +457,31 @@ impl ChunkCache {
         Ok(PutIfAbsentResult::Inserted)
     }
 
+    /// Release the bytes of one retained slot of a stream.
+    ///
+    /// The ring holds as many slots for every stream as the stream with the
+    /// shortest parts needs. A stream with long parts, such as 4K video, uses
+    /// this to drop the parts behind its own window instead of keeping the
+    /// whole ring of them in memory. Returns whether a slot was released.
+    pub async fn clear_for_stream_id(&self, stream_id: u64, id: usize) -> bool {
+        let Some((stream_idx, generation)) = self.stream_generation_for_id(stream_id) else {
+            return false;
+        };
+        let Some(idx) = self.offset(stream_idx, id) else {
+            return false;
+        };
+        let mut lock = self.buffer[idx].write().await;
+        let stored_id = self.slot_ids[idx].load(Ordering::Acquire);
+        let stored_generation = self.slot_generations[idx].load(Ordering::Acquire);
+        if stored_id != id || stored_generation != generation {
+            return false;
+        }
+        *lock = Bytes::new();
+        self.slot_ids[idx].store(EMPTY_LAST, Ordering::Release);
+        self.slot_hashes[idx].store(0, Ordering::Release);
+        true
+    }
+
     pub async fn zero_stream_id(&self, stream_id: u64) {
         self.zero_stream_id_sync(stream_id);
     }
@@ -734,6 +759,40 @@ mod tests {
     use std::sync::Arc;
     use tokio::task;
     use tokio::time::{timeout, Duration, Instant};
+
+    #[tokio::test]
+    async fn a_cleared_slot_is_released_and_can_be_written_again() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 8,
+            ..Options::default()
+        });
+        for id in 0..4 {
+            cache
+                .add_for_stream_id(7, id, Bytes::from(vec![id as u8; 16]))
+                .await
+                .unwrap();
+        }
+        assert!(cache.clear_for_stream_id(7, 1).await);
+        assert!(cache.get_for_stream_id(7, 1).await.is_none());
+        assert!(cache.get_for_stream_id(7, 2).await.is_some());
+        // The newest part is still the head of the stream.
+        let stream_idx = cache.get_stream_idx(7).await.unwrap();
+        assert_eq!(cache.last(stream_idx), Some(3));
+        // Clearing is idempotent and does not touch other identities.
+        assert!(!cache.clear_for_stream_id(7, 1).await);
+        assert!(!cache.clear_for_stream_id(7, 9).await);
+        assert!(!cache.clear_for_stream_id(8, 2).await);
+        cache
+            .add_for_stream_id(7, 1, Bytes::from_static(b"again"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_for_stream_id(7, 1).await.unwrap().0,
+            Bytes::from_static(b"again")
+        );
+    }
 
     #[tokio::test]
     async fn exact_part_waiters_follow_stream_and_sequence_identity() {

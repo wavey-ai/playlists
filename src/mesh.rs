@@ -615,15 +615,21 @@ impl CacheMeshHandle {
             return Ok(peers);
         }
         let lease_ms = u32::try_from(self.subscription_lease.as_millis()).unwrap_or(u32::MAX);
-        let frame = MeshFrame::Subscribe {
-            node_id: self.node_id.clone(),
-            stream_id,
-            from_slot: from_slot as u64,
-            backfill_parts: u32::try_from(backfill_parts).unwrap_or(u32::MAX),
-            lease_ms,
+        // Every parent pushes the live parts. Only the first parent sends the
+        // warm-up window, so a new copy is not warmed twice over.
+        for (index, peer) in peers.iter().enumerate() {
+            let backfill_parts = if index == 0 { backfill_parts } else { 0 };
+            let frame = MeshFrame::Subscribe {
+                node_id: self.node_id.clone(),
+                stream_id,
+                from_slot: from_slot as u64,
+                backfill_parts: u32::try_from(backfill_parts).unwrap_or(u32::MAX),
+                lease_ms,
+            }
+            .encode()?;
+            self.send_control(std::slice::from_ref(peer), &frame)
+                .await?;
         }
-        .encode()?;
-        self.send_control(&peers, &frame).await?;
         Ok(peers)
     }
 
@@ -2096,9 +2102,13 @@ async fn sync_task(
                                 );
                             }
                         }
+                        // A cursor beyond the newest part means that the
+                        // stream restarted with a new publication, whose
+                        // sequence starts again. Send it from its beginning.
                         let next = sent
                             .get(&(stream_id, stream_idx, *peer))
                             .copied()
+                            .filter(|slot| *slot <= last)
                             .and_then(|slot| slot.checked_add(1))
                             .unwrap_or(retained_start)
                             .max(retained_start);
@@ -3173,6 +3183,65 @@ mod tests {
 
         parent_a.shutdown();
         parent_b.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_stream_is_pushed_from_its_new_beginning() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        edge.subscribe(7, 0, 16).await.unwrap();
+        for slot in 0..6 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![1_u8; 32]))
+                .await
+                .unwrap();
+        }
+        wait_for_slot(&edge_cache, 7, 5).await;
+
+        // The source restarts: the parent drops the stream and its sequence
+        // starts again below the part that the child was last sent.
+        parent_cache.zero_stream_id(7).await;
+        for slot in 0..2 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![2_u8; 32]))
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let restarted = edge_cache
+                    .get_for_stream_id(7, 1)
+                    .await
+                    .is_some_and(|(bytes, _)| bytes == Bytes::from(vec![2_u8; 32]));
+                if restarted {
+                    return;
+                }
+                edge.subscribe(7, 0, 16).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the restarted stream did not reach the child");
+
+        parent.shutdown();
         edge.shutdown();
     }
 
