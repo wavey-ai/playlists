@@ -188,6 +188,9 @@ pub struct CacheMeshConfig {
     pub peer_timeout: Duration,
     /// Receives one event for each new playlist part that the mesh writes.
     pub applied_tx: Option<mpsc::UnboundedSender<AppliedSlot>>,
+    /// Fault injection for tests: drop this many received datagrams in each
+    /// million, as a lossy private network would. Zero drops none.
+    pub receive_loss_ppm: u32,
 }
 
 impl CacheMeshConfig {
@@ -218,6 +221,7 @@ impl CacheMeshConfig {
             socket_buffer_bytes: None,
             peer_timeout: DEFAULT_PEER_TIMEOUT,
             applied_tx: None,
+            receive_loss_ppm: 0,
         }
     }
 
@@ -278,6 +282,11 @@ impl CacheMeshConfig {
 
     pub fn with_peer_timeout(mut self, timeout: Duration) -> Self {
         self.peer_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn with_receive_loss_ppm(mut self, receive_loss_ppm: u32) -> Self {
+        self.receive_loss_ppm = receive_loss_ppm.min(1_000_000);
         self
     }
 
@@ -1524,6 +1533,11 @@ async fn receive_task(
         stats,
     );
     let mut buf = vec![0u8; 65_536];
+    // xorshift64 state for the test-only loss injection.
+    let mut loss_state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9e37_79b9_7f4a_7c15, |elapsed| elapsed.as_nanos() as u64)
+        | 1;
 
     loop {
         tokio::select! {
@@ -1539,6 +1553,14 @@ async fn receive_task(
                         continue;
                     }
                 };
+                if config.receive_loss_ppm > 0 {
+                    loss_state ^= loss_state << 13;
+                    loss_state ^= loss_state >> 7;
+                    loss_state ^= loss_state << 17;
+                    if loss_state % 1_000_000 < u64::from(config.receive_loss_ppm) {
+                        continue;
+                    }
+                }
 
                 let decoded = match receiver.push(peer, &buf[..len]) {
                     Ok(Some(decoded)) => decoded,
