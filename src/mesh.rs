@@ -29,6 +29,9 @@ const DEFAULT_SUBSCRIPTION_LEASE: Duration = Duration::from_secs(5);
 const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest burst that the warm-up pacer may send in one sync tick.
 const BACKFILL_BURST: Duration = Duration::from_millis(100);
+/// Source symbols that a large object is divided into when the symbol size
+/// may grow with the object.
+const ADAPTIVE_SOURCE_SYMBOLS: usize = 64;
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_REPAIR_RATIO: f32 = 0.03;
@@ -158,6 +161,12 @@ pub struct CacheMeshConfig {
     pub repair_ratio: f32,
     pub max_repair_symbols: u32,
     pub symbol_size: u16,
+    /// Largest symbol for a large object. An object that needs more than 64
+    /// symbols of `symbol_size` uses a multiple of it, up to this size, so a
+    /// 4K video part is tens of datagrams and a 5 ms audio part still fits
+    /// small symbols. Zero, or a value at or below `symbol_size`, keeps one
+    /// symbol size for every object.
+    pub max_symbol_size: u16,
     pub same_region_only: bool,
     pub role: CacheMeshRole,
     /// Maximum number of parent distributors queried by one cache request.
@@ -198,6 +207,7 @@ impl CacheMeshConfig {
             repair_ratio: DEFAULT_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
             symbol_size: DEFAULT_SYMBOL_SIZE,
+            max_symbol_size: 0,
             same_region_only: false,
             role: CacheMeshRole::Peer,
             max_parents: 2,
@@ -238,6 +248,11 @@ impl CacheMeshConfig {
 
     pub fn with_max_children(mut self, max_children: usize) -> Self {
         self.max_children = max_children.max(1);
+        self
+    }
+
+    pub fn with_max_symbol_size(mut self, max_symbol_size: u16) -> Self {
+        self.max_symbol_size = max_symbol_size;
         self
     }
 
@@ -1118,6 +1133,7 @@ struct FecSender {
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
+    max_symbol_size: u16,
     stats: Arc<CacheMeshFecCounters>,
 }
 
@@ -1143,6 +1159,28 @@ impl FecSender {
             0,
             stats,
         )
+        .with_max_symbol_size(config.max_symbol_size)
+    }
+
+    fn with_max_symbol_size(mut self, max_symbol_size: u16) -> Self {
+        self.max_symbol_size = max_symbol_size;
+        self
+    }
+
+    /// Symbol size for one object: the configured size, or a multiple of it
+    /// that keeps a large object within about 64 source symbols.
+    fn symbol_size_for(&self, frame_len: usize) -> u16 {
+        let base = usize::from(self.symbol_size.max(1));
+        let limit = usize::from(self.max_symbol_size);
+        if limit <= base || frame_len <= base * ADAPTIVE_SOURCE_SYMBOLS {
+            return self.symbol_size;
+        }
+        let multiple = frame_len
+            .div_ceil(ADAPTIVE_SOURCE_SYMBOLS)
+            .div_ceil(base)
+            .min(limit / base)
+            .max(1);
+        u16::try_from(base * multiple).unwrap_or(self.symbol_size)
     }
 
     fn from_config_with_initial_block_id(
@@ -1158,6 +1196,7 @@ impl FecSender {
             initial_block_id,
             stats,
         )
+        .with_max_symbol_size(config.max_symbol_size)
     }
 
     fn with_policy_and_initial_block_id(
@@ -1179,12 +1218,13 @@ impl FecSender {
             repair_ratio: repair_ratio.max(0.0),
             max_repair_symbols,
             symbol_size: symbol_size.max(1),
+            max_symbol_size: 0,
             stats,
         }
     }
 
     fn repair_symbols_for(&self, frame_len: usize) -> u32 {
-        let source_symbols = source_symbol_count(frame_len, self.symbol_size);
+        let source_symbols = source_symbol_count(frame_len, self.symbol_size_for(frame_len));
         let proportional = (f32::from(source_symbols) * self.repair_ratio).ceil() as u32;
         proportional
             .max(self.min_repair_symbols)
@@ -1198,7 +1238,9 @@ impl FecSender {
         frame: &[u8],
     ) -> Result<(), MeshError> {
         let repair_symbols = self.repair_symbols_for(frame.len());
-        let source_symbols = usize::from(source_symbol_count(frame.len(), self.symbol_size));
+        let symbol_size = self.symbol_size_for(frame.len());
+        self.encoder.set_symbol_size(symbol_size);
+        let source_symbols = usize::from(source_symbol_count(frame.len(), symbol_size));
         let packets = match self
             .encoder
             .encode_object_with_repair_symbols(frame, repair_symbols)
@@ -3243,6 +3285,61 @@ mod tests {
 
         parent.shutdown();
         edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn symbol_size_grows_with_the_object_and_decodes() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut sender =
+            FecSender::with_policy_and_initial_block_id(0, 0.03, 32, 900, 7, Arc::clone(&stats))
+                .with_max_symbol_size(16_000);
+        // A 5 ms audio part keeps the small symbol.
+        assert_eq!(sender.symbol_size_for(1_700), 900);
+        assert_eq!(sender.symbol_size_for(900 * 64), 900);
+        // A 500 kB video part uses a multiple of it: 64 symbols, not 556.
+        assert_eq!(sender.symbol_size_for(500_000), 8_100);
+        assert_eq!(source_symbol_count(500_000, 8_100), 62);
+        // The largest symbol is a multiple of the base at or below the limit.
+        assert_eq!(sender.symbol_size_for(4_000_000), 15_300);
+        let fixed = FecSender::new(1, 900);
+        assert_eq!(fixed.symbol_size_for(500_000), 900);
+
+        let tx = UdpSocket::bind(loopback_addr()).await.unwrap();
+        let rx = UdpSocket::bind(loopback_addr()).await.unwrap();
+        // The test sends a whole object before it reads, so the receive
+        // buffer must hold it.
+        socket2::SockRef::from(&rx)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .unwrap();
+        let peer = tx.local_addr().unwrap();
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let mut buf = vec![0_u8; 65_536];
+        for frame_len in [1_700_usize, 500_000, 2_000] {
+            let frame = (0..frame_len)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let before = stats.snapshot().tx_source_datagrams;
+            sender
+                .send(&tx, rx.local_addr().unwrap(), &frame)
+                .await
+                .unwrap();
+            let datagrams = stats.snapshot().tx_source_datagrams - before;
+            assert!(
+                datagrams <= 64,
+                "{frame_len} bytes used {datagrams} datagrams"
+            );
+            let decoded = timeout(Duration::from_secs(3), async {
+                loop {
+                    let (len, _) = rx.recv_from(&mut buf).await.unwrap();
+                    if let Some(decoded) = receiver.push(peer, &buf[..len]).unwrap() {
+                        return decoded;
+                    }
+                }
+            })
+            .await
+            .expect("object was not decoded");
+            assert_eq!(decoded.as_ref(), frame.as_slice());
+        }
     }
 
     #[test]
