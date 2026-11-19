@@ -39,7 +39,11 @@ const DEFAULT_MAX_REPAIR_SYMBOLS: u32 = 32;
 const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(20);
 const REQUEST_BLOCK_ID_BASE: u32 = 1 << 30;
+const REPLY_BLOCK_ID_BASE: u32 = (1 << 30) + (1 << 29);
 const CHUNK_BLOCK_ID_BASE: u32 = 1 << 31;
+/// Each lane of block ids starts at its base plus a per-start offset below
+/// this bound.
+const BLOCK_ID_START_SPAN: u32 = 1 << 28;
 const MAX_GOSSIP_PEERS: usize = 256;
 const FEC_OBSERVATION_DATAGRAM_WINDOW: u64 = 8_192;
 const FEC_COMPLETED_BLOCK_WINDOW: usize = 4_096;
@@ -191,6 +195,8 @@ pub struct CacheMeshConfig {
     /// Fault injection for tests: drop this many received datagrams in each
     /// million, as a lossy private network would. Zero drops none.
     pub receive_loss_ppm: u32,
+    /// Offset of the first block id of each lane. `start` sets it.
+    block_id_offset: u32,
 }
 
 impl CacheMeshConfig {
@@ -222,6 +228,7 @@ impl CacheMeshConfig {
             peer_timeout: DEFAULT_PEER_TIMEOUT,
             applied_tx: None,
             receive_loss_ppm: 0,
+            block_id_offset: 0,
         }
     }
 
@@ -350,6 +357,24 @@ fn rank_parents(node_id: &str, stream_id: u64, peers: &mut [SocketAddr]) {
     });
 }
 
+/// Offset for the first block id of every lane of one mesh start.
+///
+/// A receiver remembers the block ids that a peer address completed, so that
+/// late repair symbols are not decoded again. A node that restarts keeps its
+/// address. If it counted its block ids from the same value again, its peers
+/// would discard its first frames, among them its subscriptions, as repeats
+/// of blocks that the previous process sent.
+fn block_id_start_offset(config: &CacheMeshConfig) -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    let mut seed = Vec::with_capacity(config.node_id.len() + 12);
+    seed.extend_from_slice(&nanos.to_be_bytes());
+    seed.extend_from_slice(&std::process::id().to_be_bytes());
+    seed.extend_from_slice(config.node_id.as_bytes());
+    (xxh3_64(&seed) as u32) % BLOCK_ID_START_SPAN
+}
+
 fn bind_socket(config: &CacheMeshConfig) -> Result<UdpSocket, MeshError> {
     let std_socket = std::net::UdpSocket::bind(config.bind_addr)?;
     std_socket.set_nonblocking(true)?;
@@ -463,7 +488,8 @@ impl CacheMesh {
         Self { cache, config }
     }
 
-    pub async fn start(self) -> Result<CacheMeshHandle, MeshError> {
+    pub async fn start(mut self) -> Result<CacheMeshHandle, MeshError> {
+        self.config.block_id_offset = block_id_start_offset(&self.config);
         let socket = Arc::new(bind_socket(&self.config)?);
         let local_addr = socket.local_addr()?;
         let peers = Arc::new(RwLock::new(
@@ -537,7 +563,9 @@ impl CacheMesh {
             max_repair_symbols: self.config.max_repair_symbols,
             symbol_size: self.config.symbol_size,
             fec_counters,
-            request_block_id: Arc::new(AtomicU32::new(REQUEST_BLOCK_ID_BASE)),
+            request_block_id: Arc::new(AtomicU32::new(
+                REQUEST_BLOCK_ID_BASE + self.config.block_id_offset,
+            )),
             local_addr,
             region: self.config.region,
             same_region_only: self.config.same_region_only,
@@ -1529,7 +1557,7 @@ async fn receive_task(
     let mut receiver = FecReceiver::new(Arc::clone(&stats));
     let mut reply_sender = FecSender::from_config_with_initial_block_id(
         &config,
-        REQUEST_BLOCK_ID_BASE.saturating_add(1 << 20),
+        REPLY_BLOCK_ID_BASE + config.block_id_offset,
         stats,
     );
     let mut buf = vec![0u8; 65_536];
@@ -1910,7 +1938,8 @@ async fn announce_task(
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut sender = FecSender::from_config(&config, stats);
+    let mut sender =
+        FecSender::from_config_with_initial_block_id(&config, config.block_id_offset, stats);
     let mut interval = tokio::time::interval(config.announce_interval);
 
     loop {
@@ -1978,8 +2007,11 @@ async fn sync_task(
         return;
     }
     let demand = config.replication == ReplicationMode::Demand;
-    let mut sender =
-        FecSender::from_config_with_initial_block_id(&config, CHUNK_BLOCK_ID_BASE, stats);
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        CHUNK_BLOCK_ID_BASE + config.block_id_offset,
+        stats,
+    );
     let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
     let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
     // Demand replication state: the leases the last tick saw, the warm-up
@@ -3362,6 +3394,53 @@ mod tests {
             .expect("object was not decoded");
             assert_eq!(decoded.as_ref(), frame.as_slice());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_child_is_heard_by_its_parent_at_once() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        for slot in 0..4 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 64]))
+                .await
+                .unwrap();
+        }
+        // The same child, at the same address, starts three times. Each
+        // process subscribes and must receive the playlist.
+        for start in 0..3 {
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr).with_peer(parent_addr),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            edge.subscribe(7, 0, 16).await.unwrap();
+            timeout(Duration::from_secs(3), async {
+                while edge_cache.get_for_stream_id(7, 3).await.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("start {start} of the child received nothing"));
+            edge.unsubscribe(7).await.unwrap();
+            edge.shutdown();
+            drop(edge);
+            // The socket of the stopped child must be free for the next one.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        parent.shutdown();
     }
 
     #[test]
