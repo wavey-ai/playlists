@@ -9,11 +9,12 @@ use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, warn};
+use xxhash_rust::xxh3::xxh3_64;
 
 const FRAME_MAGIC: &[u8; 8] = b"PLMESH1\0";
 const FRAME_VERSION: u8 = 2;
@@ -22,6 +23,12 @@ const FRAME_HELLO: u8 = 1;
 const FRAME_CHUNK: u8 = 2;
 const FRAME_REPLICA_REQUEST: u8 = 3;
 const FRAME_INITIALIZATION: u8 = 4;
+const FRAME_SUBSCRIBE: u8 = 5;
+const FRAME_UNSUBSCRIBE: u8 = 6;
+const DEFAULT_SUBSCRIPTION_LEASE: Duration = Duration::from_secs(5);
+const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest burst that the warm-up pacer may send in one sync tick.
+const BACKFILL_BURST: Duration = Duration::from_millis(100);
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_REPAIR_RATIO: f32 = 0.03;
@@ -110,6 +117,35 @@ impl From<std::str::Utf8Error> for MeshError {
     }
 }
 
+/// How a node that serves children decides which playlists to push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplicationMode {
+    /// Push every playlist to every child. This is the original behavior.
+    #[default]
+    All,
+    /// Push a playlist to a child only while the child holds a subscription
+    /// lease for it. A child subscribes when a reader asks for the playlist
+    /// and lets the lease lapse when the demand is gone.
+    Demand,
+}
+
+/// One playlist part that the cache mesh wrote into the local cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedSlot {
+    pub stream_id: u64,
+    pub slot_id: usize,
+    pub bytes: usize,
+}
+
+/// One playlist subscription lease that this node serves to a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServedSubscription {
+    pub child: SocketAddr,
+    pub stream_id: u64,
+    /// Parts of the warm-up window that are still to be sent.
+    pub backfill_parts_pending: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct CacheMeshConfig {
     pub node_id: String,
@@ -128,6 +164,21 @@ pub struct CacheMeshConfig {
     pub max_parents: usize,
     /// Maximum number of child edges served by one distributor tick.
     pub max_children: usize,
+    /// Whether children receive every playlist or only subscribed playlists.
+    pub replication: ReplicationMode,
+    /// How long a parent keeps pushing a playlist after the last subscribe.
+    pub subscription_lease: Duration,
+    /// Rate limit for the warm-up window that a new subscription receives, for
+    /// each child. Live parts are never limited. Zero sends the window at once.
+    pub backfill_bytes_per_sec: u64,
+    /// Requested size of the socket receive and send buffers. The kernel can
+    /// clamp it. `None` keeps the system default.
+    pub socket_buffer_bytes: Option<usize>,
+    /// A parent that has been silent for this long is not chosen for a new
+    /// subscription or a replica request.
+    pub peer_timeout: Duration,
+    /// Receives one event for each new playlist part that the mesh writes.
+    pub applied_tx: Option<mpsc::UnboundedSender<AppliedSlot>>,
 }
 
 impl CacheMeshConfig {
@@ -151,6 +202,12 @@ impl CacheMeshConfig {
             role: CacheMeshRole::Peer,
             max_parents: 2,
             max_children: 8,
+            replication: ReplicationMode::All,
+            subscription_lease: DEFAULT_SUBSCRIPTION_LEASE,
+            backfill_bytes_per_sec: 0,
+            socket_buffer_bytes: None,
+            peer_timeout: DEFAULT_PEER_TIMEOUT,
+            applied_tx: None,
         }
     }
 
@@ -183,6 +240,118 @@ impl CacheMeshConfig {
         self.max_children = max_children.max(1);
         self
     }
+
+    pub fn with_replication(mut self, replication: ReplicationMode) -> Self {
+        self.replication = replication;
+        self
+    }
+
+    pub fn with_subscription_lease(mut self, lease: Duration) -> Self {
+        self.subscription_lease = lease.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn with_backfill_bytes_per_sec(mut self, bytes_per_sec: u64) -> Self {
+        self.backfill_bytes_per_sec = bytes_per_sec;
+        self
+    }
+
+    pub fn with_socket_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.socket_buffer_bytes = (bytes > 0).then_some(bytes);
+        self
+    }
+
+    pub fn with_peer_timeout(mut self, timeout: Duration) -> Self {
+        self.peer_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn with_applied_tx(mut self, applied_tx: mpsc::UnboundedSender<AppliedSlot>) -> Self {
+        self.applied_tx = Some(applied_tx);
+        self
+    }
+}
+
+/// A lease that a child holds on one playlist of this node.
+#[derive(Debug, Clone, Copy)]
+struct Lease {
+    expires: Instant,
+    /// Set when the lease is new. The sync task takes it and starts the
+    /// warm-up window: the first slot wanted and the most parts to send.
+    open: Option<(usize, usize)>,
+}
+
+/// Warm-up window of one lease, sent newest part first.
+#[derive(Debug, Clone, Copy)]
+struct Backfill {
+    low: usize,
+    /// Next slot to send. The window is complete when it is below `low`.
+    next: Option<usize>,
+}
+
+impl Backfill {
+    fn pending(&self) -> usize {
+        self.next
+            .map(|next| next.saturating_sub(self.low).saturating_add(1))
+            .unwrap_or(0)
+    }
+}
+
+type LeaseTable = Arc<StdMutex<HashMap<(SocketAddr, u64), Lease>>>;
+type ServedTable = Arc<StdMutex<Vec<ServedSubscription>>>;
+type PeerSeen = Arc<StdMutex<HashMap<SocketAddr, Instant>>>;
+type WantedStreams = Arc<StdMutex<HashSet<u64>>>;
+
+fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Rank the parents of one playlist for one child with rendezvous hashing.
+///
+/// Each child spreads its playlists over the distributors of the region, and
+/// each distributor serves a share of the children. Adding a distributor moves
+/// only the playlists that now rank it first.
+fn rank_parents(node_id: &str, stream_id: u64, peers: &mut [SocketAddr]) {
+    let score = |peer: &SocketAddr| {
+        let mut key = Vec::with_capacity(node_id.len() + 40);
+        key.extend_from_slice(node_id.as_bytes());
+        key.extend_from_slice(&stream_id.to_be_bytes());
+        key.extend_from_slice(peer.to_string().as_bytes());
+        xxh3_64(&key)
+    };
+    peers.sort_unstable_by(|left, right| {
+        score(right).cmp(&score(left)).then_with(|| left.cmp(right))
+    });
+}
+
+fn bind_socket(config: &CacheMeshConfig) -> Result<UdpSocket, MeshError> {
+    let std_socket = std::net::UdpSocket::bind(config.bind_addr)?;
+    std_socket.set_nonblocking(true)?;
+    if let Some(bytes) = config.socket_buffer_bytes {
+        let socket = socket2::SockRef::from(&std_socket);
+        if let Err(err) = socket.set_recv_buffer_size(bytes) {
+            warn!(bytes, error = %err, "cache mesh receive buffer request failed");
+        }
+        if let Err(err) = socket.set_send_buffer_size(bytes) {
+            warn!(bytes, error = %err, "cache mesh send buffer request failed");
+        }
+        let receive = socket.recv_buffer_size().unwrap_or(0);
+        let send = socket.send_buffer_size().unwrap_or(0);
+        if receive < bytes {
+            warn!(
+                requested = bytes,
+                receive,
+                "cache mesh receive buffer is smaller than requested; raise net.core.rmem_max"
+            );
+        }
+        info!(
+            requested = bytes,
+            receive, send, "cache mesh socket buffers"
+        );
+    }
+    Ok(UdpSocket::from_std(std_socket)?)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -271,7 +440,7 @@ impl CacheMesh {
     }
 
     pub async fn start(self) -> Result<CacheMeshHandle, MeshError> {
-        let socket = Arc::new(UdpSocket::bind(self.config.bind_addr).await?);
+        let socket = Arc::new(bind_socket(&self.config)?);
         let local_addr = socket.local_addr()?;
         let peers = Arc::new(RwLock::new(
             self.config.peers.iter().copied().collect::<HashSet<_>>(),
@@ -280,6 +449,10 @@ impl CacheMesh {
         let peer_roles = Arc::new(RwLock::new(HashMap::new()));
         let remote_slots = Arc::new(RwLock::new(HashSet::new()));
         let fec_counters = Arc::new(CacheMeshFecCounters::default());
+        let leases: LeaseTable = Arc::new(StdMutex::new(HashMap::new()));
+        let served: ServedTable = Arc::new(StdMutex::new(Vec::new()));
+        let peer_seen: PeerSeen = Arc::new(StdMutex::new(HashMap::new()));
+        let wanted: WantedStreams = Arc::new(StdMutex::new(HashSet::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         tokio::spawn(receive_task(
@@ -290,6 +463,11 @@ impl CacheMesh {
             Arc::clone(&peer_roles),
             Arc::clone(&remote_slots),
             Arc::clone(&fec_counters),
+            MeshShared {
+                leases: Arc::clone(&leases),
+                peer_seen: Arc::clone(&peer_seen),
+                wanted: Arc::clone(&wanted),
+            },
             self.config.clone(),
             shutdown_rx.clone(),
         ));
@@ -310,6 +488,8 @@ impl CacheMesh {
             Arc::clone(&peer_roles),
             remote_slots,
             Arc::clone(&fec_counters),
+            Arc::clone(&leases),
+            Arc::clone(&served),
             self.config.clone(),
             shutdown_rx,
         ));
@@ -339,8 +519,21 @@ impl CacheMesh {
             same_region_only: self.config.same_region_only,
             role: self.config.role,
             max_parents: self.config.max_parents.max(1),
+            replication: self.config.replication,
+            subscription_lease: self.config.subscription_lease,
+            peer_timeout: self.config.peer_timeout,
+            served,
+            peer_seen,
+            wanted,
         })
     }
+}
+
+#[derive(Clone)]
+struct MeshShared {
+    leases: LeaseTable,
+    peer_seen: PeerSeen,
+    wanted: WantedStreams,
 }
 
 pub struct CacheMeshHandle {
@@ -361,6 +554,12 @@ pub struct CacheMeshHandle {
     same_region_only: bool,
     role: CacheMeshRole,
     max_parents: usize,
+    replication: ReplicationMode,
+    subscription_lease: Duration,
+    peer_timeout: Duration,
+    served: ServedTable,
+    peer_seen: PeerSeen,
+    wanted: WantedStreams,
 }
 
 impl CacheMeshHandle {
@@ -388,11 +587,113 @@ impl CacheMeshHandle {
         stream_id: u64,
         from_slot: usize,
     ) -> Result<usize, MeshError> {
+        let peers = self.parents_for(stream_id).await;
+        if peers.is_empty() {
+            return Ok(0);
+        }
+        let frame = MeshFrame::replica_request(self.node_id.clone(), stream_id, from_slot as u64)
+            .encode()?;
+        self.send_control(&peers, &frame).await
+    }
+
+    /// Subscribe to one playlist at its parents, or renew the subscription.
+    ///
+    /// A parent that runs demand replication pushes the playlist only while
+    /// the lease is current, so call this again within the lease. A new lease
+    /// first receives a warm-up window of at most `backfill_parts` parts that
+    /// ends at the newest part and does not start before `from_slot`.
+    /// Returns the parents that were asked.
+    pub async fn subscribe(
+        &self,
+        stream_id: u64,
+        from_slot: usize,
+        backfill_parts: usize,
+    ) -> Result<Vec<SocketAddr>, MeshError> {
+        lock(&self.wanted).insert(stream_id);
+        let peers = self.parents_for(stream_id).await;
+        if peers.is_empty() {
+            return Ok(peers);
+        }
+        let lease_ms = u32::try_from(self.subscription_lease.as_millis()).unwrap_or(u32::MAX);
+        let frame = MeshFrame::Subscribe {
+            node_id: self.node_id.clone(),
+            stream_id,
+            from_slot: from_slot as u64,
+            backfill_parts: u32::try_from(backfill_parts).unwrap_or(u32::MAX),
+            lease_ms,
+        }
+        .encode()?;
+        self.send_control(&peers, &frame).await?;
+        Ok(peers)
+    }
+
+    /// End the subscription to one playlist. Parents stop pushing it, and
+    /// this node no longer accepts its parts.
+    pub async fn unsubscribe(&self, stream_id: u64) -> Result<usize, MeshError> {
+        if !lock(&self.wanted).remove(&stream_id) {
+            return Ok(0);
+        }
+        // Every allowed parent is told, because the parents of the playlist
+        // can have changed since the subscription was made.
         let peers = self.allowed_peers().await;
         if peers.is_empty() {
             return Ok(0);
         }
+        let frame = MeshFrame::Unsubscribe {
+            node_id: self.node_id.clone(),
+            stream_id,
+        }
+        .encode()?;
+        self.send_control(&peers, &frame).await
+    }
 
+    /// Playlists that this node currently subscribes to.
+    pub fn subscribed_streams(&self) -> Vec<u64> {
+        let mut streams = lock(&self.wanted).iter().copied().collect::<Vec<_>>();
+        streams.sort_unstable();
+        streams
+    }
+
+    /// Subscription leases that this node currently serves to children.
+    pub fn served_subscriptions(&self) -> Vec<ServedSubscription> {
+        lock(&self.served).clone()
+    }
+
+    pub fn replication(&self) -> ReplicationMode {
+        self.replication
+    }
+
+    pub fn subscription_lease(&self) -> Duration {
+        self.subscription_lease
+    }
+
+    /// The parents that this node uses for one playlist: allowed, alive, and
+    /// ranked for this node and playlist, at most `max_parents` of them.
+    pub async fn parents_for(&self, stream_id: u64) -> Vec<SocketAddr> {
+        let mut peers = self.allowed_peers().await;
+        let alive = {
+            let seen = lock(&self.peer_seen);
+            let now = Instant::now();
+            peers
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    seen.get(peer)
+                        .is_some_and(|last| now.duration_since(*last) <= self.peer_timeout)
+                })
+                .collect::<Vec<_>>()
+        };
+        // Before the first hello arrives no parent is known to be alive. The
+        // configured parents are then asked, so a cold start does not wait.
+        if !alive.is_empty() {
+            peers = alive;
+        }
+        rank_parents(&self.node_id, stream_id, &mut peers);
+        peers.truncate(self.max_parents.max(1));
+        peers
+    }
+
+    async fn send_control(&self, peers: &[SocketAddr], frame: &[u8]) -> Result<usize, MeshError> {
         let block_id = self.request_block_id.fetch_add(1, Ordering::Relaxed);
         let mut sender = FecSender::with_policy_and_initial_block_id(
             self.repair_symbols,
@@ -402,11 +703,9 @@ impl CacheMeshHandle {
             block_id,
             Arc::clone(&self.fec_counters),
         );
-        let frame = MeshFrame::replica_request(self.node_id.clone(), stream_id, from_slot as u64)
-            .encode()?;
         let mut sent = 0usize;
         for peer in peers {
-            sender.send(&self.socket, peer, &frame).await?;
+            sender.send(&self.socket, *peer, frame).await?;
             sent = sent.saturating_add(1);
         }
         Ok(sent)
@@ -444,7 +743,6 @@ impl CacheMeshHandle {
             })
             .collect::<Vec<_>>();
         peers.sort_unstable();
-        peers.truncate(self.max_parents.max(1));
         peers
     }
 }
@@ -478,6 +776,17 @@ enum MeshFrame {
         node_id: String,
         stream_id: u64,
         from_slot: u64,
+    },
+    Subscribe {
+        node_id: String,
+        stream_id: u64,
+        from_slot: u64,
+        backfill_parts: u32,
+        lease_ms: u32,
+    },
+    Unsubscribe {
+        node_id: String,
+        stream_id: u64,
     },
 }
 
@@ -540,7 +849,9 @@ impl MeshFrame {
             Self::Hello { node_id, .. }
             | Self::Chunk { node_id, .. }
             | Self::Initialization { node_id, .. }
-            | Self::ReplicaRequest { node_id, .. } => node_id,
+            | Self::ReplicaRequest { node_id, .. }
+            | Self::Subscribe { node_id, .. }
+            | Self::Unsubscribe { node_id, .. } => node_id,
         }
     }
 
@@ -624,6 +935,27 @@ impl MeshFrame {
                 out.put_slice(node_id);
                 out.put_u64(*stream_id);
                 out.put_u64(*from_slot);
+            }
+            Self::Subscribe {
+                stream_id,
+                from_slot,
+                backfill_parts,
+                lease_ms,
+                ..
+            } => {
+                out.put_u8(FRAME_SUBSCRIBE);
+                out.put_u16(node_id.len() as u16);
+                out.put_slice(node_id);
+                out.put_u64(*stream_id);
+                out.put_u64(*from_slot);
+                out.put_u32(*backfill_parts);
+                out.put_u32(*lease_ms);
+            }
+            Self::Unsubscribe { stream_id, .. } => {
+                out.put_u8(FRAME_UNSUBSCRIBE);
+                out.put_u16(node_id.len() as u16);
+                out.put_slice(node_id);
+                out.put_u64(*stream_id);
             }
         }
         Ok(out.freeze())
@@ -732,6 +1064,29 @@ impl MeshFrame {
                     stream_id,
                     payload,
                 })
+            }
+            FRAME_SUBSCRIBE => {
+                if buf.remaining() != 24 {
+                    return Err(MeshError::InvalidFrame("subscribe header mismatch"));
+                }
+                let stream_id = buf.get_u64();
+                let from_slot = buf.get_u64();
+                let backfill_parts = buf.get_u32();
+                let lease_ms = buf.get_u32();
+                Ok(Self::Subscribe {
+                    node_id,
+                    stream_id,
+                    from_slot,
+                    backfill_parts,
+                    lease_ms,
+                })
+            }
+            FRAME_UNSUBSCRIBE => {
+                if buf.remaining() != 8 {
+                    return Err(MeshError::InvalidFrame("unsubscribe header mismatch"));
+                }
+                let stream_id = buf.get_u64();
+                Ok(Self::Unsubscribe { node_id, stream_id })
             }
             _ => Err(MeshError::InvalidFrame("unknown frame kind")),
         }
@@ -1110,6 +1465,7 @@ async fn receive_task(
     peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     stats: Arc<CacheMeshFecCounters>,
+    shared: MeshShared,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
@@ -1159,6 +1515,7 @@ async fn receive_task(
                                 peer_regions: &peer_regions,
                                 peer_roles: &peer_roles,
                                 remote_slots: &remote_slots,
+                                shared: &shared,
                                 config: &config,
                                 reply_sender: &mut reply_sender,
                             },
@@ -1178,11 +1535,23 @@ struct FrameHandler<'a> {
     peer_regions: &'a Arc<RwLock<HashMap<SocketAddr, String>>>,
     peer_roles: &'a Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: &'a Arc<RwLock<HashSet<(u64, usize)>>>,
+    shared: &'a MeshShared,
     config: &'a CacheMeshConfig,
     reply_sender: &'a mut FecSender,
 }
 
+impl FrameHandler<'_> {
+    /// Whether this node accepts parts of the playlist from a parent. An edge
+    /// that replicates on demand holds only the playlists it subscribes to.
+    fn accepts_stream(&self, stream_id: u64) -> bool {
+        self.config.replication != ReplicationMode::Demand
+            || self.config.role != CacheMeshRole::Edge
+            || lock(&self.shared.wanted).contains(&stream_id)
+    }
+}
+
 async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<'_>) {
+    lock(&handler.shared.peer_seen).insert(peer, Instant::now());
     match frame {
         MeshFrame::Hello {
             node_id,
@@ -1229,7 +1598,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             slot_id,
             payload,
         } => {
-            if !peer_is_allowed(peer, &handler).await {
+            if !peer_is_allowed(peer, &handler).await || !handler.accepts_stream(stream_id) {
                 return;
             }
             let Ok(slot_id) = usize::try_from(slot_id) else {
@@ -1239,6 +1608,17 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             };
+            // Each parent sends every part. The second copy of a part is not
+            // written again, so it costs no copy and wakes no reader.
+            if handler
+                .cache
+                .get_for_stream_id(stream_id, slot_id)
+                .await
+                .is_some_and(|(existing, _)| existing == payload)
+            {
+                return;
+            }
+            let bytes = payload.len();
             if let Err(err) = handler
                 .cache
                 .add_for_stream_id(stream_id, slot_id, payload)
@@ -1258,6 +1638,13 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 .write()
                 .await
                 .insert((stream_id, slot_id));
+            if let Some(applied_tx) = &handler.config.applied_tx {
+                let _ = applied_tx.send(AppliedSlot {
+                    stream_id,
+                    slot_id,
+                    bytes,
+                });
+            }
             debug!(node_id, stream_id, slot_id, "cache mesh slot applied");
         }
         MeshFrame::Initialization {
@@ -1265,7 +1652,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             stream_id,
             payload,
         } => {
-            if !peer_is_allowed(peer, &handler).await {
+            if !peer_is_allowed(peer, &handler).await || !handler.accepts_stream(stream_id) {
                 return;
             }
             let bytes = payload.len();
@@ -1314,6 +1701,65 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                     stream_id,
                     error = %err,
                     "cache mesh replica request could not be served"
+                );
+            }
+        }
+        MeshFrame::Subscribe {
+            node_id,
+            stream_id,
+            from_slot,
+            backfill_parts,
+            lease_ms,
+        } => {
+            if !peer_is_allowed(peer, &handler).await || handler.config.role == CacheMeshRole::Edge
+            {
+                return;
+            }
+            handler.peers.write().await.insert(peer);
+            let lease = Duration::from_millis(u64::from(lease_ms).max(1)).min(
+                handler
+                    .config
+                    .subscription_lease
+                    .max(Duration::from_secs(1))
+                    * 4,
+            );
+            let now = Instant::now();
+            let mut leases = lock(&handler.shared.leases);
+            let current = leases
+                .get_mut(&(peer, stream_id))
+                .filter(|lease| lease.expires > now);
+            if let Some(current) = current {
+                current.expires = now + lease;
+            } else {
+                let from_slot = usize::try_from(from_slot).unwrap_or(usize::MAX);
+                let backfill_parts = usize::try_from(backfill_parts).unwrap_or(usize::MAX);
+                leases.insert(
+                    (peer, stream_id),
+                    Lease {
+                        expires: now + lease,
+                        open: Some((from_slot, backfill_parts)),
+                    },
+                );
+                debug!(
+                    child = node_id,
+                    peer = %peer,
+                    stream_id,
+                    from_slot,
+                    backfill_parts,
+                    "cache mesh playlist subscription opened"
+                );
+            }
+        }
+        MeshFrame::Unsubscribe { node_id, stream_id } => {
+            if lock(&handler.shared.leases)
+                .remove(&(peer, stream_id))
+                .is_some()
+            {
+                debug!(
+                    child = node_id,
+                    peer = %peer,
+                    stream_id,
+                    "cache mesh playlist subscription closed"
                 );
             }
         }
@@ -1453,16 +1899,26 @@ async fn sync_task(
     peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     stats: Arc<CacheMeshFecCounters>,
+    leases: LeaseTable,
+    served: ServedTable,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     if config.role == CacheMeshRole::Edge {
         return;
     }
+    let demand = config.replication == ReplicationMode::Demand;
     let mut sender =
         FecSender::from_config_with_initial_block_id(&config, CHUNK_BLOCK_ID_BASE, stats);
     let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
     let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
+    // Demand replication state: the leases the last tick saw, the warm-up
+    // window of each, and the warm-up byte allowance of each child.
+    let mut active: HashSet<(SocketAddr, u64)> = HashSet::new();
+    let mut pending_open: HashMap<(SocketAddr, u64), (usize, usize)> = HashMap::new();
+    let mut backfills: HashMap<(SocketAddr, u64), Backfill> = HashMap::new();
+    let mut backfill_tokens: HashMap<SocketAddr, f64> = HashMap::new();
+    let mut last_tick = Instant::now();
     let mut child_cursor = 0usize;
     let mut interval = tokio::time::interval(config.sync_interval);
 
@@ -1473,6 +1929,60 @@ async fn sync_task(
                 return;
             }
             _ = interval.tick() => {
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_tick);
+                last_tick = now;
+                if demand {
+                    let mut current = HashSet::new();
+                    {
+                        let mut leases = lock(&leases);
+                        leases.retain(|_, lease| lease.expires > now);
+                        for (key, lease) in leases.iter_mut() {
+                            current.insert(*key);
+                            if let Some(open) = lease.open.take() {
+                                pending_open.insert(*key, open);
+                            }
+                        }
+                    }
+                    for (peer, stream_id) in active.difference(&current) {
+                        // The lease ended. Forget the cursors, so that a later
+                        // subscription starts with the initialization again.
+                        sent.retain(|(sent_stream, _, sent_peer), _| {
+                            sent_stream != stream_id || sent_peer != peer
+                        });
+                        sent_initializations.retain(|(sent_stream, _, sent_peer), _| {
+                            sent_stream != stream_id || sent_peer != peer
+                        });
+                        backfills.remove(&(*peer, *stream_id));
+                        pending_open.remove(&(*peer, *stream_id));
+                    }
+                    backfill_tokens.retain(|peer, _| current.iter().any(|(child, _)| child == peer));
+                    active = current;
+                    if config.backfill_bytes_per_sec > 0 {
+                        let rate = config.backfill_bytes_per_sec as f64;
+                        let burst = rate * BACKFILL_BURST.as_secs_f64();
+                        for (peer, _) in &active {
+                            let tokens = backfill_tokens.entry(*peer).or_insert(burst);
+                            *tokens = (*tokens + rate * elapsed.as_secs_f64()).min(burst);
+                        }
+                    }
+                    *lock(&served) = active
+                        .iter()
+                        .map(|(child, stream_id)| ServedSubscription {
+                            child: *child,
+                            stream_id: *stream_id,
+                            backfill_parts_pending: pending_open
+                                .get(&(*child, *stream_id))
+                                .map(|(_, parts)| *parts)
+                                .or_else(|| {
+                                    backfills
+                                        .get(&(*child, *stream_id))
+                                        .map(Backfill::pending)
+                                })
+                                .unwrap_or(0),
+                        })
+                        .collect();
+                }
                 let peers = {
                     let regions = peer_regions.read().await;
                     let roles = peer_roles.read().await;
@@ -1481,6 +1991,7 @@ async fn sync_task(
                         .await
                         .iter()
                         .copied()
+                        .filter(|peer| !demand || active.iter().any(|(child, _)| child == peer))
                         .filter(|peer| {
                             !config.same_region_only
                                 || regions
@@ -1523,6 +2034,20 @@ async fn sync_task(
                         .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
                 });
                 for (stream_id, stream_idx) in stream_ids {
+                    // In demand replication a child receives a playlist only
+                    // while it holds a lease for it.
+                    let peers = if demand {
+                        peers
+                            .iter()
+                            .copied()
+                            .filter(|peer| active.contains(&(*peer, stream_id)))
+                            .collect::<Vec<_>>()
+                    } else {
+                        peers.clone()
+                    };
+                    if peers.is_empty() {
+                        continue;
+                    }
                     if let Some(initialization) = cache.stream_initialization(stream_id) {
                         let frame = match MeshFrame::initialization(
                             config.node_id.clone(),
@@ -1555,6 +2080,22 @@ async fn sync_task(
                     };
                     let retained_start = cache.retained_start(last);
                     for peer in &peers {
+                        if let Some((from_slot, backfill_parts)) =
+                            pending_open.remove(&(*peer, stream_id))
+                        {
+                            // A new lease starts live at the next part. The
+                            // parts already stored are the warm-up window.
+                            let low = from_slot
+                                .max(retained_start)
+                                .max(last.saturating_add(1).saturating_sub(backfill_parts));
+                            sent.insert((stream_id, stream_idx, *peer), last);
+                            if low <= last && backfill_parts > 0 {
+                                backfills.insert(
+                                    (*peer, stream_id),
+                                    Backfill { low, next: Some(last) },
+                                );
+                            }
+                        }
                         let next = sent
                             .get(&(stream_id, stream_idx, *peer))
                             .copied()
@@ -1599,6 +2140,59 @@ async fn sync_task(
                                     break;
                                 }
                             }
+                        }
+                    }
+
+                    // Warm-up windows go after the live parts of the tick,
+                    // newest part first, within the allowance of each child.
+                    for peer in &peers {
+                        let key = (*peer, stream_id);
+                        let Some(mut backfill) = backfills.get(&key).copied() else {
+                            continue;
+                        };
+                        let limited = config.backfill_bytes_per_sec > 0;
+                        while let Some(slot_id) = backfill.next {
+                            if slot_id < backfill.low.max(retained_start) {
+                                backfill.next = None;
+                                break;
+                            }
+                            if limited && backfill_tokens.get(peer).copied().unwrap_or(0.0) <= 0.0 {
+                                break;
+                            }
+                            backfill.next = slot_id.checked_sub(1);
+                            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                                continue;
+                            };
+                            if hash == 0 && payload.is_empty() {
+                                continue;
+                            }
+                            let bytes = payload.len();
+                            let frame = match MeshFrame::chunk(
+                                config.node_id.clone(),
+                                stream_id,
+                                slot_id as u64,
+                                payload,
+                            ).encode() {
+                                Ok(frame) => frame,
+                                Err(err) => {
+                                    warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                                    continue;
+                                }
+                            };
+                            if let Err(err) = sender.send(&socket, *peer, &frame).await {
+                                debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
+                                break;
+                            }
+                            if limited {
+                                if let Some(tokens) = backfill_tokens.get_mut(peer) {
+                                    *tokens -= bytes as f64;
+                                }
+                            }
+                        }
+                        if backfill.next.is_none() {
+                            backfills.remove(&key);
+                        } else {
+                            backfills.insert(key, backfill);
                         }
                     }
                 }
@@ -2193,5 +2787,427 @@ mod tests {
             sender.repair_symbols_for(1_000 * usize::from(DEFAULT_SYMBOL_SIZE)),
             16
         );
+    }
+
+    fn demand_options() -> Options {
+        Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 64,
+            buffer_size_kb: 4,
+            ..Options::default()
+        }
+    }
+
+    fn demand_distributor(name: &str, addr: SocketAddr) -> CacheMeshConfig {
+        let mut config = CacheMeshConfig::new(name, "uk", addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Distributor)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(600));
+        config.sync_interval = Duration::from_millis(10);
+        config.announce_interval = Duration::from_millis(100);
+        config
+    }
+
+    fn demand_edge(name: &str, addr: SocketAddr) -> CacheMeshConfig {
+        let mut config = CacheMeshConfig::new(name, "uk", addr)
+            .with_same_region_only(true)
+            .with_role(CacheMeshRole::Edge)
+            .with_replication(ReplicationMode::Demand)
+            .with_subscription_lease(Duration::from_millis(600));
+        config.sync_interval = Duration::from_millis(10);
+        config.announce_interval = Duration::from_millis(100);
+        config
+    }
+
+    async fn wait_for_slot(cache: &ChunkCache, stream_id: u64, slot_id: usize) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if cache.get_for_stream_id(stream_id, slot_id).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("stream {stream_id} slot {slot_id} did not arrive"));
+    }
+
+    /// Wait until the child has learned the role and region of its parents.
+    async fn wait_for_hello(handle: &CacheMeshHandle, parents: usize) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if handle.peer_roles.read().await.len() >= parents {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("parents did not announce themselves");
+    }
+
+    #[test]
+    fn subscription_frames_roundtrip() {
+        let frame = MeshFrame::Subscribe {
+            node_id: "edge-1".into(),
+            stream_id: 2001,
+            from_slot: 77,
+            backfill_parts: 32,
+            lease_ms: 5_000,
+        };
+        assert_eq!(MeshFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+
+        let frame = MeshFrame::Unsubscribe {
+            node_id: "edge-1".into(),
+            stream_id: 2001,
+        };
+        assert_eq!(MeshFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn demand_replication_pushes_only_subscribed_playlists() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        for slot in 0..4 {
+            for stream_id in [7_u64, 8] {
+                parent_cache
+                    .add_for_stream_id(stream_id, slot, Bytes::from(vec![stream_id as u8; 64]))
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            edge_cache.get_stream_idx(7).await.is_none(),
+            "a playlist without demand must not be replicated"
+        );
+        assert!(parent.served_subscriptions().is_empty());
+
+        // Demand for playlist 7 arrives. The edge receives the stored window
+        // and then every new part. Playlist 8 stays at the distributor.
+        assert_eq!(edge.subscribe(7, 0, 16).await.unwrap(), vec![parent_addr]);
+        for slot in 0..4 {
+            wait_for_slot(&edge_cache, 7, slot).await;
+        }
+        parent_cache
+            .add_for_stream_id(7, 4, Bytes::from(vec![7_u8; 64]))
+            .await
+            .unwrap();
+        parent_cache
+            .add_for_stream_id(8, 4, Bytes::from(vec![8_u8; 64]))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 4).await;
+        assert!(edge_cache.get_stream_idx(8).await.is_none());
+        assert_eq!(edge.subscribed_streams(), vec![7]);
+        let served = parent.served_subscriptions();
+        assert_eq!(served.len(), 1);
+        assert_eq!((served[0].child, served[0].stream_id), (edge_addr, 7));
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn demand_replication_stops_when_the_lease_lapses_or_is_released() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        parent_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"part-0"))
+            .await
+            .unwrap();
+        edge.subscribe(7, 0, 16).await.unwrap();
+        wait_for_slot(&edge_cache, 7, 0).await;
+
+        // No renewal: the lease of 600 ms lapses and the push stops.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(parent.served_subscriptions().is_empty());
+        parent_cache
+            .add_for_stream_id(7, 1, Bytes::from_static(b"part-1"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(edge_cache.get_for_stream_id(7, 1).await.is_none());
+
+        // A new subscription asks from the first missing slot and receives it.
+        edge.subscribe(7, 1, 16).await.unwrap();
+        wait_for_slot(&edge_cache, 7, 1).await;
+
+        // An explicit release stops the push at once. A part that is already
+        // on the wire is not accepted afterwards.
+        assert_eq!(edge.unsubscribe(7).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(parent.served_subscriptions().is_empty());
+        parent_cache
+            .add_for_stream_id(7, 2, Bytes::from_static(b"part-2"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(edge_cache.get_for_stream_id(7, 2).await.is_none());
+        assert!(edge.subscribed_streams().is_empty());
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_up_window_is_bounded_paced_and_newest_first() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        // 1,000-byte parts at 20,000 bytes per second: 2,000 bytes of burst,
+        // then one part every 50 ms.
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_backfill_bytes_per_sec(20_000),
+        )
+        .start()
+        .await
+        .unwrap();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peer(parent_addr)
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        for slot in 0..20 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 1_000]))
+                .await
+                .unwrap();
+        }
+        let started = Instant::now();
+        // The edge asks for at most eight parts before the newest part.
+        edge.subscribe(7, 0, 8).await.unwrap();
+        let mut order = Vec::new();
+        while order.len() < 8 {
+            let applied = timeout(Duration::from_secs(3), applied_rx.recv())
+                .await
+                .expect("warm-up part did not arrive")
+                .unwrap();
+            assert_eq!(applied.stream_id, 7);
+            assert_eq!(applied.bytes, 1_000);
+            order.push(applied.slot_id);
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(order, vec![19, 18, 17, 16, 15, 14, 13, 12]);
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "eight 1,000-byte parts at 20 kB/s arrived in {elapsed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(edge_cache.get_for_stream_id(7, 11).await.is_none());
+
+        // A live part is not held behind the allowance.
+        parent_cache
+            .add_for_stream_id(7, 20, Bytes::from(vec![20_u8; 1_000]))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 20).await;
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn second_parent_copy_of_a_part_is_applied_once() {
+        let parent_a_addr = loopback_addr();
+        let parent_b_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let cache_a = Arc::new(ChunkCache::new(demand_options()));
+        let cache_b = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent_a = CacheMesh::new(
+            Arc::clone(&cache_a),
+            demand_distributor("parent-a", parent_a_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let parent_b = CacheMesh::new(
+            Arc::clone(&cache_b),
+            demand_distributor("parent-b", parent_b_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peers([parent_a_addr, parent_b_addr])
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 2).await;
+
+        let mut parents = edge.subscribe(7, 0, 16).await.unwrap();
+        parents.sort_unstable();
+        let mut expected = vec![parent_a_addr, parent_b_addr];
+        expected.sort_unstable();
+        assert_eq!(parents, expected);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for slot in 0..5 {
+            let part = Bytes::from(vec![slot as u8; 200]);
+            cache_a
+                .add_for_stream_id(7, slot, part.clone())
+                .await
+                .unwrap();
+            cache_b.add_for_stream_id(7, slot, part).await.unwrap();
+        }
+        wait_for_slot(&edge_cache, 7, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut applied = Vec::new();
+        while let Ok(event) = applied_rx.try_recv() {
+            applied.push(event.slot_id);
+        }
+        applied.sort_unstable();
+        assert_eq!(applied, vec![0, 1, 2, 3, 4]);
+
+        parent_a.shutdown();
+        parent_b.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn edge_moves_its_subscription_away_from_a_silent_parent() {
+        let parent_a_addr = loopback_addr();
+        let parent_b_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let cache_a = Arc::new(ChunkCache::new(demand_options()));
+        let cache_b = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent_a = CacheMesh::new(
+            Arc::clone(&cache_a),
+            demand_distributor("parent-a", parent_a_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let parent_b = CacheMesh::new(
+            Arc::clone(&cache_b),
+            demand_distributor("parent-b", parent_b_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        // One parent for each playlist, so the choice is visible.
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peers([parent_a_addr, parent_b_addr])
+                .with_max_parents(1)
+                .with_peer_timeout(Duration::from_millis(400)),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 2).await;
+
+        let first = edge.subscribe(7, 0, 4).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let (silent, survivor, survivor_cache) = if first[0] == parent_a_addr {
+            (&parent_a, parent_b_addr, &cache_b)
+        } else {
+            (&parent_b, parent_a_addr, &cache_a)
+        };
+        silent.shutdown();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // The renewal finds the first parent silent and uses the other one.
+        assert_eq!(edge.subscribe(7, 0, 4).await.unwrap(), vec![survivor]);
+        survivor_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"from-survivor"))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 0).await;
+
+        parent_a.shutdown();
+        parent_b.shutdown();
+        edge.shutdown();
+    }
+
+    #[test]
+    fn parent_ranking_spreads_children_and_is_stable() {
+        let distributors = (0..4)
+            .map(|index| SocketAddr::from(([10, 0, 0, 10 + index], 9101)))
+            .collect::<Vec<_>>();
+        let mut first_choice: HashMap<SocketAddr, usize> = HashMap::new();
+        for child in 0..200 {
+            let node_id = format!("edge-{child}");
+            let mut ranked = distributors.clone();
+            rank_parents(&node_id, 7, &mut ranked);
+            *first_choice.entry(ranked[0]).or_default() += 1;
+
+            // The order does not depend on the order in which peers are known.
+            let mut reversed = distributors.iter().rev().copied().collect::<Vec<_>>();
+            rank_parents(&node_id, 7, &mut reversed);
+            assert_eq!(ranked, reversed);
+
+            // Removing a distributor that is not the first choice keeps it.
+            let mut fewer = distributors
+                .iter()
+                .copied()
+                .filter(|peer| *peer != ranked[3])
+                .collect::<Vec<_>>();
+            rank_parents(&node_id, 7, &mut fewer);
+            assert_eq!(fewer[0], ranked[0]);
+        }
+        assert_eq!(first_choice.len(), 4);
+        for (distributor, children) in first_choice {
+            assert!(
+                (25..=75).contains(&children),
+                "{distributor} is the first parent of {children} of 200 children"
+            );
+        }
     }
 }

@@ -330,6 +330,7 @@ dependencies = [
  "raptorq-datagram-fec",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tls-helpers",
  "tokio",
