@@ -128,7 +128,17 @@ impl ChunkCache {
             return idx;
         }
 
-        let idx = self.idx.fetch_add(1, Ordering::SeqCst) % self.options.num_playlists;
+        // Take an index that no stream uses. Only when every index is in use
+        // does a new stream replace the stream at the next index in turn. A
+        // cache that adds and releases streams as its readers come and go
+        // must not evict a stream that still has readers while indices are
+        // free.
+        let playlists = self.options.num_playlists;
+        let start = self.idx.fetch_add(1, Ordering::SeqCst);
+        let idx = (0..playlists)
+            .map(|step| start.wrapping_add(step) % playlists)
+            .find(|candidate| !lock.values().any(|mapped_idx| mapped_idx == candidate))
+            .unwrap_or(start % playlists);
         if let Some(previous_stream_id) = lock
             .iter()
             .find_map(|(candidate, mapped_idx)| (*mapped_idx == idx).then_some(*candidate))
@@ -482,6 +492,41 @@ impl ChunkCache {
         true
     }
 
+    /// Remove a stream and release the bytes of every part that it retained.
+    ///
+    /// [`Self::zero_stream_id`] only hides the parts: they stay in memory
+    /// until another stream overwrites the same slots. A cache that holds a
+    /// stream only while it has readers uses this instead, so that a released
+    /// 4K stream does not keep its window in memory.
+    pub async fn release_stream_id(&self, stream_id: u64) -> bool {
+        let stream_idx = {
+            let mut offsets = self.offsets.write().unwrap();
+            let Some(stream_idx) = offsets.remove(&stream_id) else {
+                return false;
+            };
+            self.reset_stream_idx(stream_idx);
+            stream_idx
+        };
+        for slot in 0..self.stream_capacity() {
+            let Some(idx) = self.offset(stream_idx, slot) else {
+                break;
+            };
+            let mut bytes = self.buffer[idx].write().await;
+            // The index can already belong to a new stream. A slot that the
+            // new stream wrote carries the current generation and is kept.
+            let current = self.generation(stream_idx);
+            if Some(self.slot_generations[idx].load(Ordering::Acquire)) == current
+                && self.slot_ids[idx].load(Ordering::Acquire) != EMPTY_LAST
+            {
+                continue;
+            }
+            *bytes = Bytes::new();
+            self.slot_ids[idx].store(EMPTY_LAST, Ordering::Release);
+            self.slot_hashes[idx].store(0, Ordering::Release);
+        }
+        true
+    }
+
     pub async fn zero_stream_id(&self, stream_id: u64) {
         self.zero_stream_id_sync(stream_id);
     }
@@ -759,6 +804,78 @@ mod tests {
     use std::sync::Arc;
     use tokio::task;
     use tokio::time::{timeout, Duration, Instant};
+
+    #[tokio::test]
+    async fn a_new_stream_takes_a_free_index_before_it_replaces_a_stream() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 8,
+            ..Options::default()
+        });
+        // One stream stays while forty others come and go.
+        cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"kept"))
+            .await
+            .unwrap();
+        for stream_id in 100..140_u64 {
+            cache
+                .add_for_stream_id(stream_id, 0, Bytes::from_static(b"visitor"))
+                .await
+                .unwrap();
+            assert!(cache.release_stream_id(stream_id).await);
+            assert_eq!(
+                cache.get_for_stream_id(7, 0).await.unwrap().0,
+                Bytes::from_static(b"kept"),
+                "stream 7 was evicted when stream {stream_id} was added"
+            );
+        }
+        // With every index in use a new stream still gets one.
+        for stream_id in [8_u64, 9, 10, 11] {
+            cache
+                .add_for_stream_id(stream_id, 0, Bytes::from_static(b"full"))
+                .await
+                .unwrap();
+        }
+        assert!(cache.get_for_stream_id(11, 0).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_released_stream_frees_the_bytes_of_its_parts() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 8,
+            ..Options::default()
+        });
+        for id in 0..8 {
+            cache
+                .add_for_stream_id(7, id, Bytes::from(vec![id as u8; 1_024]))
+                .await
+                .unwrap();
+        }
+        let stream_idx = cache.get_stream_idx(7).await.unwrap();
+        assert!(cache.release_stream_id(7).await);
+        assert!(!cache.release_stream_id(7).await);
+        assert!(cache.get_stream_idx(7).await.is_none());
+        for id in 0..8 {
+            let idx = cache.offset(stream_idx, id).unwrap();
+            assert!(
+                cache.buffer[idx].read().await.is_empty(),
+                "slot {id} kept its bytes"
+            );
+        }
+        // The index is usable again, and a hidden stream keeps its bytes
+        // only until they are released.
+        cache
+            .add_for_stream_id(8, 3, Bytes::from_static(b"next"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get_for_stream_id(8, 3).await.unwrap().0,
+            Bytes::from_static(b"next")
+        );
+    }
 
     #[tokio::test]
     async fn a_cleared_slot_is_released_and_can_be_written_again() {
