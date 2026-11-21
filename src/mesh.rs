@@ -176,8 +176,16 @@ pub struct AppliedSlot {
     pub parent: SocketAddr,
 }
 
-/// Called by the sync task each time it hands the first datagram of a part to
-/// the kernel for a child: `(stream_id, slot_id, child, sent_unix_us)`.
+/// Called by the sync task each time it hands the first datagram of a live
+/// part to the kernel for a child: `(stream_id, slot_id, child, sent_unix_us)`.
+///
+/// A live part is one published since the sync task last looked at its
+/// stream, or any part for a child that is already following the stream
+/// (so a part that a child receives late, because of rotation over
+/// `max_children` or a failed send, is still reported). Catch-up sends are not
+/// reported: the warm-up window of a new lease, and the parts a new child in
+/// full replication is sent from the start of the retained window. Their
+/// send times measure how old the window is, not the hop.
 ///
 /// It runs inline on the sync task and must be cheap: record and return.
 pub type CacheMeshSendObserver = Arc<dyn Fn(u64, u64, SocketAddr, u64) + Send + Sync>;
@@ -2336,11 +2344,34 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 return;
             }
             let bytes = payload.len();
-            if let Err(err) = handler
+            // The set tells the copy loop which slots came from a peer, so
+            // that it does not send them back. An edge has no copy loop: it
+            // must not keep a set that nothing reads and nothing prunes.
+            //
+            // The slot is marked before the write, and the set stays locked
+            // until the write is done: the write advances the watermark,
+            // which wakes the copy loop at once, and the loop must see the
+            // slot as remote. Holding the lock also keeps a prune, which
+            // drops slots above the watermark, from running in between.
+            let mut remote_slots = if handler.config.role != CacheMeshRole::Edge {
+                Some(handler.remote_slots.write().await)
+            } else {
+                None
+            };
+            let marked = remote_slots
+                .as_mut()
+                .is_some_and(|remote_slots| remote_slots.insert((stream_id, slot_id)));
+            let written = handler
                 .cache
                 .add_for_stream_id(stream_id, slot_id, payload)
-                .await
-            {
+                .await;
+            if written.is_err() && marked {
+                if let Some(remote_slots) = remote_slots.as_mut() {
+                    remote_slots.remove(&(stream_id, slot_id));
+                }
+            }
+            drop(remote_slots);
+            if let Err(err) = written {
                 warn!(
                     node_id,
                     stream_id,
@@ -2351,16 +2382,6 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 return;
             }
             let committed_us = unix_micros();
-            // The set tells the copy loop which slots came from a peer, so
-            // that it does not send them back. An edge has no copy loop: it
-            // must not keep a set that nothing reads and nothing prunes.
-            if handler.config.role != CacheMeshRole::Edge {
-                handler
-                    .remote_slots
-                    .write()
-                    .await
-                    .insert((stream_id, slot_id));
-            }
             if let Some(applied_tx) = &handler.config.applied_tx {
                 let _ = applied_tx.send(AppliedSlot {
                     stream_id,
@@ -2693,6 +2714,43 @@ async fn announce_task(
     }
 }
 
+/// The watermark of each stream when the sync task last looked at it.
+#[derive(Default)]
+struct SeenWatermarks(HashMap<(u64, usize), usize>);
+
+impl SeenWatermarks {
+    /// Remember the watermark `last` of a stream and return the one seen
+    /// before.
+    fn record(&mut self, stream_id: u64, stream_idx: usize, last: Option<usize>) -> Option<usize> {
+        match last {
+            Some(last) => self.0.insert((stream_id, stream_idx), last),
+            None => self.0.remove(&(stream_id, stream_idx)),
+        }
+    }
+
+    /// Remember the current watermark of every stream.
+    fn refresh(&mut self, cache: &ChunkCache, stream_ids: &[(u64, usize)]) {
+        for (stream_id, stream_idx) in stream_ids {
+            self.record(*stream_id, *stream_idx, cache.last(*stream_idx));
+        }
+        self.retain_streams(stream_ids);
+    }
+
+    /// Forget the streams that the cache no longer holds.
+    fn retain_streams(&mut self, stream_ids: &[(u64, usize)]) {
+        if self.0.len() > stream_ids.len() {
+            let current = stream_ids.iter().copied().collect::<HashSet<_>>();
+            self.0.retain(|key, _| current.contains(key));
+        }
+    }
+}
+
+/// Whether two byte strings are equal, without comparing the bytes when they
+/// are the same buffer (a stored initialization is cloned, not copied).
+fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
+}
+
 /// How often a node without children forgets the remote slots that its
 /// cache no longer retains.
 const REMOTE_SLOT_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
@@ -2702,9 +2760,14 @@ const REMOTE_SLOT_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 /// that was released.
 async fn forget_unretained_remote_slots(
     cache: &ChunkCache,
-    stream_ids: &[(u64, usize)],
     remote_slots: &RwLock<HashSet<(u64, usize)>>,
 ) {
+    // The streams and their watermarks are read under the lock. The receive
+    // task marks a slot and writes it under the same lock, so a slot that is
+    // being received is never seen above the watermark, or in a stream not
+    // yet created, here.
+    let mut remote_slots = remote_slots.write().await;
+    let stream_ids = cache.stream_ids().await;
     let retained_ranges = stream_ids
         .iter()
         .filter_map(|(stream_id, stream_idx)| {
@@ -2713,7 +2776,7 @@ async fn forget_unretained_remote_slots(
                 .map(|last| (*stream_id, (cache.retained_start(last), last)))
         })
         .collect::<HashMap<_, _>>();
-    remote_slots.write().await.retain(|(stream_id, slot_id)| {
+    remote_slots.retain(|(stream_id, slot_id)| {
         retained_ranges
             .get(stream_id)
             .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
@@ -2759,6 +2822,12 @@ async fn sync_task(
     // The children that the last tick chose. A pass woken by a publication
     // sends the new parts to them; only the tick changes the set.
     let mut children: Vec<SocketAddr> = Vec::new();
+    // The children of the stream that the pass is on; reused for each stream.
+    let mut stream_children: Vec<SocketAddr> = Vec::new();
+    // The watermark of each stream when the last pass looked at it. A pass
+    // woken by a publication visits only the streams whose watermark moved
+    // since, and the parts at or below it were not published since then.
+    let mut seen_last = SeenWatermarks::default();
     let publication = cache.publication_notify();
     let mut published = std::pin::pin!(publication.notified());
     published.as_mut().enable();
@@ -2870,10 +2939,14 @@ async fn sync_task(
                 // parents. An edge in demand replication never has a
                 // child, and its set grew by one entry for each part
                 // that it received, for the life of the process.
+                let stream_ids = cache.stream_ids().await;
+                // Keep the watermarks current, so that the parts published
+                // long ago are not reported as live sends to a child that
+                // comes later.
+                seen_last.refresh(&cache, &stream_ids);
                 if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
                     last_remote_slot_prune = Instant::now();
-                    let stream_ids = cache.stream_ids().await;
-                    forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
+                    forget_unretained_remote_slots(&cache, &remote_slots).await;
                 }
                 continue;
             }
@@ -2883,43 +2956,61 @@ async fn sync_task(
 
         let stream_ids = cache.stream_ids().await;
         if tick {
-            forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
+            forget_unretained_remote_slots(&cache, &remote_slots).await;
+            seen_last.retain_streams(&stream_ids);
         }
-        for (stream_id, stream_idx) in stream_ids {
+        'streams: for (stream_id, stream_idx) in stream_ids {
+            let last = cache.last(stream_idx);
+            let previous = seen_last.record(stream_id, stream_idx, last);
+            // A publication woke this pass: only a stream whose watermark
+            // moved has a part to send. The tick does everything else.
+            if !tick && (last.is_none() || last == previous) {
+                continue;
+            }
             // In demand replication a child receives a playlist only
             // while it holds a lease for it.
-            let peers = if demand {
-                children
-                    .iter()
-                    .copied()
-                    .filter(|peer| active.contains(&(*peer, stream_id)))
-                    .collect::<Vec<_>>()
+            stream_children.clear();
+            if demand {
+                stream_children.extend(
+                    children
+                        .iter()
+                        .copied()
+                        .filter(|peer| active.contains(&(*peer, stream_id))),
+                );
             } else {
-                children.clone()
-            };
-            if peers.is_empty() {
+                stream_children.extend_from_slice(&children);
+            }
+            if stream_children.is_empty() {
                 continue;
             }
             if let Some(initialization) = cache.stream_initialization(stream_id) {
-                let frame = match MeshFrame::initialization(
-                    config.node_id.clone(),
-                    stream_id,
-                    initialization.clone(),
-                )
-                .encode()
-                {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        warn!(stream_id, error = %err, "cache mesh initialization encode failed");
-                        continue;
-                    }
-                };
-                for peer in &peers {
+                // Encoded only when a child lacks this initialization.
+                let mut frame = None;
+                for peer in &stream_children {
                     let key = (stream_id, stream_idx, *peer);
-                    if sent_initializations.get(&key) == Some(&initialization) {
+                    if sent_initializations
+                        .get(&key)
+                        .is_some_and(|sent| same_bytes(sent, &initialization))
+                    {
                         continue;
                     }
-                    match sender.send(&socket, *peer, &frame).await {
+                    let frame = match &mut frame {
+                        Some(frame) => frame,
+                        None => match MeshFrame::initialization(
+                            config.node_id.clone(),
+                            stream_id,
+                            initialization.clone(),
+                        )
+                        .encode()
+                        {
+                            Ok(encoded) => frame.insert(encoded),
+                            Err(err) => {
+                                warn!(stream_id, error = %err, "cache mesh initialization encode failed");
+                                continue 'streams;
+                            }
+                        },
+                    };
+                    match sender.send(&socket, *peer, frame).await {
                         Ok(()) => {
                             sent_initializations.insert(key, initialization.clone());
                         }
@@ -2929,11 +3020,17 @@ async fn sync_task(
                     }
                 }
             }
-            let Some(last) = cache.last(stream_idx) else {
+            let Some(last) = last else {
                 continue;
             };
+            // Parts above this slot were published since the last pass. A
+            // stream that is new, or that restarted, has only such parts.
+            let published_from = match previous {
+                Some(previous) if previous <= last => previous + 1,
+                _ => 0,
+            };
             let retained_start = cache.retained_start(last);
-            for peer in &peers {
+            for peer in &stream_children {
                 if let Some((from_slot, backfill_parts)) = pending_open.remove(&(*peer, stream_id))
                 {
                     // A new lease starts live at the next part. The
@@ -2955,16 +3052,25 @@ async fn sync_task(
                 // A cursor beyond the newest part means that the
                 // stream restarted with a new publication, whose
                 // sequence starts again. Send it from its beginning.
-                let next = sent
+                let cursor = sent
                     .get(&(stream_id, stream_idx, *peer))
                     .copied()
-                    .filter(|slot| *slot <= last)
+                    .filter(|slot| *slot <= last);
+                let next = cursor
                     .and_then(|slot| slot.checked_add(1))
                     .unwrap_or(retained_start)
                     .max(retained_start);
                 if next > last {
                     continue;
                 }
+                // A child without a cursor is new, in full replication: the
+                // parts that were there before this pass are its catch-up,
+                // not live parts, and the send observer does not see them.
+                let live_from = if cursor.is_some() {
+                    next
+                } else {
+                    published_from.max(next)
+                };
 
                 for slot_id in next..=last {
                     if config.role != CacheMeshRole::Distributor
@@ -2999,8 +3105,10 @@ async fn sync_task(
                     {
                         Ok(sent_us) => {
                             sent.insert((stream_id, stream_idx, *peer), slot_id);
-                            if let Some(observer) = &config.send_observer.0 {
-                                observer(stream_id, slot_id as u64, *peer, sent_us);
+                            if slot_id >= live_from {
+                                if let Some(observer) = &config.send_observer.0 {
+                                    observer(stream_id, slot_id as u64, *peer, sent_us);
+                                }
                             }
                         }
                         Err(err) => {
@@ -3017,7 +3125,7 @@ async fn sync_task(
             if !tick {
                 continue;
             }
-            for peer in &peers {
+            for peer in &stream_children {
                 let key = (*peer, stream_id);
                 let Some(mut backfill) = backfills.get(&key).copied() else {
                     continue;
@@ -3057,11 +3165,9 @@ async fn sync_task(
                         .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
                         .await
                     {
-                        Ok(sent_us) => {
-                            if let Some(observer) = &config.send_observer.0 {
-                                observer(stream_id, slot_id as u64, *peer, sent_us);
-                            }
-                        }
+                        // A warm-up part is not a live send: the observer
+                        // does not see it.
+                        Ok(_) => {}
                         Err(err) => {
                             debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
                             break;
@@ -4163,8 +4269,7 @@ mod tests {
         // A stream that the cache does not hold.
         remote_slots.write().await.insert((9_u64, 3_usize));
 
-        let stream_ids = cache.stream_ids().await;
-        forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
+        forget_unretained_remote_slots(&cache, &remote_slots).await;
 
         // The cache retains the last 64 slots of the stream.
         let left = remote_slots.read().await;
@@ -4822,17 +4927,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_committed_part_leaves_at_once_when_sync_on_publish() {
         let (mut latencies, applied, sent, distributor_addr, edge_addr) =
-            commit_to_apply(true, 9).await;
+            commit_to_apply(true, 19).await;
         latencies.sort_unstable();
         let median = latencies[latencies.len() / 2];
         assert!(
             median < Duration::from_millis(5),
             "commit to edge took {latencies:?} with a 50 ms sync interval"
         );
+        // Every part, not only most: a part whose publication did not wake
+        // the sender waits for the tick, which is up to 50 ms away and more
+        // than 10 ms away four times in five. Over 19 parts a lost wake-up
+        // that hits even one part in ten fails here almost surely. The bound
+        // is 10 ms rather than 5 so that one part delayed by the scheduler of
+        // a busy test host does not fail the test.
         assert!(
             latencies
                 .iter()
-                .all(|latency| *latency < Duration::from_millis(25)),
+                .all(|latency| *latency < Duration::from_millis(10)),
             "a part waited for the tick: {latencies:?}"
         );
 
@@ -4871,5 +4982,211 @@ mod tests {
             "a part left before the tick: {latencies:?}"
         );
         assert!(applied.iter().all(|event| event.parent == distributor_addr));
+    }
+    #[test]
+    fn seen_watermarks_tell_a_pass_which_streams_moved() {
+        let mut seen = SeenWatermarks::default();
+        assert_eq!(seen.record(7, 0, Some(3)), None);
+        assert_eq!(seen.record(7, 0, Some(3)), Some(3), "unchanged");
+        assert_eq!(seen.record(7, 0, Some(5)), Some(3), "advanced");
+        assert_eq!(seen.record(9, 1, None), None);
+        // The same slot index holding another stream is another stream.
+        assert_eq!(seen.record(8, 0, Some(1)), None);
+        seen.retain_streams(&[(8, 0)]);
+        assert_eq!(seen.record(7, 0, Some(5)), None, "forgotten");
+    }
+
+    #[test]
+    fn same_bytes_compares_clones_without_reading_them() {
+        let initialization = Bytes::from(vec![1u8; 4096]);
+        assert!(same_bytes(&initialization, &initialization.clone()));
+        assert!(same_bytes(&initialization, &Bytes::from(vec![1u8; 4096])));
+        assert!(!same_bytes(&initialization, &Bytes::from(vec![2u8; 4096])));
+        assert!(!same_bytes(&initialization, &initialization.slice(..4095)));
+    }
+
+    /// Records, at the moment a publication wakes it, whether the slot was
+    /// already marked as remote. The check runs inside the wake-up, so it
+    /// sees exactly what the sync task would see if it ran at once.
+    struct RemoteAtWake {
+        remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
+        slot: (u64, usize),
+        // 0: not woken, 1: marked, 2: not marked, 3: set locked.
+        seen: std::sync::atomic::AtomicU8,
+    }
+
+    impl std::task::Wake for RemoteAtWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let seen = match self.remote_slots.try_read() {
+                Ok(remote_slots) if remote_slots.contains(&self.slot) => 1,
+                Ok(_) => 2,
+                // The receive task holds the set until the write is done, so
+                // the sync task waits for it and then sees the slot.
+                Err(_) => 3,
+            };
+            let _ = self.seen.compare_exchange(
+                0,
+                seen,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_received_part_is_marked_remote_before_its_publication_wakes_the_sender() {
+        let sender_addr = loopback_addr();
+        let receiver_addr = loopback_addr();
+        let sender_cache = Arc::new(ChunkCache::new(demand_options()));
+        let receiver_cache = Arc::new(ChunkCache::new(demand_options()));
+        let sender = CacheMesh::new(
+            Arc::clone(&sender_cache),
+            CacheMeshConfig::new("sender", "uk", sender_addr)
+                .with_peer(receiver_addr)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_sync_interval(Duration::from_millis(5)),
+        )
+        .start()
+        .await
+        .unwrap();
+        // A peer, not an edge: it has a copy loop that must not send the
+        // part back. Its interval is long so that no tick prunes the set.
+        let receiver = CacheMesh::new(
+            Arc::clone(&receiver_cache),
+            CacheMeshConfig::new("receiver", "uk", receiver_addr)
+                .with_peer(sender_addr)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_sync_interval(Duration::from_secs(60)),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&receiver, 1).await;
+
+        let probe = Arc::new(RemoteAtWake {
+            remote_slots: Arc::clone(&receiver.remote_slots),
+            slot: (7, 0),
+            seen: std::sync::atomic::AtomicU8::new(0),
+        });
+        use std::future::Future;
+        let waker = std::task::Waker::from(Arc::clone(&probe));
+        let notified = receiver_cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        assert!(notified
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending());
+
+        sender_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"part-0"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while probe.seen.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the part was not published at the receiver");
+        assert_ne!(
+            probe.seen.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "the publication woke the sender before the slot was marked remote"
+        );
+        assert!(receiver.remote_slots.read().await.contains(&(7, 0)));
+        sender.shutdown();
+        receiver.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_send_observer_sees_live_parts_and_not_a_new_childs_catch_up() {
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let sent: Arc<StdMutex<Vec<SentRecord>>> = Arc::default();
+        let observer = {
+            let sent = Arc::clone(&sent);
+            Arc::new(move |stream_id, slot_id, child, sent_us| {
+                lock(&sent).push((stream_id, slot_id, child, sent_us));
+            })
+        };
+        // The distributor has no child yet: it learns of the edge from its
+        // hello, after these parts are published.
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_announce_interval(Duration::from_millis(20))
+                .with_sync_interval(Duration::from_millis(10))
+                .with_send_observer(observer),
+        )
+        .start()
+        .await
+        .unwrap();
+        for slot in 0..10 {
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 100]))
+                .await
+                .unwrap();
+        }
+        // Let a tick see the parts while there is no child.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(20))
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        // Full replication: the new child is sent the whole window. The edge
+        // takes parts from its configured parent before it hears its hello.
+        let mut caught_up = HashSet::new();
+        timeout(Duration::from_secs(3), async {
+            while caught_up.len() < 10 {
+                let event: AppliedSlot = applied_rx.recv().await.unwrap();
+                caught_up.insert(event.slot_id);
+            }
+        })
+        .await
+        .expect("the new child did not catch up");
+        assert!(
+            lock(&sent).is_empty(),
+            "catch-up sends were reported as live: {:?}",
+            lock(&sent)
+        );
+
+        distributor_cache
+            .add_for_stream_id(7, 10, Bytes::from(vec![10u8; 100]))
+            .await
+            .unwrap();
+        let event = timeout(Duration::from_secs(2), applied_rx.recv())
+            .await
+            .expect("the live part did not reach the edge")
+            .unwrap();
+        assert_eq!(event.slot_id, 10);
+        timeout(Duration::from_secs(1), async {
+            while lock(&sent).is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the live part was not reported");
+        let sent = lock(&sent).clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!((sent[0].0, sent[0].1, sent[0].2), (7, 10, edge_addr));
+        distributor.shutdown();
+        edge.shutdown();
     }
 }
