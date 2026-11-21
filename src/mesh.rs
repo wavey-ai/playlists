@@ -576,7 +576,7 @@ impl CacheMesh {
             Arc::clone(&peers),
             Arc::clone(&peer_regions),
             Arc::clone(&peer_roles),
-            remote_slots,
+            Arc::clone(&remote_slots),
             Arc::clone(&fec_counters),
             Arc::clone(&leases),
             Arc::clone(&served),
@@ -620,6 +620,7 @@ impl CacheMesh {
             wanted,
             link_loss,
             measured_loss,
+            remote_slots,
         })
     }
 }
@@ -655,6 +656,7 @@ pub struct CacheMeshHandle {
     subscription_lease: Duration,
     peer_timeout: Duration,
     served: ServedTable,
+    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
     link_loss: LinkLossTable,
@@ -840,6 +842,12 @@ impl CacheMeshHandle {
     /// An edge that has heard no parent for a few hello intervals has lost
     /// its network, or every parent: it cannot say when the next part will
     /// come, and should send its readers to another cache.
+    /// Slots that this node took from a peer and still remembers. It is at
+    /// most the slots that its cache retains.
+    pub async fn remote_slot_count(&self) -> usize {
+        self.remote_slots.read().await.len()
+    }
+
     pub async fn parents_silent_for(&self) -> Option<Duration> {
         let peers = self.allowed_peers().await;
         let seen = lock(&self.peer_seen);
@@ -2227,11 +2235,16 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             }
-            handler
-                .remote_slots
-                .write()
-                .await
-                .insert((stream_id, slot_id));
+            // The set tells the copy loop which slots came from a peer, so
+            // that it does not send them back. An edge has no copy loop: it
+            // must not keep a set that nothing reads and nothing prunes.
+            if handler.config.role != CacheMeshRole::Edge {
+                handler
+                    .remote_slots
+                    .write()
+                    .await
+                    .insert((stream_id, slot_id));
+            }
             if let Some(applied_tx) = &handler.config.applied_tx {
                 let _ = applied_tx.send(AppliedSlot {
                     stream_id,
@@ -2560,6 +2573,33 @@ async fn announce_task(
     }
 }
 
+/// How often a node without children forgets the remote slots that its
+/// cache no longer retains.
+const REMOTE_SLOT_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Forget the slots that came from a peer and that the cache no longer
+/// retains: slots behind the window of their stream, and slots of a stream
+/// that was released.
+async fn forget_unretained_remote_slots(
+    cache: &ChunkCache,
+    stream_ids: &[(u64, usize)],
+    remote_slots: &RwLock<HashSet<(u64, usize)>>,
+) {
+    let retained_ranges = stream_ids
+        .iter()
+        .filter_map(|(stream_id, stream_idx)| {
+            cache
+                .last(*stream_idx)
+                .map(|last| (*stream_id, (cache.retained_start(last), last)))
+        })
+        .collect::<HashMap<_, _>>();
+    remote_slots.write().await.retain(|(stream_id, slot_id)| {
+        retained_ranges
+            .get(stream_id)
+            .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
+    });
+}
+
 async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
@@ -2592,6 +2632,7 @@ async fn sync_task(
     let mut pending_open: HashMap<(SocketAddr, u64), (usize, usize)> = HashMap::new();
     let mut backfills: HashMap<(SocketAddr, u64), Backfill> = HashMap::new();
     let mut backfill_tokens: HashMap<SocketAddr, f64> = HashMap::new();
+    let mut last_remote_slot_prune = Instant::now();
     let mut last_tick = Instant::now();
     let mut child_cursor = 0usize;
     let mut interval = tokio::time::interval(config.sync_interval);
@@ -2690,23 +2731,20 @@ async fn sync_task(
                     peers
                 };
                 if peers.is_empty() {
+                    // A node without children still learns slots from its
+                    // parents. An edge in demand replication never has a
+                    // child, and its set grew by one entry for each part
+                    // that it received, for the life of the process.
+                    if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
+                        last_remote_slot_prune = Instant::now();
+                        let stream_ids = cache.stream_ids().await;
+                        forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
+                    }
                     continue;
                 }
 
                 let stream_ids = cache.stream_ids().await;
-                let retained_ranges = stream_ids
-                    .iter()
-                    .filter_map(|(stream_id, stream_idx)| {
-                        cache
-                            .last(*stream_idx)
-                            .map(|last| (*stream_id, (cache.retained_start(last), last)))
-                    })
-                    .collect::<HashMap<_, _>>();
-                remote_slots.write().await.retain(|(stream_id, slot_id)| {
-                    retained_ranges
-                        .get(stream_id)
-                        .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
-                });
+                forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
                 for (stream_id, stream_idx) in stream_ids {
                     // In demand replication a child receives a playlist only
                     // while it holds a lease for it.
@@ -3904,6 +3942,76 @@ mod tests {
             .expect("the parent was heard");
         assert!(silent >= Duration::from_millis(300), "{silent:?}");
         edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_edge_does_not_remember_the_slots_that_it_receives() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        assert_eq!(edge.subscribe(7, 0, 4).await.unwrap(), vec![parent_addr]);
+
+        // The cache retains 64 slots of a stream. The parent publishes 400.
+        for slot_id in 0..400_usize {
+            parent_cache
+                .add_for_stream_id(7, slot_id, Bytes::from(vec![slot_id as u8; 32]))
+                .await
+                .unwrap();
+            if slot_id % 16 == 15 {
+                wait_for_slot(&edge_cache, 7, slot_id).await;
+                let _ = edge.subscribe(7, slot_id, 4).await;
+            }
+        }
+        wait_for_slot(&edge_cache, 7, 399).await;
+
+        // An edge sends no slot on, so it has no use for the set of slots
+        // that came from a peer. It kept one entry for each part that it
+        // ever received.
+        assert_eq!(edge.remote_slot_count().await, 0);
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn remote_slots_that_the_cache_has_dropped_are_forgotten() {
+        let cache = ChunkCache::new(demand_options());
+        let remote_slots = RwLock::new(HashSet::new());
+        for slot_id in 0..400_usize {
+            cache
+                .add_for_stream_id(7, slot_id, Bytes::from_static(b"part"))
+                .await
+                .unwrap();
+            remote_slots.write().await.insert((7_u64, slot_id));
+        }
+        // A stream that the cache does not hold.
+        remote_slots.write().await.insert((9_u64, 3_usize));
+
+        let stream_ids = cache.stream_ids().await;
+        forget_unretained_remote_slots(&cache, &stream_ids, &remote_slots).await;
+
+        // The cache retains the last 64 slots of the stream.
+        let left = remote_slots.read().await;
+        assert_eq!(left.len(), 64);
+        assert!(left
+            .iter()
+            .all(|(stream_id, slot_id)| *stream_id == 7 && *slot_id >= 336));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
