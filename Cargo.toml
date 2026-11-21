@@ -32,3 +32,9 @@ serde_json = "1.0"
 [[bench]]
 name = "distribution_capacity"
 harness = false
+
+# RaptorQ coding is orders of magnitude slower without optimisation: a 300-byte
+# part took about 12 ms to encode in a debug build. Optimise it in test and
+# dev builds so that the timing tests of the cache mesh measure the mesh.
+[profile.dev.package.raptorq]
+opt-level = 3

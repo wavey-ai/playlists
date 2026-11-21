@@ -56,6 +56,9 @@ pub struct ChunkCache {
     stream_initializations: Vec<StdRwLock<Option<StreamInitialization>>>,
     offsets: StdRwLock<HashMap<u64, usize>>,
     exact_part_waiters: Vec<ExactPartWaiterShard>,
+    /// Signalled whenever the watermark ([`Self::last`]) of any stream
+    /// advances. See [`Self::publication_notify`].
+    published: Notify,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
     new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
@@ -103,11 +106,26 @@ impl ChunkCache {
             exact_part_waiters: (0..EXACT_PART_WAITER_SHARDS)
                 .map(|_| StdMutex::new(HashMap::new()))
                 .collect(),
+            published: Notify::new(),
             idx: AtomicUsize::new(0),
             new_playlist_tx,
             new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
             options,
         }
+    }
+
+    /// Signalled with [`Notify::notify_waiters`] each time the watermark of a
+    /// stream ([`Self::last`]) advances: from `add`, `append`,
+    /// `add_for_stream_id`, `put_if_absent_for_stream_id`, and from
+    /// `put_if_absent_contiguous_for_stream_id` when the contiguous prefix
+    /// grows. A write beyond a gap, which leaves the watermark where it was,
+    /// does not signal.
+    ///
+    /// No permit is stored. A consumer creates its `notified()` future (and
+    /// may `enable()` it) before it reads the watermarks, so that an advance
+    /// made while it works wakes its next wait.
+    pub fn publication_notify(&self) -> &Notify {
+        &self.published
     }
 
     pub fn take_new_playlists_rx(&self) -> Option<mpsc::UnboundedReceiver<(u64, usize)>> {
@@ -727,7 +745,10 @@ impl ChunkCache {
                 return;
             }
             match last.compare_exchange_weak(current, id, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return,
+                Ok(_) => {
+                    self.published.notify_waiters();
+                    return;
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -789,7 +810,10 @@ impl ChunkCache {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    self.published.notify_waiters();
+                    return;
+                }
                 Err(_) => continue,
             }
         }
@@ -1864,5 +1888,126 @@ mod tests {
             cache.get_for_stream_id(63, 5).await.unwrap().0,
             Bytes::from_static(b"object-5")
         );
+    }
+
+    /// Whether the publication notification has fired since `notified` was
+    /// created.
+    fn fired(notified: &mut std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>) -> bool {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        matches!(notified.as_mut().poll(&mut context), Poll::Ready(()))
+    }
+
+    #[tokio::test]
+    async fn an_advancing_watermark_signals_publication() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            ..Options::default()
+        });
+
+        // add_for_stream_id advances the watermark.
+        let notified = cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        assert!(!fired(&mut notified));
+        cache
+            .add_for_stream_id(5, 0, Bytes::from_static(b"part-0"))
+            .await
+            .unwrap();
+        assert!(fired(&mut notified));
+
+        // Rewriting an older slot leaves the watermark where it is.
+        cache
+            .add_for_stream_id(5, 1, Bytes::from_static(b"part-1"))
+            .await
+            .unwrap();
+        let notified = cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cache
+            .add_for_stream_id(5, 0, Bytes::from_static(b"part-0-again"))
+            .await
+            .unwrap();
+        assert!(!fired(&mut notified));
+
+        // put_if_absent_for_stream_id signals a new part, not a repeat.
+        cache
+            .put_if_absent_for_stream_id(5, 2, Bytes::from_static(b"part-2"))
+            .await
+            .unwrap();
+        let notified = cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cache
+            .put_if_absent_for_stream_id(5, 2, Bytes::from_static(b"part-2"))
+            .await
+            .unwrap();
+        assert!(!fired(&mut notified));
+    }
+
+    #[tokio::test]
+    async fn a_part_beyond_a_gap_signals_publication_only_when_the_gap_fills() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            ..Options::default()
+        });
+        cache
+            .put_if_absent_contiguous_for_stream_id(9, 0, 0, Bytes::from_static(b"object-0"))
+            .await
+            .unwrap();
+
+        let notified = cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cache
+            .put_if_absent_contiguous_for_stream_id(9, 2, 0, Bytes::from_static(b"object-2"))
+            .await
+            .unwrap();
+        assert!(
+            !fired(&mut notified),
+            "a part beyond a gap is not published"
+        );
+
+        cache
+            .put_if_absent_contiguous_for_stream_id(9, 1, 0, Bytes::from_static(b"object-1"))
+            .await
+            .unwrap();
+        assert!(fired(&mut notified), "filling the gap publishes");
+        let stream_idx = cache.get_stream_idx(9).await.unwrap();
+        assert_eq!(cache.last(stream_idx), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_publication_wakes_a_task_waiting_for_it() {
+        let cache = Arc::new(ChunkCache::new(Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 16,
+            ..Options::default()
+        }));
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            task::spawn(async move {
+                let notified = cache.publication_notify().notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                notified.await;
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cache
+            .append(0, Bytes::from_static(b"appended"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("publication did not wake the waiter")
+            .unwrap();
     }
 }
