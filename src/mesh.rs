@@ -1548,8 +1548,10 @@ struct FecSender {
     encoded_serial: u64,
 }
 
-/// An object (stream and slot) in one symbol size.
-type EncodedKey = (u64, u64, u16);
+/// An object (stream and slot) in one symbol size, and the hash of its
+/// payload. A restarted publication numbers its slots from the start again,
+/// so a slot id alone could name the old payload.
+type EncodedKey = (u64, u64, u16, u64);
 
 /// One object as datagrams: its source symbols, then its repair symbols.
 struct EncodedObject {
@@ -1772,16 +1774,19 @@ impl FecSender {
     /// child is sent. The part is encoded once for all the children that
     /// take the same symbol size, with the repair symbols of the child with
     /// the most loss, and each child receives as many repair symbols as its
-    /// own path needs. The frame is the concatenation of `frame`.
+    /// own path needs. The frame is the concatenation of `frame`; `content`
+    /// is the hash of the payload (the cache's slot hash), so that an
+    /// encoding is reused only for the same bytes.
     fn prepare_object(
         &mut self,
         peer: SocketAddr,
         key: (u64, u64),
+        content: u64,
         frame: &[&[u8]],
     ) -> Result<(ObjectDatagrams, usize), MeshError> {
         let frame_len = frame.iter().map(|piece| piece.len()).sum::<usize>();
         let (symbol_size, repair_symbols) = self.plan(frame_len, self.loss_ppm_to(peer));
-        let encoded_key = (key.0, key.1, symbol_size);
+        let encoded_key = (key.0, key.1, symbol_size, content);
         let reusable = self.encoded.get(&encoded_key).is_some_and(|object| {
             object.packets.count() >= object.packets.source_symbols + repair_symbols as usize
                 && !object.sent_to.contains(&peer)
@@ -1867,9 +1872,10 @@ impl FecSender {
         socket: &UdpSocket,
         peer: SocketAddr,
         key: (u64, u64),
+        content: u64,
         frame: &[u8],
     ) -> Result<u64, MeshError> {
-        let (object, count) = self.prepare_object(peer, key, &[frame])?;
+        let (object, count) = self.prepare_object(peer, key, content, &[frame])?;
         let mut first_sent_us = 0;
         for position in 0..count {
             // Read the clock as the first datagram is handed to the kernel,
@@ -3012,7 +3018,7 @@ async fn sync_task(
     let mut call_times: Vec<(usize, u64)> = Vec::new();
     let mut frame_header: Vec<u8> = Vec::new();
     // The payloads of the stream that the pass is on, by slot.
-    let mut stream_payloads: HashMap<usize, Option<Bytes>> = HashMap::new();
+    let mut stream_payloads: HashMap<usize, Option<(Bytes, u64)>> = HashMap::new();
     // The streams that the cache says advanced, and the stream at each
     // index as the last look found it.
     let moved = cache.subscribe_publications();
@@ -3369,7 +3375,7 @@ async fn sync_task(
                             });
                             continue;
                         }
-                        let Some(payload) =
+                        let Some((payload, hash)) =
                             stream_payload(&cache, &mut stream_payloads, stream_idx, slot_id).await
                         else {
                             continue;
@@ -3384,6 +3390,7 @@ async fn sync_task(
                         match sender.prepare_object(
                             *peer,
                             (stream_id, slot_id as u64),
+                            hash,
                             &[&frame_header, &payload],
                         ) {
                             Ok((object, count)) => {
@@ -3436,7 +3443,7 @@ async fn sync_task(
                         }
                     };
                     match sender
-                        .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
+                        .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
                         .await
                     {
                         Ok(sent_us) => {
@@ -3495,6 +3502,7 @@ async fn sync_task(
                         match sender.prepare_object(
                             *peer,
                             (stream_id, slot_id as u64),
+                            hash,
                             &[&frame_header, &payload],
                         ) {
                             Ok((object, count)) => {
@@ -3533,7 +3541,7 @@ async fn sync_task(
                             }
                         };
                         match sender
-                            .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
+                            .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
                             .await
                         {
                             // A warm-up part is not a live send: the observer
@@ -3585,19 +3593,20 @@ async fn sync_task(
     }
 }
 
-/// The payload of `slot_id` of a stream, read from the cache once for every
-/// child of the pass. `None` for a slot that the cache does not hold.
+/// The payload of `slot_id` of a stream and its hash, read from the cache
+/// once for every child of the pass. `None` for a slot that the cache does
+/// not hold.
 async fn stream_payload(
     cache: &ChunkCache,
-    payloads: &mut HashMap<usize, Option<Bytes>>,
+    payloads: &mut HashMap<usize, Option<(Bytes, u64)>>,
     stream_idx: usize,
     slot_id: usize,
-) -> Option<Bytes> {
+) -> Option<(Bytes, u64)> {
     if let Some(payload) = payloads.get(&slot_id) {
         return payload.clone();
     }
     let payload = match cache.get(stream_idx, slot_id).await {
-        Some((payload, hash)) if hash != 0 || !payload.is_empty() => Some(payload),
+        Some((payload, hash)) if hash != 0 || !payload.is_empty() => Some((payload, hash)),
         _ => None,
     };
     payloads.insert(slot_id, payload.clone());
@@ -4127,6 +4136,35 @@ mod tests {
         assert_eq!(sender.stats.snapshot().tx_repair_datagrams, 2);
         assert_eq!(receiver_stats.snapshot().rx_decoded_objects, 1);
         assert_eq!(receiver_stats.snapshot().rx_repaired_objects, 0);
+    }
+
+    /// A restarted publication numbers its slots from the start again. A
+    /// child that was not sent the old encoding of a slot must get the new
+    /// payload, even when it has the same length; the same payload is still
+    /// encoded once for every child.
+    #[test]
+    fn an_encoding_is_reused_only_for_the_same_payload() {
+        let mut sender = FecSender::new(1, DEFAULT_SYMBOL_SIZE).with_fitted_symbols(true);
+        let [a, b, c]: [SocketAddr; 3] = [
+            "127.0.0.1:9001".parse().unwrap(),
+            "127.0.0.1:9002".parse().unwrap(),
+            "127.0.0.1:9003".parse().unwrap(),
+        ];
+        let old = vec![1_u8; 96];
+        let new = vec![2_u8; 96];
+        let (first, _) = sender
+            .prepare_object(a, (7, 5), xxh3_64(&old), &[&old])
+            .unwrap();
+        let (restarted, _) = sender
+            .prepare_object(b, (7, 5), xxh3_64(&new), &[&new])
+            .unwrap();
+        let symbol = |object: &ObjectDatagrams| object.datagram(0)[HEADER_LEN + 4..].to_vec();
+        assert_eq!(symbol(&first), old);
+        assert_eq!(symbol(&restarted), new);
+        let (shared, _) = sender
+            .prepare_object(c, (7, 5), xxh3_64(&new), &[&new])
+            .unwrap();
+        assert_eq!(shared.wire.as_ptr(), restarted.wire.as_ptr());
     }
 
     #[test]
