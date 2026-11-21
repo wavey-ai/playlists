@@ -58,6 +58,14 @@ const LOSSY_SOURCE_SYMBOLS: usize = 128;
 const ENCODED_OBJECT_CACHE: usize = 1_024;
 const ENCODED_OBJECT_CACHE_BYTES: usize = 6 * 1024 * 1024;
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
+/// Largest object that fitted symbols put in one symbol of its own length.
+/// An edge that cuts a mesh block through to UDP clients (av-mesh
+/// `edge_udp`) forwards each mesh symbol as a whole number of client
+/// symbols of at most 1200 bytes (av-mesh `client_udp::DEFAULT_SYMBOL_SIZE`)
+/// and at least 256: a symbol of 1201 to 1315 bytes often has no such
+/// divisor (1201 is prime), and its part would not be cut through. A
+/// padded 1316-byte symbol always has one (658).
+const FITTED_SYMBOL_MAX: usize = 1_200;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_REPAIR_RATIO: f32 = 0.03;
 const DEFAULT_MAX_REPAIR_SYMBOLS: u32 = 32;
@@ -348,7 +356,8 @@ pub struct CacheMeshConfig {
     /// `symbol_size` (`max_symbol_size` is not used), so that no datagram is
     /// fragmented. Default true.
     pub gso: bool,
-    /// An object smaller than `symbol_size` goes in one symbol of its own
+    /// An object smaller than `symbol_size`, and of at most 1200 bytes (the
+    /// symbol of an edge's UDP cut-through), goes in one symbol of its own
     /// length, not padded to `symbol_size`: a 2.5 ms Opus part is one
     /// datagram of about 100 bytes and one repair datagram of the same size,
     /// not two of 1352. Receivers take the symbol size from each block's
@@ -1638,7 +1647,7 @@ impl FecSender {
     /// Symbol size that keeps an object within about `source_symbols`.
     fn symbol_size_within(&self, frame_len: usize, source_symbols: usize) -> u16 {
         let base = usize::from(self.symbol_size.max(1));
-        if self.fitted_symbols && frame_len < base {
+        if self.fitted_symbols && frame_len < base && frame_len <= FITTED_SYMBOL_MAX {
             return frame_len.max(1) as u16;
         }
         let limit = usize::from(self.max_symbol_size);
@@ -6156,6 +6165,13 @@ mod tests {
         .with_fitted_symbols(true);
         assert_eq!(fitted.symbol_size_for(120), 120);
         assert_eq!(fitted.symbol_size_for(0), 1);
+        assert_eq!(fitted.symbol_size_for(1_200), 1_200);
+        // Above the cut-through client symbol an object is padded, so that
+        // the edge can forward the symbol as two client symbols of 658.
+        for frame_len in [1_201, 1_211, 1_213, 1_217, 1_315] {
+            assert_eq!(fitted.symbol_size_for(frame_len), 1_316, "{frame_len}");
+            assert_eq!(fitted.plan(frame_len, 50_000).0, 1_316, "{frame_len}");
+        }
         assert_eq!(fitted.symbol_size_for(1_316), 1_316);
         assert_eq!(fitted.symbol_size_for(5_000), 1_316);
         // A lossy path plans the same way.
