@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Playlist durations are rendered exactly from microseconds as decimal seconds (up to six decimals, at least three); the delta-update parser reads them exactly.
 - EXT-X-PART lines only for segments within three target durations of the end, and at most `max_parted_segments` when it is set.
 - A part is added to a playlist in constant time; `M3u8Cache` renders and compresses a stream's playlist when it is read, once per new part, instead of storing a gzip snapshot for every part. `M3u8Cache::add_part_us`, `M3u8Cache::last_text`, `Playlists::add_us`, `M3u8Manifest::push_part_us` and `m3u8_manifest::{format_seconds_us, parse_seconds_us}` are new.
+- Cache-mesh send path: `CacheMeshConfig::with_batched_send` (default true) hands the datagrams of a sync pass to the kernel with `sendmmsg`, one batch per child, and `with_gso` (default true) adds UDP GSO for the equal-sized datagrams of an object, keeping symbols within `symbol_size` while GSO is in use. `with_fitted_symbols` (default true) puts an object smaller than `symbol_size` in one symbol of its own length. Encoding keeps the RaptorQ plan of each symbol count, repairs a one-symbol block by byte table, and writes an object's datagrams into one buffer; the datagrams are byte-identical to `DatagramFecEncoder`'s. `ChunkCache::subscribe_publications` tells the sync task which streams advanced, so a publication pass visits only those; remote slots are pruned every 250 ms rather than every tick.
 
 ## [Unreleased] - 2026-06-02
 

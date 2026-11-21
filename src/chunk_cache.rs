@@ -37,6 +37,44 @@ pub struct ExactPartWaiterStats {
     pub capacity: usize,
 }
 
+/// The streams whose watermark advanced since a consumer last looked: one
+/// bit per stream index. See [`ChunkCache::subscribe_publications`].
+pub struct PublishedStreams {
+    words: Vec<AtomicU64>,
+}
+
+impl PublishedStreams {
+    fn new(streams: usize) -> Self {
+        Self {
+            words: (0..streams.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn mark(&self, stream_idx: usize) {
+        if let Some(word) = self.words.get(stream_idx / 64) {
+            word.fetch_or(1 << (stream_idx % 64), Ordering::AcqRel);
+        }
+    }
+
+    /// Append the stream indexes that advanced since the last call, in
+    /// order, and forget them.
+    pub fn drain(&self, out: &mut Vec<usize>) {
+        for (index, word) in self.words.iter().enumerate() {
+            if word.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let mut bits = word.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                out.push(index * 64 + bit);
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StreamInitialization {
     stream_id: u64,
@@ -63,6 +101,8 @@ pub struct ChunkCache {
     /// Signalled whenever the watermark ([`Self::last`]) of any stream
     /// advances. See [`Self::publication_notify`].
     published: Notify,
+    /// Told which stream advanced, before `published` is signalled.
+    publication_sets: StdRwLock<Vec<Weak<PublishedStreams>>>,
     idx: AtomicUsize,
     new_playlist_tx: mpsc::UnboundedSender<(u64, usize)>,
     new_playlist_rx: StdMutex<Option<mpsc::UnboundedReceiver<(u64, usize)>>>,
@@ -113,6 +153,7 @@ impl ChunkCache {
                 .map(|_| StdMutex::new(HashMap::new()))
                 .collect(),
             published: Notify::new(),
+            publication_sets: StdRwLock::new(Vec::new()),
             idx: AtomicUsize::new(0),
             new_playlist_tx,
             new_playlist_rx: StdMutex::new(Some(new_playlist_rx)),
@@ -132,6 +173,38 @@ impl ChunkCache {
     /// made while it works wakes its next wait.
     pub fn publication_notify(&self) -> &Notify {
         &self.published
+    }
+
+    /// A set of the streams whose watermark advances from now on. Each
+    /// advance marks its stream before [`Self::publication_notify`] is
+    /// signalled, so a consumer woken by the signal finds the streams to
+    /// visit without scanning every stream. The set lives as long as the
+    /// consumer holds it.
+    pub fn subscribe_publications(&self) -> Arc<PublishedStreams> {
+        let set = Arc::new(PublishedStreams::new(self.options.num_playlists));
+        let mut sets = self
+            .publication_sets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sets.retain(|set| set.strong_count() > 0);
+        sets.push(Arc::downgrade(&set));
+        set
+    }
+
+    /// Mark `stream_idx` in every publication set and wake the consumers.
+    fn signal_publication(&self, stream_idx: usize) {
+        {
+            let sets = self
+                .publication_sets
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for set in sets.iter() {
+                if let Some(set) = set.upgrade() {
+                    set.mark(stream_idx);
+                }
+            }
+        }
+        self.published.notify_waiters();
     }
 
     pub fn take_new_playlists_rx(&self) -> Option<mpsc::UnboundedReceiver<(u64, usize)>> {
@@ -177,6 +250,11 @@ impl ChunkCache {
     }
 
     pub async fn get_stream_idx(&self, stream_id: u64) -> Option<usize> {
+        self.stream_idx(stream_id)
+    }
+
+    /// The index of a stream, without waiting.
+    pub fn stream_idx(&self, stream_id: u64) -> Option<usize> {
         let lock = self.offsets.read().unwrap();
         lock.get(&stream_id).copied()
     }
@@ -776,7 +854,7 @@ impl ChunkCache {
             }
             match last.compare_exchange_weak(current, id, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    self.published.notify_waiters();
+                    self.signal_publication(stream_idx);
                     return;
                 }
                 Err(observed) => current = observed,
@@ -841,7 +919,7 @@ impl ChunkCache {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.published.notify_waiters();
+                    self.signal_publication(stream_idx);
                     return;
                 }
                 Err(_) => continue,
@@ -2086,5 +2164,62 @@ mod tests {
             .await
             .expect("publication did not wake the waiter")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_publication_set_names_the_streams_that_advanced() {
+        let cache = ChunkCache::new(Options {
+            num_playlists: 70,
+            max_segments: 1,
+            max_parts_per_segment: 8,
+            ..Options::default()
+        });
+        let set = cache.subscribe_publications();
+        let mut moved = Vec::new();
+        set.drain(&mut moved);
+        assert!(moved.is_empty());
+        let mut indexes = Vec::new();
+        for stream_id in 0..70_u64 {
+            indexes.push(cache.add_stream_id(stream_id).await);
+        }
+        cache
+            .add_for_stream_id(3, 0, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        cache
+            .add_for_stream_id(68, 0, Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+        // A write beyond a gap leaves the watermark where it was.
+        cache
+            .put_if_absent_contiguous_for_stream_id(5, 3, 0, Bytes::from_static(b"c"))
+            .await
+            .unwrap();
+        set.drain(&mut moved);
+        let mut expected = vec![indexes[3], indexes[68]];
+        expected.sort_unstable();
+        assert_eq!(moved, expected);
+        moved.clear();
+        set.drain(&mut moved);
+        assert!(moved.is_empty(), "drained twice");
+
+        // A second consumer has its own set, and a dropped set is forgotten.
+        let other = cache.subscribe_publications();
+        drop(set);
+        cache
+            .add_for_stream_id(3, 1, Bytes::from_static(b"d"))
+            .await
+            .unwrap();
+        other.drain(&mut moved);
+        assert_eq!(moved, vec![indexes[3]]);
+        let live = cache
+            .publication_sets
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|set| set.strong_count() > 0)
+            .count();
+        assert_eq!(live, 1);
+        assert_eq!(cache.stream_idx(68), Some(indexes[68]));
     }
 }

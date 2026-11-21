@@ -9,13 +9,15 @@ readme = "README.md"
 
 [features]
 default = []
-mesh = ["dep:raptorq-datagram-fec", "dep:socket2"]
+mesh = ["dep:raptorq-datagram-fec", "dep:raptorq", "dep:socket2", "dep:libc"]
 
 [dependencies]
 bytes = "1.6.0"
 chrono = "0.4.38"
 flate2 = "1.0.28"
 raptorq-datagram-fec = { version = "0.1.6", optional = true }
+raptorq = { version = "2.0.1", optional = true }
+libc = { version = "0.2", optional = true }
 socket2 = { version = "0.6", optional = true }
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
 tls-helpers = "0.2.0"

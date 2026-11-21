@@ -327,6 +327,7 @@ dependencies = [
  "chrono",
  "flate2",
  "libc",
+ "raptorq",
  "raptorq-datagram-fec",
  "serde",
  "serde_json",

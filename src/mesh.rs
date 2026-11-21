@@ -1,8 +1,10 @@
 use crate::chunk_cache::ChunkCache;
+use crate::mesh_send::{call_time, BatchSender, Message, ObjectDatagrams, ObjectEncoder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+#[cfg(test)]
+use raptorq_datagram_fec::DatagramFecEncoder;
 use raptorq_datagram_fec::{
-    source_symbol_count, DatagramFecDecoder, DatagramFecEncoder, DatagramFecError,
-    DatagramFecHeader, HEADER_LEN,
+    source_symbol_count, DatagramFecDecoder, DatagramFecError, DatagramFecHeader, HEADER_LEN,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -50,7 +52,10 @@ const ADAPTIVE_SOURCE_SYMBOLS: usize = 64;
 const LOSSY_SOURCE_SYMBOLS: usize = 128;
 /// Encoded objects that a sender keeps, so that the children of a node get
 /// one encoding of a part and not one each.
-const ENCODED_OBJECT_CACHE: usize = 24;
+/// Encoded objects kept so that every child of a pass, and a child reached on
+/// a later tick, shares one encoding of a part. At 4,000 parts per second a
+/// sync interval holds about 80 of them per stream.
+const ENCODED_OBJECT_CACHE: usize = 1_024;
 const ENCODED_OBJECT_CACHE_BYTES: usize = 6 * 1024 * 1024;
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
@@ -332,6 +337,23 @@ pub struct CacheMeshConfig {
     send_observer: SendObserverSlot,
     /// Told of every received datagram and decoded block.
     receive_observer: ReceiveObserverSlot,
+    /// Hand the datagrams of a sync pass to the kernel in batches, one
+    /// `sendmmsg` call for up to 64 messages to a child (Linux; one call
+    /// for each datagram elsewhere). False sends each datagram with its own
+    /// awaited call, as before. Default true.
+    pub batched_send: bool,
+    /// With batched sends, let the kernel cut the equal-sized datagrams of
+    /// an object from one buffer (UDP generic segmentation offload), where
+    /// the kernel has it. While it is in use, symbols do not grow past
+    /// `symbol_size` (`max_symbol_size` is not used), so that no datagram is
+    /// fragmented. Default true.
+    pub gso: bool,
+    /// An object smaller than `symbol_size` goes in one symbol of its own
+    /// length, not padded to `symbol_size`: a 2.5 ms Opus part is one
+    /// datagram of about 100 bytes and one repair datagram of the same size,
+    /// not two of 1352. Receivers take the symbol size from each block's
+    /// header. False pads every object to `symbol_size`. Default true.
+    pub fitted_symbols: bool,
 }
 
 impl CacheMeshConfig {
@@ -367,6 +389,9 @@ impl CacheMeshConfig {
             block_id_offset: 0,
             send_observer: SendObserverSlot(None),
             receive_observer: ReceiveObserverSlot(None),
+            batched_send: true,
+            gso: true,
+            fitted_symbols: true,
         }
     }
 
@@ -465,6 +490,27 @@ impl CacheMeshConfig {
     /// task hands the first datagram of a part to the kernel for a child.
     pub fn with_send_observer(mut self, observer: CacheMeshSendObserver) -> Self {
         self.send_observer = SendObserverSlot(Some(observer));
+        self
+    }
+
+    /// Whether a sync pass hands its datagrams to the kernel in batches
+    /// (true, the default) or one awaited call per datagram (false).
+    pub fn with_batched_send(mut self, batched_send: bool) -> Self {
+        self.batched_send = batched_send;
+        self
+    }
+
+    /// Whether batched sends use UDP generic segmentation offload where the
+    /// kernel has it (true, the default).
+    pub fn with_gso(mut self, gso: bool) -> Self {
+        self.gso = gso;
+        self
+    }
+
+    /// Whether an object smaller than `symbol_size` goes in one symbol of its
+    /// own length (true, the default) or is padded to `symbol_size` (false).
+    pub fn with_fitted_symbols(mut self, fitted_symbols: bool) -> Self {
+        self.fitted_symbols = fitted_symbols;
         self
     }
 
@@ -1483,27 +1529,33 @@ fn read_string(buf: &mut &[u8]) -> Result<String, MeshError> {
 }
 
 struct FecSender {
-    encoder: DatagramFecEncoder,
+    encoder: ObjectEncoder,
     min_repair_symbols: u32,
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
     max_symbol_size: u16,
+    /// An object smaller than a symbol is one symbol of its own length.
+    fitted_symbols: bool,
     stats: Arc<CacheMeshFecCounters>,
     /// Loss that the peers report on the paths from this node.
     link_loss: Option<LinkLossTable>,
-    /// The newest encoded objects, by object key and symbol size.
-    encoded: VecDeque<EncodedObject>,
+    /// The newest encoded objects, by object key and symbol size, and the
+    /// order in which they were encoded.
+    encoded: HashMap<EncodedKey, EncodedObject>,
+    encoded_order: VecDeque<(EncodedKey, u64)>,
     encoded_bytes: usize,
+    encoded_serial: u64,
 }
+
+/// An object (stream and slot) in one symbol size.
+type EncodedKey = (u64, u64, u16);
 
 /// One object as datagrams: its source symbols, then its repair symbols.
 struct EncodedObject {
-    key: (u64, u64),
-    symbol_size: u16,
-    source_symbols: usize,
-    packets: Vec<Bytes>,
-    bytes: usize,
+    packets: ObjectDatagrams,
+    /// Which encoding of the key this is, in `encoded_order`.
+    serial: u64,
     /// Children that have been sent this encoding. A receiver ignores a
     /// block that it has decoded, so a part that is sent to a child again
     /// needs a new encoding.
@@ -1570,6 +1622,11 @@ impl FecSender {
         self
     }
 
+    fn with_fitted_symbols(mut self, fitted_symbols: bool) -> Self {
+        self.fitted_symbols = fitted_symbols;
+        self
+    }
+
     /// Symbol size for one object: the configured size, or a multiple of it
     /// that keeps a large object within about 64 source symbols.
     fn symbol_size_for(&self, frame_len: usize) -> u16 {
@@ -1579,6 +1636,9 @@ impl FecSender {
     /// Symbol size that keeps an object within about `source_symbols`.
     fn symbol_size_within(&self, frame_len: usize, source_symbols: usize) -> u16 {
         let base = usize::from(self.symbol_size.max(1));
+        if self.fitted_symbols && frame_len < base {
+            return frame_len.max(1) as u16;
+        }
         let limit = usize::from(self.max_symbol_size);
         if limit <= base || frame_len <= base * source_symbols {
             return self.symbol_size;
@@ -1605,6 +1665,7 @@ impl FecSender {
             stats,
         )
         .with_max_symbol_size(config.max_symbol_size)
+        .with_fitted_symbols(config.fitted_symbols)
     }
 
     fn with_policy_and_initial_block_id(
@@ -1616,10 +1677,7 @@ impl FecSender {
         stats: Arc<CacheMeshFecCounters>,
     ) -> Self {
         let max_repair_symbols = max_repair_symbols.max(min_repair_symbols);
-        let encoder = DatagramFecEncoder::new()
-            .with_repair_symbols(min_repair_symbols)
-            .with_symbol_size(symbol_size)
-            .with_initial_block_id(initial_block_id);
+        let encoder = ObjectEncoder::new(initial_block_id);
         Self {
             encoder,
             min_repair_symbols,
@@ -1627,10 +1685,13 @@ impl FecSender {
             max_repair_symbols,
             symbol_size: symbol_size.max(1),
             max_symbol_size: 0,
+            fitted_symbols: false,
             stats,
             link_loss: None,
-            encoded: VecDeque::new(),
+            encoded: HashMap::new(),
+            encoded_order: VecDeque::new(),
             encoded_bytes: 0,
+            encoded_serial: 0,
         }
     }
 
@@ -1707,10 +1768,97 @@ impl FecSender {
             .unwrap_or(0)
     }
 
-    /// Send one stored part to a child. The part is encoded once for all the
-    /// children that take the same symbol size, with the repair symbols of
-    /// the child with the most loss, and each child receives as many repair
-    /// symbols as its own path needs.
+    /// The datagrams of one stored part for a child, and how many of them the
+    /// child is sent. The part is encoded once for all the children that
+    /// take the same symbol size, with the repair symbols of the child with
+    /// the most loss, and each child receives as many repair symbols as its
+    /// own path needs. The frame is the concatenation of `frame`.
+    fn prepare_object(
+        &mut self,
+        peer: SocketAddr,
+        key: (u64, u64),
+        frame: &[&[u8]],
+    ) -> Result<(ObjectDatagrams, usize), MeshError> {
+        let frame_len = frame.iter().map(|piece| piece.len()).sum::<usize>();
+        let (symbol_size, repair_symbols) = self.plan(frame_len, self.loss_ppm_to(peer));
+        let encoded_key = (key.0, key.1, symbol_size);
+        let reusable = self.encoded.get(&encoded_key).is_some_and(|object| {
+            object.packets.count() >= object.packets.source_symbols + repair_symbols as usize
+                && !object.sent_to.contains(&peer)
+        });
+        if !reusable {
+            let (_, worst) = self.plan(frame_len, self.worst_loss_ppm());
+            let repair = repair_symbols.max(worst);
+            let packets = match self.encoder.encode(frame, symbol_size, repair) {
+                Ok(packets) => packets,
+                Err(err) => {
+                    self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(err.into());
+                }
+            };
+            self.stats.tx_objects.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .tx_protected_bytes
+                .fetch_add(frame_len as u64, Ordering::Relaxed);
+            self.encoded_serial += 1;
+            let serial = self.encoded_serial;
+            self.encoded_bytes += packets.wire.len();
+            // An older encoding of the same part with less repair is of no
+            // more use.
+            if let Some(old) = self.encoded.insert(
+                encoded_key,
+                EncodedObject {
+                    packets,
+                    serial,
+                    sent_to: Vec::new(),
+                },
+            ) {
+                self.encoded_bytes -= old.packets.wire.len();
+            }
+            self.encoded_order.push_back((encoded_key, serial));
+            while self.encoded.len() > ENCODED_OBJECT_CACHE
+                || (self.encoded_bytes > ENCODED_OBJECT_CACHE_BYTES && self.encoded.len() > 1)
+                || self.encoded_order.len() > 2 * ENCODED_OBJECT_CACHE
+            {
+                let Some((old_key, old_serial)) = self.encoded_order.pop_front() else {
+                    break;
+                };
+                if self
+                    .encoded
+                    .get(&old_key)
+                    .is_some_and(|object| object.serial == old_serial)
+                {
+                    if let Some(old) = self.encoded.remove(&old_key) {
+                        self.encoded_bytes -= old.packets.wire.len();
+                    }
+                }
+            }
+        }
+        let Some(object) = self.encoded.get_mut(&encoded_key) else {
+            return Err(MeshError::InvalidFrame("encoded object evicted"));
+        };
+        object.sent_to.push(peer);
+        let count =
+            (object.packets.source_symbols + repair_symbols as usize).min(object.packets.count());
+        Ok((object.packets.clone(), count))
+    }
+
+    /// Count `count` datagrams of `object` as sent.
+    fn count_sent(&self, object: &ObjectDatagrams, count: usize) {
+        let source = count.min(object.source_symbols) as u64;
+        self.stats
+            .tx_source_datagrams
+            .fetch_add(source, Ordering::Relaxed);
+        self.stats
+            .tx_repair_datagrams
+            .fetch_add(count as u64 - source, Ordering::Relaxed);
+        self.stats
+            .tx_wire_bytes
+            .fetch_add((count * object.datagram_len) as u64, Ordering::Relaxed);
+    }
+
+    /// Send one stored part to a child, a datagram at a time (see
+    /// [`Self::prepare_object`]).
     ///
     /// Returns when the first datagram was handed to the kernel, in wall-clock
     /// microseconds since the Unix epoch.
@@ -1721,89 +1869,21 @@ impl FecSender {
         key: (u64, u64),
         frame: &[u8],
     ) -> Result<u64, MeshError> {
-        let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
-        let cached = self.encoded.iter().position(|object| {
-            object.key == key
-                && object.symbol_size == symbol_size
-                && object.packets.len() >= object.source_symbols + repair_symbols as usize
-                && !object.sent_to.contains(&peer)
-        });
-        let index = match cached {
-            Some(index) => index,
-            None => {
-                let (_, worst) = self.plan(frame.len(), self.worst_loss_ppm());
-                let repair = repair_symbols.max(worst);
-                self.encoder.set_symbol_size(symbol_size);
-                let packets = match self
-                    .encoder
-                    .encode_object_with_repair_symbols(frame, repair)
-                {
-                    Ok(packets) => packets.into_iter().map(Bytes::from).collect::<Vec<_>>(),
-                    Err(err) => {
-                        self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(err.into());
-                    }
-                };
-                self.stats.tx_objects.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .tx_protected_bytes
-                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
-                let bytes = packets.iter().map(Bytes::len).sum::<usize>();
-                // An older encoding of the same part with less repair is of
-                // no more use.
-                self.encoded
-                    .retain(|object| object.key != key || object.symbol_size != symbol_size);
-                self.encoded_bytes = self.encoded.iter().map(|object| object.bytes).sum();
-                self.encoded.push_back(EncodedObject {
-                    key,
-                    symbol_size,
-                    source_symbols: usize::from(source_symbol_count(frame.len(), symbol_size)),
-                    packets,
-                    bytes,
-                    sent_to: Vec::new(),
-                });
-                self.encoded_bytes += bytes;
-                while self.encoded.len() > ENCODED_OBJECT_CACHE
-                    || (self.encoded_bytes > ENCODED_OBJECT_CACHE_BYTES && self.encoded.len() > 1)
-                {
-                    if let Some(old) = self.encoded.pop_front() {
-                        self.encoded_bytes -= old.bytes;
-                    }
-                }
-                self.encoded.len() - 1
-            }
-        };
-        self.encoded[index].sent_to.push(peer);
-        let object = &self.encoded[index];
-        let source_symbols = object.source_symbols;
-        let count = (source_symbols + repair_symbols as usize).min(object.packets.len());
+        let (object, count) = self.prepare_object(peer, key, &[frame])?;
         let mut first_sent_us = 0;
-        for (position, packet) in object.packets[..count].iter().enumerate() {
+        for position in 0..count {
             // Read the clock as the first datagram is handed to the kernel,
             // so that the time cannot be later than its arrival at the child.
             if position == 0 {
                 first_sent_us = unix_micros();
             }
-            let sent = match socket.send_to(packet, peer).await {
-                Ok(sent) => sent,
-                Err(err) => {
-                    self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(err.into());
-                }
-            };
-            if position < source_symbols {
-                self.stats
-                    .tx_source_datagrams
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.stats
-                    .tx_repair_datagrams
-                    .fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = socket.send_to(&object.datagram(position), peer).await {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                self.count_sent(&object, position);
+                return Err(err.into());
             }
-            self.stats
-                .tx_wire_bytes
-                .fetch_add(sent as u64, Ordering::Relaxed);
         }
+        self.count_sent(&object, count);
         Ok(first_sent_us)
     }
 
@@ -1822,13 +1902,8 @@ impl FecSender {
         frame: &[u8],
     ) -> Result<(), MeshError> {
         let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
-        self.encoder.set_symbol_size(symbol_size);
-        let source_symbols = usize::from(source_symbol_count(frame.len(), symbol_size));
-        let packets = match self
-            .encoder
-            .encode_object_with_repair_symbols(frame, repair_symbols)
-        {
-            Ok(packets) => packets,
+        let object = match self.encoder.encode(&[frame], symbol_size, repair_symbols) {
+            Ok(object) => object,
             Err(err) => {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 return Err(err.into());
@@ -1839,27 +1914,14 @@ impl FecSender {
             .tx_protected_bytes
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
 
-        for (index, packet) in packets.into_iter().enumerate() {
-            let sent = match socket.send_to(&packet, peer).await {
-                Ok(sent) => sent,
-                Err(err) => {
-                    self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(err.into());
-                }
-            };
-            if index < source_symbols {
-                self.stats
-                    .tx_source_datagrams
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.stats
-                    .tx_repair_datagrams
-                    .fetch_add(1, Ordering::Relaxed);
+        for index in 0..object.count() {
+            if let Err(err) = socket.send_to(&object.datagram(index), peer).await {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                self.count_sent(&object, index);
+                return Err(err.into());
             }
-            self.stats
-                .tx_wire_bytes
-                .fetch_add(sent as u64, Ordering::Relaxed);
         }
+        self.count_sent(&object, object.count());
 
         Ok(())
     }
@@ -2865,6 +2927,54 @@ async fn forget_unretained_remote_slots(
     });
 }
 
+/// A chunk frame without its payload: the payload follows it.
+fn chunk_frame_header(
+    out: &mut Vec<u8>,
+    node_id: &str,
+    stream_id: u64,
+    slot_id: u64,
+    payload_len: usize,
+) {
+    out.clear();
+    out.extend_from_slice(FRAME_MAGIC);
+    out.push(FRAME_VERSION);
+    out.push(FRAME_CHUNK);
+    out.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(node_id.as_bytes());
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.extend_from_slice(&slot_id.to_be_bytes());
+    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
+}
+
+/// A part queued for a child in a batched pass.
+struct QueuedPart {
+    stream_id: u64,
+    stream_idx: usize,
+    slot_id: usize,
+    /// Its messages are `first_message..end_message` of the child's batch;
+    /// none for a part that the child is not sent (it came from a peer).
+    first_message: usize,
+    end_message: usize,
+    /// The send observer is told of it.
+    live: bool,
+    /// A warm-up part: it moves no cursor.
+    warm_up: bool,
+    object: Option<(ObjectDatagrams, usize)>,
+}
+
+/// What a batched pass sends one child.
+#[derive(Default)]
+struct ChildBatch {
+    messages: Vec<Message>,
+    parts: Vec<QueuedPart>,
+}
+
+impl ChildBatch {
+    fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
 async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
@@ -2889,6 +2999,26 @@ async fn sync_task(
         stats,
     )
     .with_link_loss(link_loss);
+    let batched = config.batched_send;
+    let mut batch_sender = BatchSender::new(&socket, batched && config.gso);
+    if batch_sender.gso() {
+        // The kernel cuts an object into datagrams that fit a packet: keep
+        // every symbol within one packet rather than fragment large ones.
+        sender = sender.with_max_symbol_size(0);
+    }
+    // The children's batches of a pass, kept from pass to pass for their
+    // capacity.
+    let mut batches: HashMap<SocketAddr, ChildBatch> = HashMap::new();
+    let mut call_times: Vec<(usize, u64)> = Vec::new();
+    let mut frame_header: Vec<u8> = Vec::new();
+    // The payloads of the stream that the pass is on, by slot.
+    let mut stream_payloads: HashMap<usize, Option<Bytes>> = HashMap::new();
+    // The streams that the cache says advanced, and the stream at each
+    // index as the last look found it.
+    let moved = cache.subscribe_publications();
+    let mut moved_idxs: Vec<usize> = Vec::new();
+    let mut stream_at: HashMap<usize, u64> = HashMap::new();
+    let mut pass_streams: Vec<(u64, usize)> = Vec::new();
     let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
     let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
     // Demand replication state: the leases the last tick saw, the warm-up
@@ -3036,12 +3166,52 @@ async fn sync_task(
             continue;
         }
 
-        let stream_ids = cache.stream_ids().await;
+        // The streams of the pass: every stream on a tick, and on a
+        // publication only those that the cache marked as advanced.
+        moved_idxs.clear();
+        moved.drain(&mut moved_idxs);
         if tick {
-            forget_unretained_remote_slots(&cache, &remote_slots).await;
+            let stream_ids = cache.stream_ids().await;
+            if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
+                last_remote_slot_prune = Instant::now();
+                forget_unretained_remote_slots(&cache, &remote_slots).await;
+            }
             seen_last.retain_streams(&stream_ids);
+            stream_at.clear();
+            stream_at.extend(stream_ids.iter().map(|(stream_id, idx)| (*idx, *stream_id)));
+            pass_streams = stream_ids;
+        } else {
+            if moved_idxs.is_empty() {
+                continue;
+            }
+            let current = |stream_at: &HashMap<usize, u64>, idx: &usize| {
+                stream_at
+                    .get(idx)
+                    .filter(|stream_id| cache.stream_idx(**stream_id) == Some(*idx))
+                    .copied()
+            };
+            if moved_idxs
+                .iter()
+                .any(|idx| current(&stream_at, idx).is_none())
+            {
+                // A stream that is new since the last look.
+                stream_at.clear();
+                stream_at.extend(
+                    cache
+                        .stream_ids()
+                        .await
+                        .into_iter()
+                        .map(|(stream_id, idx)| (idx, stream_id)),
+                );
+            }
+            pass_streams.clear();
+            pass_streams.extend(
+                moved_idxs
+                    .iter()
+                    .filter_map(|idx| current(&stream_at, idx).map(|stream_id| (stream_id, *idx))),
+            );
         }
-        'streams: for (stream_id, stream_idx) in stream_ids {
+        'streams: for &(stream_id, stream_idx) in &pass_streams {
             let last = cache.last(stream_idx);
             let previous = seen_last.record(stream_id, stream_idx, last);
             // A publication woke this pass: only a stream whose watermark
@@ -3075,6 +3245,20 @@ async fn sync_task(
                         .is_some_and(|sent| same_bytes(sent, &initialization))
                     {
                         continue;
+                    }
+                    if batched {
+                        // The parts queued before it must not overtake it.
+                        flush_child(
+                            &socket,
+                            &mut sender,
+                            &mut batch_sender,
+                            *peer,
+                            batches.get_mut(peer),
+                            &mut call_times,
+                            &mut sent,
+                            &config,
+                        )
+                        .await;
                     }
                     let frame = match &mut frame {
                         Some(frame) => frame,
@@ -3112,6 +3296,7 @@ async fn sync_task(
                 _ => 0,
             };
             let retained_start = cache.retained_start(last);
+            stream_payloads.clear();
             for peer in &stream_children {
                 if let Some((from_slot, backfill_parts)) = pending_open.remove(&(*peer, stream_id))
                 {
@@ -3153,6 +3338,75 @@ async fn sync_task(
                 } else {
                     published_from.max(next)
                 };
+
+                if batched {
+                    // The slots of the range that came from a peer, read
+                    // under one lock.
+                    let from_peers = if config.role != CacheMeshRole::Distributor {
+                        let remote = remote_slots.read().await;
+                        if remote.is_empty() {
+                            Vec::new()
+                        } else {
+                            (next..=last)
+                                .filter(|slot_id| remote.contains(&(stream_id, *slot_id)))
+                                .collect()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let batch = batches.entry(*peer).or_default();
+                    for slot_id in next..=last {
+                        if from_peers.binary_search(&slot_id).is_ok() {
+                            batch.parts.push(QueuedPart {
+                                stream_id,
+                                stream_idx,
+                                slot_id,
+                                first_message: batch.messages.len(),
+                                end_message: batch.messages.len(),
+                                live: false,
+                                warm_up: false,
+                                object: None,
+                            });
+                            continue;
+                        }
+                        let Some(payload) =
+                            stream_payload(&cache, &mut stream_payloads, stream_idx, slot_id).await
+                        else {
+                            continue;
+                        };
+                        chunk_frame_header(
+                            &mut frame_header,
+                            &config.node_id,
+                            stream_id,
+                            slot_id as u64,
+                            payload.len(),
+                        );
+                        match sender.prepare_object(
+                            *peer,
+                            (stream_id, slot_id as u64),
+                            &[&frame_header, &payload],
+                        ) {
+                            Ok((object, count)) => {
+                                let first_message = batch.messages.len();
+                                batch_sender.push(&mut batch.messages, &object, count);
+                                batch.parts.push(QueuedPart {
+                                    stream_id,
+                                    stream_idx,
+                                    slot_id,
+                                    first_message,
+                                    end_message: batch.messages.len(),
+                                    live: slot_id >= live_from,
+                                    warm_up: false,
+                                    object: Some((object, count)),
+                                });
+                            }
+                            Err(err) => {
+                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 for slot_id in next..=last {
                     if config.role != CacheMeshRole::Distributor
@@ -3229,30 +3483,66 @@ async fn sync_task(
                         continue;
                     }
                     let bytes = payload.len();
-                    let frame = match MeshFrame::chunk(
-                        config.node_id.clone(),
-                        stream_id,
-                        slot_id as u64,
-                        payload,
-                    )
-                    .encode()
-                    {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
-                            continue;
+                    if batched {
+                        // Queued behind the live parts of the pass.
+                        chunk_frame_header(
+                            &mut frame_header,
+                            &config.node_id,
+                            stream_id,
+                            slot_id as u64,
+                            payload.len(),
+                        );
+                        match sender.prepare_object(
+                            *peer,
+                            (stream_id, slot_id as u64),
+                            &[&frame_header, &payload],
+                        ) {
+                            Ok((object, count)) => {
+                                let batch = batches.entry(*peer).or_default();
+                                let first_message = batch.messages.len();
+                                batch_sender.push(&mut batch.messages, &object, count);
+                                batch.parts.push(QueuedPart {
+                                    stream_id,
+                                    stream_idx,
+                                    slot_id,
+                                    first_message,
+                                    end_message: batch.messages.len(),
+                                    live: false,
+                                    warm_up: true,
+                                    object: Some((object, count)),
+                                });
+                            }
+                            Err(err) => {
+                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                                continue;
+                            }
                         }
-                    };
-                    match sender
-                        .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
-                        .await
-                    {
-                        // A warm-up part is not a live send: the observer
-                        // does not see it.
-                        Ok(_) => {}
-                        Err(err) => {
-                            debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
-                            break;
+                    } else {
+                        let frame = match MeshFrame::chunk(
+                            config.node_id.clone(),
+                            stream_id,
+                            slot_id as u64,
+                            payload,
+                        )
+                        .encode()
+                        {
+                            Ok(frame) => frame,
+                            Err(err) => {
+                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                                continue;
+                            }
+                        };
+                        match sender
+                            .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
+                            .await
+                        {
+                            // A warm-up part is not a live send: the observer
+                            // does not see it.
+                            Ok(_) => {}
+                            Err(err) => {
+                                debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
+                                break;
+                            }
                         }
                     }
                     if limited {
@@ -3268,7 +3558,105 @@ async fn sync_task(
                 }
             }
         }
+
+        if batched {
+            // Each child's datagrams of the pass, in as few calls as the
+            // kernel takes them.
+            for (peer, batch) in batches.iter_mut() {
+                if batch.is_empty() {
+                    continue;
+                }
+                flush_child(
+                    &socket,
+                    &mut sender,
+                    &mut batch_sender,
+                    *peer,
+                    Some(batch),
+                    &mut call_times,
+                    &mut sent,
+                    &config,
+                )
+                .await;
+            }
+            if batches.len() > children.len().max(1) * 4 {
+                batches.retain(|peer, _| children.contains(peer));
+            }
+        }
     }
+}
+
+/// The payload of `slot_id` of a stream, read from the cache once for every
+/// child of the pass. `None` for a slot that the cache does not hold.
+async fn stream_payload(
+    cache: &ChunkCache,
+    payloads: &mut HashMap<usize, Option<Bytes>>,
+    stream_idx: usize,
+    slot_id: usize,
+) -> Option<Bytes> {
+    if let Some(payload) = payloads.get(&slot_id) {
+        return payload.clone();
+    }
+    let payload = match cache.get(stream_idx, slot_id).await {
+        Some((payload, hash)) if hash != 0 || !payload.is_empty() => Some(payload),
+        _ => None,
+    };
+    payloads.insert(slot_id, payload.clone());
+    payload
+}
+
+/// Hand a child's queued datagrams to the kernel, then move its cursors and
+/// tell the send observer of each live part, with the time of the call that
+/// carried the part's first datagram. A part whose datagrams did not all
+/// leave moves no cursor, and neither does any part after it.
+#[allow(clippy::too_many_arguments)]
+async fn flush_child(
+    socket: &UdpSocket,
+    sender: &mut FecSender,
+    batch_sender: &mut BatchSender,
+    peer: SocketAddr,
+    batch: Option<&mut ChildBatch>,
+    call_times: &mut Vec<(usize, u64)>,
+    sent: &mut HashMap<(u64, usize, SocketAddr), usize>,
+    config: &CacheMeshConfig,
+) {
+    let Some(batch) = batch else {
+        return;
+    };
+    if batch.is_empty() {
+        return;
+    }
+    call_times.clear();
+    let (delivered, error) = batch_sender
+        .send(socket, peer, &batch.messages, call_times)
+        .await;
+    for part in &batch.parts {
+        if part.end_message > delivered {
+            break;
+        }
+        if let Some((object, count)) = &part.object {
+            sender.count_sent(object, *count);
+        }
+        if part.warm_up {
+            continue;
+        }
+        sent.insert((part.stream_id, part.stream_idx, peer), part.slot_id);
+        if part.live && part.end_message > part.first_message {
+            if let Some(observer) = &config.send_observer.0 {
+                observer(
+                    part.stream_id,
+                    part.slot_id as u64,
+                    peer,
+                    call_time(call_times, part.first_message),
+                );
+            }
+        }
+    }
+    if let Some(err) = error {
+        sender.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+        debug!(peer = %peer, error = %err, "cache mesh batched send failed");
+    }
+    batch.messages.clear();
+    batch.parts.clear();
 }
 
 #[cfg(test)]
@@ -4936,6 +5324,7 @@ mod tests {
     /// observer saw.
     async fn commit_to_apply(
         sync_on_publish: bool,
+        batched_send: bool,
         parts: usize,
     ) -> (
         Vec<Duration>,
@@ -4964,6 +5353,7 @@ mod tests {
                 .with_announce_interval(Duration::from_millis(100))
                 .with_sync_interval(Duration::from_millis(50))
                 .with_sync_on_publish(sync_on_publish)
+                .with_batched_send(batched_send)
                 .with_send_observer(observer),
         )
         .start()
@@ -5027,7 +5417,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_committed_part_leaves_at_once_when_sync_on_publish() {
         let (mut latencies, applied, sent, distributor_addr, edge_addr) =
-            commit_to_apply(true, 19).await;
+            commit_to_apply(true, true, 19).await;
         latencies.sort_unstable();
         let median = latencies[latencies.len() / 2];
         assert!(
@@ -5072,7 +5462,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_committed_part_waits_for_the_tick_without_sync_on_publish() {
         let (latencies, applied, _sent, distributor_addr, _edge_addr) =
-            commit_to_apply(false, 3).await;
+            commit_to_apply(false, true, 3).await;
         // Each part is committed just after a tick delivered the one before,
         // so it waits most of the next 50 ms interval.
         assert!(
@@ -5288,5 +5678,508 @@ mod tests {
         assert_eq!((sent[0].0, sent[0].1, sent[0].2), (7, 10, edge_addr));
         distributor.shutdown();
         edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_part_leaves_at_once_without_batched_send() {
+        let (mut latencies, applied, sent, distributor_addr, edge_addr) =
+            commit_to_apply(true, false, 9).await;
+        latencies.sort_unstable();
+        assert!(
+            latencies[latencies.len() / 2] < Duration::from_millis(5),
+            "{latencies:?}"
+        );
+        let sent = lock(&sent).clone();
+        for event in &applied {
+            assert_eq!(event.parent, distributor_addr);
+            let &(_, _, child, sent_us) = sent
+                .iter()
+                .find(|(_, slot_id, _, _)| *slot_id == event.slot_id as u64)
+                .expect("the send observer saw the part");
+            assert_eq!(child, edge_addr);
+            assert!(sent_us <= event.rx_first_us);
+        }
+    }
+
+    #[test]
+    fn batched_send_and_gso_are_on_by_default_and_can_be_turned_off() {
+        let config = CacheMeshConfig::new("node", "uk", "127.0.0.1:9916".parse().unwrap());
+        assert!(config.batched_send);
+        assert!(config.gso);
+        let config = config.with_batched_send(false).with_gso(false);
+        assert!(!config.batched_send);
+        assert!(!config.gso);
+    }
+
+    fn percentile(sorted: &[u64], fraction: f64) -> u64 {
+        let index = ((sorted.len() as f64 * fraction).ceil() as usize).clamp(1, sorted.len()) - 1;
+        sorted[index]
+    }
+
+    /// CPU time of the calling thread in microseconds.
+    fn thread_cpu_us() -> u64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `time` is a valid timespec for the call to fill.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+        time.tv_sec as u64 * 1_000_000 + time.tv_nsec as u64 / 1_000
+    }
+
+    /// What a test child records: when the first datagram of each part
+    /// arrived, by slot.
+    type Arrivals = Arc<StdMutex<HashMap<usize, u64>>>;
+
+    /// A child that is only a socket on its own thread: it reads each
+    /// datagram as it arrives and notes when the first source symbol of each
+    /// part came. It measures the sender alone, with no receive path of its
+    /// own to fall behind.
+    fn raw_child(
+        addr: SocketAddr,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Arrivals, std::thread::JoinHandle<()>) {
+        let arrivals: Arrivals = Arc::default();
+        let socket = std::net::UdpSocket::bind(addr).unwrap();
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 << 20);
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let thread = {
+            let arrivals = Arc::clone(&arrivals);
+            std::thread::spawn(move || {
+                let mut buf = vec![0_u8; 65_536];
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok((len, _)) = socket.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    let at = unix_micros();
+                    let datagram = &buf[..len];
+                    // The first source symbol of a block holds the head of
+                    // the chunk frame.
+                    if len < HEADER_LEN + 4
+                        || DatagramFecHeader::decode(datagram).is_err()
+                        || datagram[HEADER_LEN + 1..HEADER_LEN + 4] != [0, 0, 0]
+                    {
+                        continue;
+                    }
+                    if let Some((_, slot_id)) = chunk_frame_slot(&datagram[HEADER_LEN + 4..]) {
+                        lock(&arrivals).entry(slot_id as usize).or_insert(at);
+                    }
+                }
+            })
+        };
+        (arrivals, thread)
+    }
+
+    /// The children of a throughput run.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Children {
+        /// Two cache-mesh edges on a runtime of four threads; the time is the
+        /// edge's `rx_first_us`.
+        MeshEdges,
+        /// Two sockets that note the arrival of each part (see [`raw_child`]).
+        Sockets,
+    }
+
+    /// A distributor alone on one core (a one-thread runtime on its own OS
+    /// thread) sends to two children, while a publisher thread commits
+    /// `rate` parts of `part_bytes` a second for `seconds` at its cache, each
+    /// at its own deadline. Returns, sorted, the microseconds from each
+    /// part's commit to the arrival of its first datagram at each child, and
+    /// from the commit to the send observer's time; and the parts that a
+    /// child never received.
+    fn publish_to_two_children(
+        children: Children,
+        batched_send: bool,
+        rate: u64,
+        seconds: u64,
+        part_bytes: usize,
+    ) -> (Vec<u64>, Vec<u64>, usize) {
+        // One run at a time: they measure time, and each takes cores.
+        static RUNS: StdMutex<()> = StdMutex::new(());
+        let _run = lock(&RUNS);
+        let parts = (rate * seconds) as usize;
+        let sends: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::default();
+        let options = Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: parts + 64,
+            ..Options::default()
+        };
+        let distributor_addr = loopback_addr();
+        let child_addrs = [loopback_addr(), loopback_addr()];
+        let distributor_cache = Arc::new(ChunkCache::new(options));
+
+        // The children: each one's arrivals by slot.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut arrivals: Vec<Arrivals> = Vec::new();
+        let mut threads = Vec::new();
+        let mut edges = Vec::new();
+        for (index, addr) in child_addrs.into_iter().enumerate() {
+            if children == Children::Sockets {
+                let (child_arrivals, thread) = raw_child(addr, Arc::clone(&stop));
+                arrivals.push(child_arrivals);
+                threads.push(thread);
+                continue;
+            }
+            let child_arrivals: Arrivals = Arc::default();
+            arrivals.push(Arc::clone(&child_arrivals));
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<AppliedSlot>();
+            runtime.spawn(async move {
+                while let Some(event) = applied_rx.recv().await {
+                    lock(&child_arrivals)
+                        .entry(event.slot_id)
+                        .or_insert(event.rx_first_us);
+                }
+            });
+            edges.push(runtime.block_on(async {
+                CacheMesh::new(
+                    Arc::new(ChunkCache::new(options)),
+                    CacheMeshConfig::new(format!("edge-{index}"), "uk", addr)
+                        .with_peer(distributor_addr)
+                        .with_role(CacheMeshRole::Edge)
+                        .with_socket_buffer_bytes(4 << 20)
+                        .with_announce_interval(Duration::from_millis(100))
+                        .with_applied_tx(applied_tx),
+                )
+                .start()
+                .await
+                .unwrap()
+            }));
+        }
+
+        // The distributor.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let distributor = {
+            let cache = Arc::clone(&distributor_cache);
+            let sends = Arc::clone(&sends);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let cpu_start = thread_cpu_us();
+                runtime.block_on(async move {
+                    let mesh = CacheMesh::new(
+                        cache,
+                        CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                            .with_peers(child_addrs)
+                            .with_role(CacheMeshRole::Distributor)
+                            .with_socket_buffer_bytes(4 << 20)
+                            .with_announce_interval(Duration::from_millis(100))
+                            .with_batched_send(batched_send)
+                            .with_send_observer(Arc::new(move |_, slot_id, _, sent_us| {
+                                lock(&sends).push((slot_id, sent_us));
+                            })),
+                    )
+                    .start()
+                    .await
+                    .unwrap();
+                    ready_tx.send(()).unwrap();
+                    let _ = stop_rx.await;
+                    mesh.shutdown();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                });
+                thread_cpu_us() - cpu_start
+            })
+        };
+        ready_rx.recv().unwrap();
+        runtime.block_on(async {
+            for edge in &edges {
+                wait_for_hello(edge, 1).await;
+            }
+            // Slot 0 lines the run up: both children receive parts.
+            distributor_cache
+                .add_for_stream_id(7, 0, Bytes::from(vec![0; part_bytes]))
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(3), async {
+                while !arrivals
+                    .iter()
+                    .all(|arrivals| lock(arrivals).contains_key(&0))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the children did not receive the first part");
+        });
+
+        // The publisher.
+        let publisher = {
+            let cache = Arc::clone(&distributor_cache);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let period = Duration::from_nanos(1_000_000_000 / rate);
+                let payload = Bytes::from(vec![7_u8; part_bytes]);
+                let mut published = vec![0_u64; parts + 1];
+                let start = std::time::Instant::now();
+                for slot in 1..=parts {
+                    let deadline = start + period * slot as u32;
+                    let now = std::time::Instant::now();
+                    if deadline > now + Duration::from_micros(200) {
+                        std::thread::sleep(deadline - now - Duration::from_micros(200));
+                    }
+                    while std::time::Instant::now() < deadline {
+                        std::hint::spin_loop();
+                    }
+                    published[slot] = unix_micros();
+                    runtime
+                        .block_on(cache.add_for_stream_id(7, slot, payload.clone()))
+                        .unwrap();
+                }
+                published
+            })
+        };
+        let published = publisher.join().unwrap();
+
+        // Wait for the last part, or for the stragglers to be lost.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline
+            && !arrivals.iter().all(|arrivals| lock(arrivals).len() > parts)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = stop_tx.send(());
+        let cpu_us = distributor.join().unwrap();
+        eprintln!(
+            "distributor thread CPU {:.1} us per part ({} parts, batched {batched_send})",
+            cpu_us as f64 / parts as f64,
+            parts
+        );
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        runtime.block_on(async {
+            for edge in &edges {
+                edge.shutdown();
+            }
+        });
+
+        let mut latencies = Vec::with_capacity(2 * parts);
+        let mut missing = 0;
+        for arrivals in &arrivals {
+            let arrivals = lock(arrivals);
+            for slot in 1..=parts {
+                match arrivals.get(&slot) {
+                    Some(at) => latencies.push(at.saturating_sub(published[slot])),
+                    None => missing += 1,
+                }
+            }
+        }
+        latencies.sort_unstable();
+        let mut sent = lock(&sends)
+            .iter()
+            .filter(|(slot_id, _)| (1..=parts as u64).contains(slot_id))
+            .map(|(slot_id, sent_us)| sent_us.saturating_sub(published[*slot_id as usize]))
+            .collect::<Vec<_>>();
+        sent.sort_unstable();
+        (latencies, sent, missing)
+    }
+
+    fn report(label: &str, latencies: &[u64], sent: &[u64], missing: usize) -> (u64, u64) {
+        let p50 = percentile(latencies, 0.5);
+        let p99 = percentile(latencies, 0.99);
+        eprintln!(
+            "{label}: publish->child first datagram p50 {p50} us, p99 {p99} us, max {} us, missing {missing}; publish->sent p50 {} us, p99 {} us",
+            latencies.last().unwrap(),
+            percentile(sent, 0.5),
+            percentile(sent, 0.99)
+        );
+        (p50, p99)
+    }
+
+    /// 4,000 parts a second (0.25 ms PCM parts) for two seconds, from a
+    /// distributor on one core to two children over loopback: every part
+    /// arrives, and 99 in 100 within 2 ms of the commit. The children are
+    /// sockets, so that the test measures the sender in any build.
+    #[test]
+    fn a_distributor_on_one_core_sends_four_thousand_parts_a_second() {
+        let (latencies, sent, missing) =
+            publish_to_two_children(Children::Sockets, true, 4_000, 2, 72);
+        let (_, p99) = report("batched, socket children", &latencies, &sent, missing);
+        assert_eq!(missing, 0, "parts did not arrive");
+        assert!(p99 < 2_000, "p99 {p99} us");
+    }
+
+    /// The same with two cache-mesh edges: the edge's `rx_first_us` within
+    /// 2 ms of the commit for 99 parts in 100. The receive path of an
+    /// unoptimised build cannot take 8,000 datagrams a second, so this runs
+    /// in an optimised build (`cargo test --release`).
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "needs an optimised build: cargo test --release"
+    )]
+    fn a_distributor_on_one_core_keeps_two_edges_at_four_thousand_parts_a_second() {
+        let (latencies, sent, missing) =
+            publish_to_two_children(Children::MeshEdges, true, 4_000, 2, 72);
+        let (_, p99) = report("batched, mesh edges", &latencies, &sent, missing);
+        assert_eq!(missing, 0, "parts did not arrive");
+        assert!(p99 < 2_000, "p99 {p99} us");
+    }
+
+    /// Both runs with one awaited send per datagram, for comparison. They are
+    /// reported, not judged: it is the behaviour that batching replaces.
+    #[test]
+    #[ignore = "comparison run: cargo test --release -- --ignored unbatched"]
+    fn unbatched_four_thousand_parts_a_second_for_comparison() {
+        let (latencies, sent, missing) =
+            publish_to_two_children(Children::Sockets, false, 4_000, 2, 72);
+        report("unbatched, socket children", &latencies, &sent, missing);
+        let (latencies, sent, missing) =
+            publish_to_two_children(Children::MeshEdges, false, 4_000, 2, 72);
+        report("unbatched, mesh edges", &latencies, &sent, missing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_gso_a_large_part_keeps_symbols_that_fit_a_packet() {
+        for gso in [true, false] {
+            let distributor_addr = loopback_addr();
+            let edge_addr = loopback_addr();
+            let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+            let distributor = CacheMesh::new(
+                Arc::clone(&distributor_cache),
+                CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                    .with_peer(edge_addr)
+                    .with_role(CacheMeshRole::Distributor)
+                    .with_max_symbol_size(8_100)
+                    .with_announce_interval(Duration::from_millis(100))
+                    .with_gso(gso),
+            )
+            .start()
+            .await
+            .unwrap();
+            let edge_cache = Arc::new(ChunkCache::new(large_part_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                CacheMeshConfig::new("edge", "uk", edge_addr)
+                    .with_peer(distributor_addr)
+                    .with_role(CacheMeshRole::Edge)
+                    .with_socket_buffer_bytes(4 << 20)
+                    .with_announce_interval(Duration::from_millis(100)),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            let gso_active = BatchSender::new(&distributor.socket, gso).gso();
+            let before = distributor.fec_stats();
+            let part = Bytes::from((0..200_000).map(|index| index as u8).collect::<Vec<_>>());
+            distributor_cache
+                .add_for_stream_id(7, 0, part.clone())
+                .await
+                .unwrap();
+            wait_for_slot(&edge_cache, 7, 0).await;
+            assert_eq!(edge_cache.get_for_stream_id(7, 0).await.unwrap().0, part);
+            let after = distributor.fec_stats();
+            let source = after.tx_source_datagrams - before.tx_source_datagrams;
+            let bytes = after.tx_wire_bytes - before.tx_wire_bytes;
+            let datagram = bytes
+                / (after.tx_source_datagrams + after.tx_repair_datagrams
+                    - before.tx_source_datagrams
+                    - before.tx_repair_datagrams);
+            if gso_active {
+                // 1316-byte symbols: no datagram is fragmented.
+                assert!(source >= 152, "{source} source datagrams");
+                assert_eq!(datagram, 1_352);
+            } else {
+                // Symbols grow so that the part is about 64 of them.
+                assert!(source <= 64, "{source} source datagrams");
+                assert!(datagram > 1_500);
+            }
+            assert!(gso_active || !gso || !cfg!(target_os = "linux"));
+            distributor.shutdown();
+            edge.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_small_object_is_one_symbol_of_its_own_length() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let fitted = FecSender::with_policy_and_initial_block_id(
+            1,
+            0.03,
+            32,
+            DEFAULT_SYMBOL_SIZE,
+            0,
+            Arc::clone(&stats),
+        )
+        .with_fitted_symbols(true);
+        assert_eq!(fitted.symbol_size_for(120), 120);
+        assert_eq!(fitted.symbol_size_for(0), 1);
+        assert_eq!(fitted.symbol_size_for(1_316), 1_316);
+        assert_eq!(fitted.symbol_size_for(5_000), 1_316);
+        // A lossy path plans the same way.
+        assert_eq!(fitted.plan(120, 50_000).0, 120);
+        let padded =
+            FecSender::with_policy_and_initial_block_id(1, 0.03, 32, DEFAULT_SYMBOL_SIZE, 0, stats);
+        assert_eq!(padded.symbol_size_for(120), 1_316);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_audio_part_goes_in_datagrams_of_its_own_size() {
+        for fitted in [true, false] {
+            let distributor_addr = loopback_addr();
+            let edge_addr = loopback_addr();
+            let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+            let distributor = CacheMesh::new(
+                Arc::clone(&distributor_cache),
+                CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                    .with_peer(edge_addr)
+                    .with_role(CacheMeshRole::Distributor)
+                    .with_announce_interval(Duration::from_millis(100))
+                    .with_fitted_symbols(fitted),
+            )
+            .start()
+            .await
+            .unwrap();
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                CacheMeshConfig::new("edge", "uk", edge_addr)
+                    .with_peer(distributor_addr)
+                    .with_role(CacheMeshRole::Edge)
+                    .with_announce_interval(Duration::from_millis(100)),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            let before = distributor.fec_stats();
+            // A 2.5 ms Opus part of 40 bytes.
+            let part = Bytes::from(vec![9_u8; 40]);
+            distributor_cache
+                .add_for_stream_id(7, 0, part.clone())
+                .await
+                .unwrap();
+            wait_for_slot(&edge_cache, 7, 0).await;
+            assert_eq!(edge_cache.get_for_stream_id(7, 0).await.unwrap().0, part);
+            let after = distributor.fec_stats();
+            let datagrams = after.tx_source_datagrams + after.tx_repair_datagrams
+                - before.tx_source_datagrams
+                - before.tx_repair_datagrams;
+            let bytes = (after.tx_wire_bytes - before.tx_wire_bytes) / datagrams;
+            // The chunk frame: 12 bytes of head, the node id, 20 bytes of ids
+            // and length, and the part; then the 36 bytes of FEC header.
+            let frame = 12 + "distributor".len() + 20 + part.len();
+            if fitted {
+                assert_eq!(bytes as usize, 36 + frame);
+            } else {
+                assert_eq!(bytes, 1_352);
+            }
+            distributor.shutdown();
+            edge.shutdown();
+        }
     }
 }

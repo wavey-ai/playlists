@@ -105,6 +105,23 @@ multiple packet losses without waiting for demand-triggered backfill. Configure
 the policy through `CacheMeshConfig::{repair_symbols, repair_ratio,
 max_repair_symbols, symbol_size}`.
 
+Send path. A part is encoded once for all children, with the RaptorQ encoding
+plan of its symbol count kept from part to part; a part of one symbol (any audio
+part) is repaired by a byte table, with no RaptorQ encoding. A part smaller than
+`symbol_size` is one symbol of its own length (`with_fitted_symbols`, default
+on): a 2.5 ms Opus part is two datagrams of about 120 bytes, not two of 1352.
+The sync task wakes on the streams that the cache marks as published, not on a
+scan of every stream, and hands each child's datagrams of a pass to the kernel
+with `sendmmsg` (`with_batched_send`, default on; Linux), cutting the
+equal-sized datagrams of an object from one buffer with UDP GSO where the kernel
+has it (`with_gso`, default on). While GSO is in use symbols stay within
+`symbol_size`, so no datagram is fragmented. The tests
+`a_distributor_on_one_core_sends_four_thousand_parts_a_second` (any build) and
+`a_distributor_on_one_core_keeps_two_edges_at_four_thousand_parts_a_second`
+(`cargo test --release`) send 4,000 parts a second for two seconds from a
+distributor on one thread to two children and require every part, and 99 in 100
+within 2 ms of the commit.
+
 `CacheMeshHandle::fec_stats()` returns a lock-free bounded snapshot of transport
 outcomes. It separates:
 

@@ -3,6 +3,8 @@ pub mod m3u8_cache;
 pub mod m3u8_manifest;
 #[cfg(feature = "mesh")]
 pub mod mesh;
+#[cfg(feature = "mesh")]
+mod mesh_send;
 pub mod multivariant;
 pub mod tail_bundle;
 
