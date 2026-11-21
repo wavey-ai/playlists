@@ -25,6 +25,19 @@ const FRAME_REPLICA_REQUEST: u8 = 3;
 const FRAME_INITIALIZATION: u8 = 4;
 const FRAME_SUBSCRIBE: u8 = 5;
 const FRAME_UNSUBSCRIBE: u8 = 6;
+const FRAME_LINK_REPORT: u8 = 7;
+/// Packet loss on the path to a peer below which the configured repair is
+/// enough: 0.05%.
+const LINK_LOSS_FLOOR_PPM: u32 = 500;
+/// A loss report is used for this long after it arrived.
+const LINK_LOSS_TTL: Duration = Duration::from_secs(5);
+/// A receiver measures the loss from each peer over windows of this length.
+const LINK_LOSS_WINDOW: Duration = Duration::from_secs(1);
+/// Chance that an object needs a repair request, which the repair symbols
+/// of a lossy link are chosen for.
+const LINK_LOSS_OBJECT_FAILURE: f64 = 0.001;
+/// Payload of one IP fragment on an Ethernet link.
+const FRAGMENT_PAYLOAD: usize = 1_480;
 const DEFAULT_SUBSCRIPTION_LEASE: Duration = Duration::from_secs(5);
 const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longest burst that the warm-up pacer may send in one sync tick.
@@ -32,6 +45,13 @@ const BACKFILL_BURST: Duration = Duration::from_millis(100);
 /// Source symbols that a large object is divided into when the symbol size
 /// may grow with the object.
 const ADAPTIVE_SOURCE_SYMBOLS: usize = 64;
+/// Source symbols of a large object on a path with loss. Twice as many, so
+/// that a symbol is half as many fragments and half as likely to be lost.
+const LOSSY_SOURCE_SYMBOLS: usize = 128;
+/// Encoded objects that a sender keeps, so that the children of a node get
+/// one encoding of a part and not one each.
+const ENCODED_OBJECT_CACHE: usize = 24;
+const ENCODED_OBJECT_CACHE_BYTES: usize = 6 * 1024 * 1024;
 const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
 const DEFAULT_REPAIR_RATIO: f32 = 0.03;
@@ -332,6 +352,12 @@ type LeaseTable = Arc<StdMutex<HashMap<(SocketAddr, u64), Lease>>>;
 type ServedTable = Arc<StdMutex<Vec<ServedSubscription>>>;
 type PeerSeen = Arc<StdMutex<HashMap<SocketAddr, Instant>>>;
 type WantedStreams = Arc<StdMutex<HashSet<u64>>>;
+/// Packet loss on the path from this node to a peer, in parts per million,
+/// as the peer reported it, and when.
+type LinkLossTable = Arc<StdMutex<HashMap<SocketAddr, (u32, Instant)>>>;
+/// Packet loss on the path from a peer to this node, as this node measures
+/// it.
+type MeasuredLossTable = Arc<StdMutex<HashMap<SocketAddr, u32>>>;
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -503,6 +529,8 @@ impl CacheMesh {
         let served: ServedTable = Arc::new(StdMutex::new(Vec::new()));
         let peer_seen: PeerSeen = Arc::new(StdMutex::new(HashMap::new()));
         let wanted: WantedStreams = Arc::new(StdMutex::new(HashSet::new()));
+        let link_loss: LinkLossTable = Arc::new(StdMutex::new(HashMap::new()));
+        let measured_loss: MeasuredLossTable = Arc::new(StdMutex::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         tokio::spawn(receive_task(
@@ -517,6 +545,8 @@ impl CacheMesh {
                 leases: Arc::clone(&leases),
                 peer_seen: Arc::clone(&peer_seen),
                 wanted: Arc::clone(&wanted),
+                link_loss: Arc::clone(&link_loss),
+                measured_loss: Arc::clone(&measured_loss),
             },
             self.config.clone(),
             shutdown_rx.clone(),
@@ -527,6 +557,8 @@ impl CacheMesh {
             Arc::clone(&peer_regions),
             Arc::clone(&peer_roles),
             Arc::clone(&fec_counters),
+            Arc::clone(&link_loss),
+            Arc::clone(&measured_loss),
             self.config.clone(),
             shutdown_rx.clone(),
         ));
@@ -540,6 +572,7 @@ impl CacheMesh {
             Arc::clone(&fec_counters),
             Arc::clone(&leases),
             Arc::clone(&served),
+            Arc::clone(&link_loss),
             self.config.clone(),
             shutdown_rx,
         ));
@@ -577,6 +610,8 @@ impl CacheMesh {
             served,
             peer_seen,
             wanted,
+            link_loss,
+            measured_loss,
         })
     }
 }
@@ -586,6 +621,8 @@ struct MeshShared {
     leases: LeaseTable,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
+    link_loss: LinkLossTable,
+    measured_loss: MeasuredLossTable,
 }
 
 pub struct CacheMeshHandle {
@@ -612,9 +649,73 @@ pub struct CacheMeshHandle {
     served: ServedTable,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
+    link_loss: LinkLossTable,
+    measured_loss: MeasuredLossTable,
+}
+
+/// Packet loss on the links of this node to one peer, in parts per million.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkLoss {
+    pub peer: SocketAddr,
+    /// Loss from the peer to this node, as this node measures it.
+    pub receive_ppm: Option<u32>,
+    /// Loss from this node to the peer, as the peer reports it.
+    pub send_ppm: Option<u32>,
 }
 
 impl CacheMeshHandle {
+    /// Packet loss on the links to the peers that this node exchanges parts
+    /// with. A node sends more repair symbols, in datagrams that fit one
+    /// packet, to a peer that reports loss.
+    pub fn link_loss(&self) -> Vec<LinkLoss> {
+        let measured = lock(&self.measured_loss).clone();
+        let reported = lock(&self.link_loss).clone();
+        let now = Instant::now();
+        let mut peers = measured
+            .keys()
+            .chain(reported.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        peers.sort_unstable();
+        peers.dedup();
+        peers
+            .into_iter()
+            .map(|peer| LinkLoss {
+                peer,
+                receive_ppm: measured.get(&peer).copied(),
+                send_ppm: reported
+                    .get(&peer)
+                    .filter(|(_, at)| now.duration_since(*at) <= LINK_LOSS_TTL)
+                    .map(|(ppm, _)| *ppm),
+            })
+            .collect()
+    }
+
+    /// Ask the first `parents` parents of a playlist for `count` parts from
+    /// `from_slot`. A node that has a hole asks for the hole and nothing
+    /// else, and asks one parent first.
+    pub async fn request_parts(
+        &self,
+        stream_id: u64,
+        from_slot: usize,
+        count: u32,
+        parents: usize,
+    ) -> Result<usize, MeshError> {
+        let mut peers = self.parents_for(stream_id).await;
+        peers.truncate(parents.max(1));
+        if peers.is_empty() {
+            return Ok(0);
+        }
+        let frame = MeshFrame::ReplicaRequest {
+            node_id: self.node_id.clone(),
+            stream_id,
+            from_slot: from_slot as u64,
+            count,
+        }
+        .encode()?;
+        self.send_control(&peers, &frame).await
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -760,7 +861,8 @@ impl CacheMeshHandle {
             self.symbol_size,
             block_id,
             Arc::clone(&self.fec_counters),
-        );
+        )
+        .with_link_loss(Arc::clone(&self.link_loss));
         let mut sent = 0usize;
         for peer in peers {
             sender.send(&self.socket, *peer, frame).await?;
@@ -834,6 +936,15 @@ enum MeshFrame {
         node_id: String,
         stream_id: u64,
         from_slot: u64,
+        /// Parts wanted from `from_slot`. Zero is every part up to the
+        /// newest one.
+        count: u32,
+    },
+    /// Packet loss that the sender of this frame measures on the path from
+    /// the receiver of the frame, in parts per million.
+    LinkReport {
+        node_id: String,
+        loss_ppm: u32,
     },
     Subscribe {
         node_id: String,
@@ -891,6 +1002,7 @@ impl MeshFrame {
             node_id: node_id.into(),
             stream_id,
             from_slot,
+            count: 0,
         }
     }
 
@@ -908,6 +1020,7 @@ impl MeshFrame {
             | Self::Chunk { node_id, .. }
             | Self::Initialization { node_id, .. }
             | Self::ReplicaRequest { node_id, .. }
+            | Self::LinkReport { node_id, .. }
             | Self::Subscribe { node_id, .. }
             | Self::Unsubscribe { node_id, .. } => node_id,
         }
@@ -986,6 +1099,7 @@ impl MeshFrame {
             Self::ReplicaRequest {
                 stream_id,
                 from_slot,
+                count,
                 ..
             } => {
                 out.put_u8(FRAME_REPLICA_REQUEST);
@@ -993,6 +1107,17 @@ impl MeshFrame {
                 out.put_slice(node_id);
                 out.put_u64(*stream_id);
                 out.put_u64(*from_slot);
+                // A request without a count is the frame of an older node,
+                // which reads exactly 16 bytes here.
+                if *count > 0 {
+                    out.put_u32(*count);
+                }
+            }
+            Self::LinkReport { loss_ppm, .. } => {
+                out.put_u8(FRAME_LINK_REPORT);
+                out.put_u16(node_id.len() as u16);
+                out.put_slice(node_id);
+                out.put_u32(*loss_ppm);
             }
             Self::Subscribe {
                 stream_id,
@@ -1094,15 +1219,30 @@ impl MeshFrame {
                 })
             }
             FRAME_REPLICA_REQUEST => {
-                if buf.remaining() != 16 {
+                if buf.remaining() != 16 && buf.remaining() != 20 {
                     return Err(MeshError::InvalidFrame("replica request header mismatch"));
                 }
                 let stream_id = buf.get_u64();
                 let from_slot = buf.get_u64();
+                let count = if buf.remaining() == 4 {
+                    buf.get_u32()
+                } else {
+                    0
+                };
                 Ok(Self::ReplicaRequest {
                     node_id,
                     stream_id,
                     from_slot,
+                    count,
+                })
+            }
+            FRAME_LINK_REPORT => {
+                if buf.remaining() != 4 {
+                    return Err(MeshError::InvalidFrame("link report header mismatch"));
+                }
+                Ok(Self::LinkReport {
+                    node_id,
+                    loss_ppm: buf.get_u32(),
                 })
             }
             FRAME_INITIALIZATION => {
@@ -1172,6 +1312,54 @@ struct FecSender {
     symbol_size: u16,
     max_symbol_size: u16,
     stats: Arc<CacheMeshFecCounters>,
+    /// Loss that the peers report on the paths from this node.
+    link_loss: Option<LinkLossTable>,
+    /// The newest encoded objects, by object key and symbol size.
+    encoded: VecDeque<EncodedObject>,
+    encoded_bytes: usize,
+}
+
+/// One object as datagrams: its source symbols, then its repair symbols.
+struct EncodedObject {
+    key: (u64, u64),
+    symbol_size: u16,
+    source_symbols: usize,
+    packets: Vec<Bytes>,
+    bytes: usize,
+    /// Children that have been sent this encoding. A receiver ignores a
+    /// block that it has decoded, so a part that is sent to a child again
+    /// needs a new encoding.
+    sent_to: Vec<SocketAddr>,
+}
+
+/// Fragments that a datagram of `bytes` crosses an Ethernet link in.
+fn datagram_fragments(bytes: usize) -> usize {
+    (bytes + 8).div_ceil(FRAGMENT_PAYLOAD).max(1)
+}
+
+/// Fewest repair symbols with which an object of `source_symbols` survives a
+/// link that loses each symbol with probability `symbol_loss`, except once
+/// in `1 / failure` objects.
+fn repair_symbols_for_loss(source_symbols: u32, symbol_loss: f64, failure: f64, limit: u32) -> u32 {
+    let loss = symbol_loss.clamp(0.0, 0.9);
+    if loss <= 0.0 {
+        return 0;
+    }
+    let ratio = loss / (1.0 - loss);
+    for repair in 0..=limit {
+        // The object is lost when more than `repair` of its symbols are.
+        let symbols = f64::from(source_symbols + repair);
+        let mut term = (1.0 - loss).powf(symbols);
+        let mut survives = term;
+        for lost in 0..repair {
+            term *= (symbols - f64::from(lost)) / f64::from(lost + 1) * ratio;
+            survives += term;
+        }
+        if 1.0 - survives <= failure {
+            return repair;
+        }
+    }
+    limit
 }
 
 impl FecSender {
@@ -1207,13 +1395,18 @@ impl FecSender {
     /// Symbol size for one object: the configured size, or a multiple of it
     /// that keeps a large object within about 64 source symbols.
     fn symbol_size_for(&self, frame_len: usize) -> u16 {
+        self.symbol_size_within(frame_len, ADAPTIVE_SOURCE_SYMBOLS)
+    }
+
+    /// Symbol size that keeps an object within about `source_symbols`.
+    fn symbol_size_within(&self, frame_len: usize, source_symbols: usize) -> u16 {
         let base = usize::from(self.symbol_size.max(1));
         let limit = usize::from(self.max_symbol_size);
-        if limit <= base || frame_len <= base * ADAPTIVE_SOURCE_SYMBOLS {
+        if limit <= base || frame_len <= base * source_symbols {
             return self.symbol_size;
         }
         let multiple = frame_len
-            .div_ceil(ADAPTIVE_SOURCE_SYMBOLS)
+            .div_ceil(source_symbols)
             .div_ceil(base)
             .min(limit / base)
             .max(1);
@@ -1257,7 +1450,174 @@ impl FecSender {
             symbol_size: symbol_size.max(1),
             max_symbol_size: 0,
             stats,
+            link_loss: None,
+            encoded: VecDeque::new(),
+            encoded_bytes: 0,
         }
+    }
+
+    fn with_link_loss(mut self, link_loss: LinkLossTable) -> Self {
+        self.link_loss = Some(link_loss);
+        self
+    }
+
+    /// Packet loss that `peer` reports on the path from this node, in parts
+    /// per million. Zero when it has reported none lately.
+    fn loss_ppm_to(&self, peer: SocketAddr) -> u32 {
+        let Some(table) = &self.link_loss else {
+            return 0;
+        };
+        lock(table)
+            .get(&peer)
+            .filter(|(_, at)| at.elapsed() <= LINK_LOSS_TTL)
+            .map_or(0, |(ppm, _)| *ppm)
+    }
+
+    /// Symbol size and repair symbols for one object on a path with the
+    /// given packet loss.
+    ///
+    /// A large object goes in large symbols: fewer datagrams cost a small
+    /// node less CPU, and the network fragments each of them. One lost
+    /// fragment loses the whole symbol, so the loss of a symbol is the loss
+    /// of a packet times its fragments: at 0.5% packet loss a symbol of
+    /// eleven fragments is lost 5% of the time, and an object of 25 such
+    /// symbols with one repair symbol fails four times in ten.
+    ///
+    /// A path with loss therefore gets symbols of half the size, and the
+    /// repair symbols that keep an object from failing more than once in a
+    /// thousand at the loss that its far end measures. The repair is at most
+    /// half of the object: beyond that the path is asked to repeat a part.
+    /// Symbols that fit one packet would need the least repair, and a small
+    /// node cannot send or receive that many datagrams for 4K video.
+    fn plan(&self, frame_len: usize, loss_ppm: u32) -> (u16, u32) {
+        if loss_ppm < LINK_LOSS_FLOOR_PPM {
+            return (
+                self.symbol_size_for(frame_len),
+                self.repair_symbols_for(frame_len),
+            );
+        }
+        let symbol_size = self.symbol_size_within(frame_len, LOSSY_SOURCE_SYMBOLS);
+        let source_symbols = u32::from(source_symbol_count(frame_len, symbol_size));
+        // The measurement is a second old and loss comes in bursts: provide
+        // for one and a half times the reported loss.
+        let packet_loss = (f64::from(loss_ppm) * 1.5 / 1_000_000.0).min(0.5);
+        let fragments = datagram_fragments(usize::from(symbol_size) + HEADER_LEN + 4) as f64;
+        let symbol_loss = 1.0 - (1.0 - packet_loss).powf(fragments);
+        let limit = self
+            .max_repair_symbols
+            .max(source_symbols.div_ceil(2))
+            .min(255);
+        let repair =
+            repair_symbols_for_loss(source_symbols, symbol_loss, LINK_LOSS_OBJECT_FAILURE, limit);
+        let base = (source_symbols as f32 * self.repair_ratio).ceil() as u32;
+        (
+            symbol_size,
+            repair.max(base).max(self.min_repair_symbols).min(limit),
+        )
+    }
+
+    /// The worst loss that a peer reports at the moment.
+    fn worst_loss_ppm(&self) -> u32 {
+        let Some(table) = &self.link_loss else {
+            return 0;
+        };
+        lock(table)
+            .values()
+            .filter(|(_, at)| at.elapsed() <= LINK_LOSS_TTL)
+            .map(|(ppm, _)| *ppm)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Send one stored part to a child. The part is encoded once for all the
+    /// children that take the same symbol size, with the repair symbols of
+    /// the child with the most loss, and each child receives as many repair
+    /// symbols as its own path needs.
+    async fn send_object(
+        &mut self,
+        socket: &UdpSocket,
+        peer: SocketAddr,
+        key: (u64, u64),
+        frame: &[u8],
+    ) -> Result<(), MeshError> {
+        let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
+        let cached = self.encoded.iter().position(|object| {
+            object.key == key
+                && object.symbol_size == symbol_size
+                && object.packets.len() >= object.source_symbols + repair_symbols as usize
+                && !object.sent_to.contains(&peer)
+        });
+        let index = match cached {
+            Some(index) => index,
+            None => {
+                let (_, worst) = self.plan(frame.len(), self.worst_loss_ppm());
+                let repair = repair_symbols.max(worst);
+                self.encoder.set_symbol_size(symbol_size);
+                let packets = match self
+                    .encoder
+                    .encode_object_with_repair_symbols(frame, repair)
+                {
+                    Ok(packets) => packets.into_iter().map(Bytes::from).collect::<Vec<_>>(),
+                    Err(err) => {
+                        self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                        return Err(err.into());
+                    }
+                };
+                self.stats.tx_objects.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .tx_protected_bytes
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                let bytes = packets.iter().map(Bytes::len).sum::<usize>();
+                // An older encoding of the same part with less repair is of
+                // no more use.
+                self.encoded
+                    .retain(|object| object.key != key || object.symbol_size != symbol_size);
+                self.encoded_bytes = self.encoded.iter().map(|object| object.bytes).sum();
+                self.encoded.push_back(EncodedObject {
+                    key,
+                    symbol_size,
+                    source_symbols: usize::from(source_symbol_count(frame.len(), symbol_size)),
+                    packets,
+                    bytes,
+                    sent_to: Vec::new(),
+                });
+                self.encoded_bytes += bytes;
+                while self.encoded.len() > ENCODED_OBJECT_CACHE
+                    || (self.encoded_bytes > ENCODED_OBJECT_CACHE_BYTES && self.encoded.len() > 1)
+                {
+                    if let Some(old) = self.encoded.pop_front() {
+                        self.encoded_bytes -= old.bytes;
+                    }
+                }
+                self.encoded.len() - 1
+            }
+        };
+        self.encoded[index].sent_to.push(peer);
+        let object = &self.encoded[index];
+        let source_symbols = object.source_symbols;
+        let count = (source_symbols + repair_symbols as usize).min(object.packets.len());
+        for (position, packet) in object.packets[..count].iter().enumerate() {
+            let sent = match socket.send_to(packet, peer).await {
+                Ok(sent) => sent,
+                Err(err) => {
+                    self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(err.into());
+                }
+            };
+            if position < source_symbols {
+                self.stats
+                    .tx_source_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.stats
+                    .tx_repair_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.stats
+                .tx_wire_bytes
+                .fetch_add(sent as u64, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn repair_symbols_for(&self, frame_len: usize) -> u32 {
@@ -1274,8 +1634,7 @@ impl FecSender {
         peer: SocketAddr,
         frame: &[u8],
     ) -> Result<(), MeshError> {
-        let repair_symbols = self.repair_symbols_for(frame.len());
-        let symbol_size = self.symbol_size_for(frame.len());
+        let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
         self.encoder.set_symbol_size(symbol_size);
         let source_symbols = usize::from(source_symbol_count(frame.len(), symbol_size));
         let packets = match self
@@ -1324,6 +1683,20 @@ struct FecBlockObservation {
     source_symbols: u16,
     received_source_symbols: HashSet<u32>,
     last_seen_datagram: u64,
+    /// Packets that one symbol of the block crosses the link in.
+    fragments: u32,
+}
+
+/// Loss on the path from one peer, measured over a short window.
+#[derive(Debug)]
+struct LossWindow {
+    started: Instant,
+    /// Packets that the source symbols of the finished blocks came in.
+    expected_packets: u64,
+    /// Source symbols of those blocks that did not arrive.
+    lost_symbols: u64,
+    /// The published estimate, in parts per million.
+    ppm: u32,
 }
 
 #[derive(Debug)]
@@ -1340,6 +1713,10 @@ struct FecReceiver {
     recoveries: HashMap<(SocketAddr, u32), FecRecoveryObservation>,
     observed_datagrams: u64,
     stats: Arc<CacheMeshFecCounters>,
+    loss: HashMap<SocketAddr, LossWindow>,
+    /// Where the loss from each peer is published for the task that reports
+    /// it to the peer.
+    measured_loss: Option<MeasuredLossTable>,
 }
 
 impl FecReceiver {
@@ -1352,6 +1729,45 @@ impl FecReceiver {
             recoveries: HashMap::new(),
             observed_datagrams: 0,
             stats,
+            loss: HashMap::new(),
+            measured_loss: None,
+        }
+    }
+
+    fn with_measured_loss(mut self, measured_loss: MeasuredLossTable) -> Self {
+        self.measured_loss = Some(measured_loss);
+        self
+    }
+
+    /// Count a finished block of a peer: the packets that its source symbols
+    /// came in, and the source symbols that did not arrive. One lost packet
+    /// loses one symbol, so lost symbols over packets is the packet loss.
+    fn record_block(&mut self, peer: SocketAddr, source_symbols: u32, fragments: u32, lost: u32) {
+        let now = Instant::now();
+        let window = self.loss.entry(peer).or_insert(LossWindow {
+            started: now,
+            expected_packets: 0,
+            lost_symbols: 0,
+            ppm: 0,
+        });
+        window.expected_packets += u64::from(source_symbols) * u64::from(fragments.max(1));
+        window.lost_symbols += u64::from(lost);
+        if now.duration_since(window.started) < LINK_LOSS_WINDOW || window.expected_packets < 64 {
+            return;
+        }
+        let measured = (window.lost_symbols.saturating_mul(1_000_000) / window.expected_packets)
+            .min(1_000_000) as u32;
+        // Follow a rise at once and a fall slowly: the next burst is likely.
+        window.ppm = if measured >= window.ppm {
+            measured
+        } else {
+            ((u64::from(window.ppm) * 3 + u64::from(measured)) / 4) as u32
+        };
+        window.started = now;
+        window.expected_packets = 0;
+        window.lost_symbols = 0;
+        if let Some(table) = &self.measured_loss {
+            lock(table).insert(peer, window.ppm);
         }
     }
 
@@ -1438,6 +1854,7 @@ impl FecReceiver {
                 source_symbols: header.source_symbols,
                 received_source_symbols: HashSet::new(),
                 last_seen_datagram: self.observed_datagrams,
+                fragments: datagram_fragments(bytes.len()) as u32,
             });
         observation.last_seen_datagram = self.observed_datagrams;
         if is_source {
@@ -1448,9 +1865,11 @@ impl FecReceiver {
 
         let decoded = decoded.map(Bytes::from);
         if let Some(frame) = decoded.as_ref() {
-            let missing_source_symbols = self
-                .observations
-                .remove(&key)
+            let observation = self.observations.remove(&key);
+            let fragments = observation
+                .as_ref()
+                .map_or(1, |observation| observation.fragments);
+            let missing_source_symbols = observation
                 .map(|observation| {
                     (0..u32::from(observation.source_symbols))
                         .filter(|encoding_symbol_id| {
@@ -1461,6 +1880,12 @@ impl FecReceiver {
                         .collect::<HashSet<_>>()
                 })
                 .unwrap_or_default();
+            self.record_block(
+                peer,
+                u32::from(header.source_symbols),
+                fragments,
+                missing_source_symbols.len() as u32,
+            );
             self.stats
                 .rx_decoded_objects
                 .fetch_add(1, Ordering::Relaxed);
@@ -1523,8 +1948,28 @@ impl FecReceiver {
             .observed_datagrams
             .saturating_sub(FEC_OBSERVATION_DATAGRAM_WINDOW);
         let before = self.observations.len();
+        // A block that never decoded lost more symbols than it had repair
+        // for. Count the source symbols that did not arrive.
+        let expired = self
+            .observations
+            .iter()
+            .filter(|(_, observation)| observation.last_seen_datagram < cutoff)
+            .map(|((peer, _), observation)| {
+                let source = u32::from(observation.source_symbols);
+                let received = observation.received_source_symbols.len() as u32;
+                (
+                    *peer,
+                    source,
+                    observation.fragments,
+                    source.saturating_sub(received),
+                )
+            })
+            .collect::<Vec<_>>();
         self.observations
             .retain(|_, observation| observation.last_seen_datagram >= cutoff);
+        for (peer, source, fragments, lost) in expired {
+            self.record_block(peer, source, fragments, lost);
+        }
         self.stats.rx_expired_objects.fetch_add(
             before.saturating_sub(self.observations.len()) as u64,
             Ordering::Relaxed,
@@ -1554,12 +1999,14 @@ async fn receive_task(
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut receiver = FecReceiver::new(Arc::clone(&stats));
+    let mut receiver =
+        FecReceiver::new(Arc::clone(&stats)).with_measured_loss(Arc::clone(&shared.measured_loss));
     let mut reply_sender = FecSender::from_config_with_initial_block_id(
         &config,
         REPLY_BLOCK_ID_BASE + config.block_id_offset,
         stats,
-    );
+    )
+    .with_link_loss(Arc::clone(&shared.link_loss));
     let mut buf = vec![0u8; 65_536];
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
@@ -1772,10 +2219,17 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 stream_id, bytes, "cache mesh stream initialization applied"
             );
         }
+        MeshFrame::LinkReport { loss_ppm, .. } => {
+            if !peer_is_allowed(peer, &handler).await {
+                return;
+            }
+            lock(&handler.shared.link_loss).insert(peer, (loss_ppm, Instant::now()));
+        }
         MeshFrame::ReplicaRequest {
             node_id,
             stream_id,
             from_slot,
+            count,
         } => {
             if !peer_is_allowed(peer, &handler).await || handler.config.role == CacheMeshRole::Edge
             {
@@ -1790,6 +2244,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 peer,
                 stream_id,
                 from_slot,
+                count,
             )
             .await
             {
@@ -1894,11 +2349,39 @@ async fn serve_replica_request(
     peer: SocketAddr,
     stream_id: u64,
     from_slot: u64,
+    count: u32,
 ) -> Result<usize, MeshError> {
     let Some(stream_idx) = cache.get_stream_idx(stream_id).await else {
         return Ok(0);
     };
     let mut sent = 0usize;
+    // A request for named parts fills a hole. The requester has the
+    // initialization of the stream already.
+    if count > 0 {
+        let Some(last) = cache.last(stream_idx) else {
+            return Ok(0);
+        };
+        let first = usize::try_from(from_slot).unwrap_or(usize::MAX);
+        if first > last {
+            return Ok(0);
+        }
+        let end = first.saturating_add(count as usize - 1).min(last);
+        for slot_id in first.max(cache.retained_start(last))..=end {
+            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                continue;
+            };
+            if hash == 0 && payload.is_empty() {
+                continue;
+            }
+            let frame =
+                MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
+                    .encode()?;
+            sender.send(socket, peer, &frame).await?;
+            sent = sent.saturating_add(1);
+        }
+        debug!(peer = %peer, stream_id, from_slot, count, sent, "cache mesh hole filled");
+        return Ok(sent);
+    }
     if let Some(initialization) = cache.stream_initialization(stream_id) {
         let frame = MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
             .encode()?;
@@ -1935,11 +2418,15 @@ async fn announce_task(
     peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
     _peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
     stats: Arc<CacheMeshFecCounters>,
+    link_loss: LinkLossTable,
+    measured_loss: MeasuredLossTable,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let mut sender =
-        FecSender::from_config_with_initial_block_id(&config, config.block_id_offset, stats);
+        FecSender::from_config_with_initial_block_id(&config, config.block_id_offset, stats)
+            .with_link_loss(link_loss);
+    let mut reported: HashMap<SocketAddr, (Instant, u32)> = HashMap::new();
     let mut interval = tokio::time::interval(config.announce_interval);
 
     loop {
@@ -1980,9 +2467,43 @@ async fn announce_task(
                         continue;
                     }
                 };
-                for peer in current_peers {
-                    if let Err(err) = sender.send(&socket, peer, &frame).await {
+                for peer in &current_peers {
+                    if let Err(err) = sender.send(&socket, *peer, &frame).await {
                         debug!(peer = %peer, error = %err, "cache mesh hello send failed");
+                    }
+                }
+                // Tell each peer what this node loses of what the peer
+                // sends, so that the peer protects the path accordingly.
+                let measured = lock(&measured_loss).clone();
+                for (peer, loss_ppm) in measured {
+                    if !current_peers.contains(&peer) {
+                        continue;
+                    }
+                    // A report is sent when the loss changes, and once a
+                    // second while there is loss, which keeps it current at
+                    // the peer. A clean path costs nothing.
+                    let due = match reported.get(&peer) {
+                        Some((at, last)) => {
+                            *last != loss_ppm
+                                || (loss_ppm > 0 && at.elapsed() >= LINK_LOSS_WINDOW)
+                        }
+                        None => loss_ppm > 0,
+                    };
+                    if !due {
+                        continue;
+                    }
+                    reported.insert(peer, (Instant::now(), loss_ppm));
+                    let report = MeshFrame::LinkReport {
+                        node_id: config.node_id.clone(),
+                        loss_ppm,
+                    };
+                    match report.encode() {
+                        Ok(report) => {
+                            if let Err(err) = sender.send(&socket, peer, &report).await {
+                                debug!(peer = %peer, error = %err, "cache mesh link report send failed");
+                            }
+                        }
+                        Err(err) => error!(error = %err, "cache mesh link report encode failed"),
                     }
                 }
             }
@@ -2000,6 +2521,7 @@ async fn sync_task(
     stats: Arc<CacheMeshFecCounters>,
     leases: LeaseTable,
     served: ServedTable,
+    link_loss: LinkLossTable,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
@@ -2011,7 +2533,8 @@ async fn sync_task(
         &config,
         CHUNK_BLOCK_ID_BASE + config.block_id_offset,
         stats,
-    );
+    )
+    .with_link_loss(link_loss);
     let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
     let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
     // Demand replication state: the leases the last tick saw, the warm-up
@@ -2237,7 +2760,10 @@ async fn sync_task(
                                     continue;
                                 }
                             };
-                            match sender.send(&socket, *peer, &frame).await {
+                            match sender
+                                .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
+                                .await
+                            {
                                 Ok(()) => {
                                     sent.insert((stream_id, stream_idx, *peer), slot_id);
                                 }
@@ -2285,7 +2811,10 @@ async fn sync_task(
                                     continue;
                                 }
                             };
-                            if let Err(err) = sender.send(&socket, *peer, &frame).await {
+                            if let Err(err) = sender
+                                .send_object(&socket, *peer, (stream_id, slot_id as u64), &frame)
+                                .await
+                            {
                                 debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
                                 break;
                             }
@@ -2905,6 +3434,15 @@ mod tests {
         }
     }
 
+    /// Slots that hold parts of some tens of kilobytes.
+    fn large_part_options() -> Options {
+        Options {
+            max_parts_per_segment: 256,
+            buffer_size_kb: 64,
+            ..demand_options()
+        }
+    }
+
     fn demand_distributor(name: &str, addr: SocketAddr) -> CacheMeshConfig {
         let mut config = CacheMeshConfig::new(name, "uk", addr)
             .with_same_region_only(true)
@@ -3210,7 +3748,13 @@ mod tests {
                 .unwrap();
             cache_b.add_for_stream_id(7, slot, part).await.unwrap();
         }
-        wait_for_slot(&edge_cache, 7, 4).await;
+        // The parts that were stored when the lease began come as the
+        // warm-up window, after the live parts. The edge renews its lease of
+        // 600 ms while it waits, as a node with readers does.
+        for slot in (0..5).rev() {
+            edge.subscribe(7, 0, 16).await.unwrap();
+            wait_for_slot(&edge_cache, 7, slot).await;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut applied = Vec::new();
         while let Ok(event) = applied_rx.try_recv() {
@@ -3441,6 +3985,251 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         parent.shutdown();
+    }
+
+    #[test]
+    fn a_lossy_path_gets_unfragmented_symbols_and_repair_for_its_loss() {
+        // The lab configuration: 900-byte symbols, up to 16 kB for a large
+        // object, 3% repair and at least one repair symbol.
+        let table: LinkLossTable = Arc::new(StdMutex::new(HashMap::new()));
+        let sender = FecSender::with_policy_and_initial_block_id(
+            1,
+            0.03,
+            32,
+            900,
+            0,
+            Arc::new(CacheMeshFecCounters::default()),
+        )
+        .with_max_symbol_size(16_000)
+        .with_link_loss(Arc::clone(&table));
+        let peer = loopback_addr();
+        let part_4k = 400_000;
+
+        // A clean path: large symbols, the configured repair.
+        assert_eq!(sender.loss_ppm_to(peer), 0);
+        let (symbol, repair) = sender.plan(part_4k, 0);
+        assert!(symbol > 6_000, "{symbol}");
+        assert_eq!(repair, sender.repair_symbols_for(part_4k));
+
+        // The peer reports 0.5% packet loss. The symbols are now half the
+        // size, and the repair covers the loss with room to spare.
+        lock(&table).insert(peer, (5_000, std::time::Instant::now()));
+        let (clean_symbol, clean_repair) = sender.plan(part_4k, 0);
+        let (symbol, repair) = sender.plan(part_4k, sender.loss_ppm_to(peer));
+        assert!(symbol < clean_symbol && symbol >= 2_700, "{symbol}");
+        let source = u32::from(source_symbol_count(part_4k, symbol));
+        assert!((100..=160).contains(&source), "{source}");
+        assert!(
+            repair > clean_repair && repair <= source / 5,
+            "{repair} of {source}"
+        );
+        // With that repair the object fails less than once in a thousand at
+        // the loss of a symbol of this size.
+        let fragments = datagram_fragments(usize::from(symbol) + HEADER_LEN + 4) as i32;
+        let symbol_loss = 1.0 - (1.0_f64 - 0.0075).powi(fragments);
+        assert!(repair >= repair_symbols_for_loss(source, symbol_loss, 0.001, 255));
+
+        // 5% loss needs more, and no more than half of the object.
+        let (_, heavy) = sender.plan(part_4k, 50_000);
+        assert!(
+            heavy > repair && heavy <= source.div_ceil(2),
+            "{heavy} of {source}"
+        );
+
+        // A 5 ms audio part is two symbols. A few repair symbols make its
+        // loss rare at 5%.
+        let (symbol, repair) = sender.plan(1_200, 50_000);
+        assert_eq!(symbol, 900);
+        assert!((2..=5).contains(&repair), "{repair}");
+
+        // A report that is not renewed stops counting.
+        lock(&table).insert(peer, (5_000, std::time::Instant::now() - LINK_LOSS_TTL * 2));
+        assert_eq!(sender.loss_ppm_to(peer), 0);
+    }
+
+    #[test]
+    fn repair_for_loss_is_the_binomial_tail() {
+        // One symbol at 10% loss: both of two symbols are lost 1% of the
+        // time, all three of three 0.1% of the time.
+        assert_eq!(repair_symbols_for_loss(1, 0.1, 0.02, 32), 1);
+        assert_eq!(repair_symbols_for_loss(1, 0.1, 0.002, 32), 2);
+        assert_eq!(repair_symbols_for_loss(100, 0.0, 0.001, 32), 0);
+        // 300 symbols at 1%: three are lost on average, eleven almost never.
+        let repair = repair_symbols_for_loss(300, 0.01, 0.001, 255);
+        assert!((9..=12).contains(&repair), "{repair}");
+        // The limit holds.
+        assert_eq!(repair_symbols_for_loss(300, 0.5, 0.001, 40), 40);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receiver_measures_loss_and_its_parent_hears_it() {
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let edge_cache = ChunkCache::new(large_part_options());
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            demand_distributor("dist", distributor_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        // The edge drops 3% of what it receives.
+        let edge = CacheMesh::new(
+            Arc::new(edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peer(distributor_addr)
+                .with_receive_loss_ppm(30_000),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        edge.subscribe(7, 0, 8).await.unwrap();
+        // Two seconds of 6 kB parts every 20 ms. The lease lasts 600 ms.
+        for slot in 0..120_usize {
+            if slot % 10 == 0 {
+                edge.subscribe(7, 0, 8).await.unwrap();
+            }
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 6_000]))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let loss = distributor.link_loss();
+                if let Some(ppm) = loss
+                    .iter()
+                    .find(|loss| loss.peer == edge.local_addr())
+                    .and_then(|loss| loss.send_ppm)
+                    .filter(|ppm| *ppm > 0)
+                {
+                    break ppm;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the distributor hears the loss of its child");
+        assert!((8_000..90_000).contains(&reported), "{reported} ppm");
+        let measured = edge
+            .link_loss()
+            .into_iter()
+            .find(|loss| loss.peer == distributor.local_addr())
+            .and_then(|loss| loss.receive_ppm)
+            .unwrap();
+        assert!((8_000..90_000).contains(&measured), "{measured} ppm");
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_request_for_named_parts_returns_those_parts_only() {
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        for slot in 0..10_usize {
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 600]))
+                .await
+                .unwrap();
+        }
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            demand_distributor("dist", distributor_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(distributor_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        // The edge accepts parts of the playlist, and asks for parts 4 and 5.
+        lock(&edge.wanted).insert(7);
+        let before = distributor.fec_stats().tx_objects;
+        assert_eq!(edge.request_parts(7, 4, 2, 1).await.unwrap(), 1);
+        wait_for_slot(&edge_cache, 7, 5).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stream = edge_cache.get_stream_idx(7).await.unwrap();
+        assert!(edge_cache.get(stream, 4).await.is_some());
+        assert!(edge_cache.get(stream, 5).await.is_some());
+        for slot in [3_usize, 6, 9] {
+            assert!(edge_cache.get(stream, slot).await.is_none(), "slot {slot}");
+        }
+        // Two parts went out, beside a few hellos: not the six parts from
+        // the hole to the newest part.
+        let sent = distributor.fec_stats().tx_objects - before;
+        assert!((2..=7).contains(&sent), "{sent} objects");
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_children_of_a_node_share_one_encoding_of_a_part() {
+        let distributor_addr = loopback_addr();
+        let first_addr = loopback_addr();
+        let second_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            demand_distributor("dist", distributor_addr)
+                .with_peer(first_addr)
+                .with_peer(second_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mut edges = Vec::new();
+        for (name, addr) in [("edge-a", first_addr), ("edge-b", second_addr)] {
+            let cache = Arc::new(ChunkCache::new(large_part_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&cache),
+                demand_edge(name, addr).with_peer(distributor_addr),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            edge.subscribe(7, 0, 0).await.unwrap();
+            edges.push((edge, cache));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let before = distributor.fec_stats();
+        for slot in 0..40_usize {
+            if slot % 10 == 0 {
+                // The lease lasts 600 ms.
+                for (edge, _) in &edges {
+                    edge.subscribe(7, 0, 0).await.unwrap();
+                }
+            }
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 8_000]))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for (_, cache) in &edges {
+            wait_for_slot(cache, 7, 39).await;
+        }
+        let after = distributor.fec_stats();
+        // Forty parts were encoded once each, beside the hellos. Each of the
+        // two children received every one of them.
+        let encoded = after.tx_objects - before.tx_objects;
+        assert!((40..=72).contains(&encoded), "{encoded} objects encoded");
+        let source = after.tx_source_datagrams - before.tx_source_datagrams;
+        assert!(source >= 2 * 40 * 6, "{source} source datagrams");
+        distributor.shutdown();
+        for (edge, _) in edges {
+            edge.shutdown();
+        }
     }
 
     #[test]
