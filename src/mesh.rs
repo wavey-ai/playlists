@@ -307,6 +307,14 @@ impl CacheMeshConfig {
         self
     }
 
+    /// How often this node tells its peers that it is there. A peer that
+    /// sends media is heard with every datagram; the hello is what a node
+    /// hears from a peer that has nothing to send.
+    pub fn with_announce_interval(mut self, interval: Duration) -> Self {
+        self.announce_interval = interval.max(Duration::from_millis(10));
+        self
+    }
+
     pub fn with_peer_timeout(mut self, timeout: Duration) -> Self {
         self.peer_timeout = timeout.max(Duration::from_millis(1));
         self
@@ -824,6 +832,23 @@ impl CacheMeshHandle {
 
     pub fn subscription_lease(&self) -> Duration {
         self.subscription_lease
+    }
+
+    /// How long ago this node last heard from any peer that it may take
+    /// playlists from. `None` before the first frame of such a peer.
+    ///
+    /// An edge that has heard no parent for a few hello intervals has lost
+    /// its network, or every parent: it cannot say when the next part will
+    /// come, and should send its readers to another cache.
+    pub async fn parents_silent_for(&self) -> Option<Duration> {
+        let peers = self.allowed_peers().await;
+        let seen = lock(&self.peer_seen);
+        let now = Instant::now();
+        peers
+            .iter()
+            .filter_map(|peer| seen.get(peer))
+            .map(|last| now.duration_since(*last))
+            .min()
     }
 
     /// The parents that this node uses for one playlist: allowed, alive, and
@@ -3839,6 +3864,45 @@ mod tests {
 
         parent_a.shutdown();
         parent_b.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_edge_knows_how_long_its_parents_have_been_silent() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_announce_interval(Duration::from_millis(40)),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        // The parent says hello every 40 ms: it is never silent for long.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let silent = edge
+            .parents_silent_for()
+            .await
+            .expect("the parent was heard");
+        assert!(silent < Duration::from_millis(200), "{silent:?}");
+        // The parent is gone: the silence grows.
+        parent.shutdown();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let silent = edge
+            .parents_silent_for()
+            .await
+            .expect("the parent was heard");
+        assert!(silent >= Duration::from_millis(300), "{silent:?}");
         edge.shutdown();
     }
 
