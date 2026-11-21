@@ -49,6 +49,10 @@ pub struct ChunkCache {
     slot_ids: Vec<AtomicUsize>,
     slot_generations: Vec<AtomicUsize>,
     slot_hashes: Vec<AtomicU64>,
+    /// When each slot was written: CLOCK_REALTIME microseconds. Stored
+    /// before the slot identity, so it is readable as soon as the slot is
+    /// and before any exact-part waiter is woken.
+    slot_written_us: Vec<AtomicU64>,
     idxs: Vec<AtomicUsize>,
     next_ids: Vec<AtomicUsize>,
     generations: Vec<AtomicUsize>,
@@ -83,6 +87,7 @@ impl ChunkCache {
             .collect();
         let slot_generations = (0..buffer_size).map(|_| AtomicUsize::new(0)).collect();
         let slot_hashes = (0..buffer_size).map(|_| AtomicU64::new(0)).collect();
+        let slot_written_us = (0..buffer_size).map(|_| AtomicU64::new(0)).collect();
         let idxs = (0..num_playlists)
             .map(|_| AtomicUsize::new(EMPTY_LAST))
             .collect();
@@ -97,6 +102,7 @@ impl ChunkCache {
             slot_ids,
             slot_generations,
             slot_hashes,
+            slot_written_us,
             idxs,
             next_ids,
             generations,
@@ -341,6 +347,28 @@ impl ChunkCache {
         self.get_with_generation(stream_idx, generation, id).await
     }
 
+    /// When the retained slot of a stream was written into this cache:
+    /// CLOCK_REALTIME microseconds since the Unix epoch.
+    ///
+    /// The time is stored before the slot becomes readable, so a reader woken
+    /// by the write (an exact-part waiter, or a watermark advance) finds it.
+    /// Takes no lock and does not wait.
+    pub fn written_unix_us_for_stream_id(&self, stream_id: u64, id: usize) -> Option<u64> {
+        let (stream_idx, generation) = self.stream_generation_for_id(stream_id)?;
+        let idx = self.offset(stream_idx, id)?;
+        let matches = || {
+            self.slot_ids[idx].load(Ordering::Acquire) == id
+                && self.slot_generations[idx].load(Ordering::Acquire) == generation
+        };
+        if !matches() {
+            return None;
+        }
+        let written_us = self.slot_written_us[idx].load(Ordering::Acquire);
+        // A concurrent write of another identity into the slot replaces the
+        // time; report nothing rather than its time.
+        (matches() && written_us != 0).then_some(written_us)
+    }
+
     /// Read a contiguous retained range for one logical stream identity.
     ///
     /// The stream mapping and generation are resolved once for the whole
@@ -443,6 +471,7 @@ impl ChunkCache {
 
         let mut lock = self.buffer[idx].write().await;
         *lock = data;
+        self.slot_written_us[idx].store(unix_micros(), Ordering::Relaxed);
         self.slot_ids[idx].store(id, Ordering::Release);
         self.slot_generations[idx].store(generation, Ordering::Release);
         self.slot_hashes[idx].store(h, Ordering::Release);
@@ -476,6 +505,7 @@ impl ChunkCache {
         }
 
         *lock = data;
+        self.slot_written_us[idx].store(unix_micros(), Ordering::Relaxed);
         self.slot_ids[idx].store(id, Ordering::Release);
         self.slot_generations[idx].store(generation, Ordering::Release);
         self.slot_hashes[idx].store(h, Ordering::Release);
@@ -820,6 +850,15 @@ impl ChunkCache {
     }
 }
 
+/// CLOCK_REALTIME in microseconds since the Unix epoch.
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +972,44 @@ mod tests {
             cache.get_for_stream_id(7, 1).await.unwrap().0,
             Bytes::from_static(b"again")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_woken_by_a_write_finds_when_the_slot_was_written() {
+        let cache = Arc::new(ChunkCache::new(Options::default()));
+        cache.add_stream_id(9).await;
+        assert_eq!(cache.written_unix_us_for_stream_id(9, 3), None);
+        let waiter = cache.exact_part_waiter(9, 3).unwrap();
+        let notified = waiter.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let writer = {
+            let cache = Arc::clone(&cache);
+            task::spawn(async move {
+                let before = unix_micros();
+                cache
+                    .put_if_absent_contiguous_for_stream_id(9, 3, 0, Bytes::from_static(b"p3"))
+                    .await
+                    .unwrap();
+                before
+            })
+        };
+        timeout(Duration::from_secs(1), notified).await.unwrap();
+        // Read at once on waking, before the writer returns to its caller.
+        let written = cache.written_unix_us_for_stream_id(9, 3).unwrap();
+        let before = writer.await.unwrap();
+        assert!(written >= before && written <= unix_micros());
+        // Another identity, or a released slot, has no time.
+        assert_eq!(cache.written_unix_us_for_stream_id(9, 4), None);
+        assert_eq!(cache.written_unix_us_for_stream_id(10, 3), None);
+        assert!(cache.clear_for_stream_id(9, 3).await);
+        assert_eq!(cache.written_unix_us_for_stream_id(9, 3), None);
+        // add_for_stream_id records the time too.
+        cache
+            .add_for_stream_id(9, 5, Bytes::from_static(b"p5"))
+            .await
+            .unwrap();
+        assert!(cache.written_unix_us_for_stream_id(9, 5).unwrap() >= written);
     }
 
     #[tokio::test]
