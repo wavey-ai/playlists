@@ -1703,7 +1703,20 @@ struct LossWindow {
 struct FecRecoveryObservation {
     missing_source_symbols: HashSet<u32>,
     completed_at_datagram: u64,
+    /// When the block decoded, and what its loss is counted against once
+    /// its late source symbols have had time to arrive.
+    completed_at: Instant,
+    source_symbols: u32,
+    fragments: u32,
 }
+
+/// Time that the source symbols of a decoded block have to arrive before
+/// those that are still missing count as lost. A path that reorders packets
+/// delivers repair symbols before source symbols. Counted at once, each such
+/// symbol was a loss: on a link with 8 ms of jitter and no loss at all, the
+/// receivers reported so much loss that the senders sent 3.6 repair symbols
+/// for each source symbol.
+const LATE_SOURCE_GRACE: Duration = Duration::from_millis(250);
 
 struct FecReceiver {
     decoders: HashMap<SocketAddr, DatagramFecDecoder>,
@@ -1828,7 +1841,8 @@ impl FecReceiver {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 if complete {
-                    self.recoveries.remove(&key);
+                    // Every source symbol arrived after all: nothing was lost.
+                    self.finalize_recovery(key);
                 }
             }
             self.prune_observations();
@@ -1880,12 +1894,9 @@ impl FecReceiver {
                         .collect::<HashSet<_>>()
                 })
                 .unwrap_or_default();
-            self.record_block(
-                peer,
-                u32::from(header.source_symbols),
-                fragments,
-                missing_source_symbols.len() as u32,
-            );
+            if missing_source_symbols.is_empty() {
+                self.record_block(peer, u32::from(header.source_symbols), fragments, 0);
+            }
             self.stats
                 .rx_decoded_objects
                 .fetch_add(1, Ordering::Relaxed);
@@ -1904,6 +1915,9 @@ impl FecReceiver {
                     FecRecoveryObservation {
                         missing_source_symbols,
                         completed_at_datagram: self.observed_datagrams,
+                        completed_at: Instant::now(),
+                        source_symbols: u32::from(header.source_symbols),
+                        fragments,
                     },
                 );
             }
@@ -1940,6 +1954,13 @@ impl FecReceiver {
         self.stats.rx_presumed_lost_source_datagrams.fetch_add(
             recovery.missing_source_symbols.len() as u64,
             Ordering::Relaxed,
+        );
+        // The loss of the block is what is still missing now.
+        self.record_block(
+            key.0,
+            recovery.source_symbols,
+            recovery.fragments,
+            recovery.missing_source_symbols.len() as u32,
         );
     }
 
@@ -1978,7 +1999,10 @@ impl FecReceiver {
         let expired_recoveries = self
             .recoveries
             .iter()
-            .filter(|(_, recovery)| recovery.completed_at_datagram < cutoff)
+            .filter(|(_, recovery)| {
+                recovery.completed_at_datagram < cutoff
+                    || recovery.completed_at.elapsed() >= LATE_SOURCE_GRACE
+            })
             .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         for key in expired_recoveries {
@@ -3359,6 +3383,56 @@ mod tests {
         assert_eq!(receiver.push(peer, late_source).unwrap(), None);
         assert_eq!(stats.rx_late_source_datagrams, 0);
         assert_eq!(receiver.stats.snapshot().rx_late_source_datagrams, 1);
+    }
+
+    #[test]
+    fn a_source_symbol_that_arrives_late_is_not_counted_as_loss() {
+        let payload = b"mesh-frame-with-several-symbols";
+        let symbol_id = |datagram: &Vec<u8>| {
+            u32::from_be_bytes([
+                0,
+                datagram[HEADER_LEN + 1],
+                datagram[HEADER_LEN + 2],
+                datagram[HEADER_LEN + 3],
+            ])
+        };
+        let peer: SocketAddr = "127.0.0.1:9913".parse().unwrap();
+        // A path that reorders: the repair symbols overtake source symbol 1.
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(2);
+        let datagrams = encoder.encode_object(payload).unwrap();
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let mut decoded = false;
+        for datagram in datagrams.iter().filter(|datagram| symbol_id(datagram) != 1) {
+            if receiver.push(peer, datagram).unwrap().is_some() {
+                decoded = true;
+                break;
+            }
+        }
+        assert!(decoded);
+        // The block is decoded, and its loss is not counted yet.
+        assert!(receiver.loss.get(&peer).is_none());
+        let late = datagrams
+            .iter()
+            .find(|datagram| symbol_id(datagram) == 1)
+            .unwrap();
+        assert_eq!(receiver.push(peer, late).unwrap(), None);
+        let window = receiver.loss.get(&peer).expect("the block is counted");
+        assert!(window.expected_packets > 0);
+        assert_eq!(window.lost_symbols, 0);
+
+        // A path that loses the symbol: it counts once it has had its time.
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        for datagram in datagrams.iter().filter(|datagram| symbol_id(datagram) != 1) {
+            if receiver.push(peer, datagram).unwrap().is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(LATE_SOURCE_GRACE + Duration::from_millis(30));
+        receiver.prune_observations();
+        let window = receiver.loss.get(&peer).expect("the block is counted");
+        assert_eq!(window.lost_symbols, 1);
     }
 
     #[test]
