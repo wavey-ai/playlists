@@ -220,6 +220,36 @@ pub trait CacheMeshReceiveObserver: Send + Sync {
     fn decoded(&self, peer: SocketAddr, datagram: &[u8], frame: &[u8]);
 }
 
+/// The class of a playlist on a cache mesh that is split by class (see
+/// [`CacheMeshConfig::with_class_port_offset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StreamClass {
+    /// Audio, and every playlist that the classifier does not call video.
+    /// Its parts go on the main socket.
+    #[default]
+    Audio,
+    /// Video: its parts go on the class socket, with their own receive and
+    /// sync tasks, so that encoding, sending and decoding them never holds an
+    /// audio part back.
+    Video,
+}
+
+/// Tells the cache mesh the class of a playlist, by stream id. It is called
+/// by the sync tasks for every stream of every pass and by the receive task
+/// for each replica request, so it must be cheap (a lookup), must not block,
+/// and must not call into the mesh.
+pub type CacheMeshStreamClassifier = Arc<dyn Fn(u64) -> StreamClass + Send + Sync>;
+
+/// Holds the optional classifier so that the configuration stays `Debug`.
+#[derive(Clone, Default)]
+struct ClassifierSlot(Option<CacheMeshStreamClassifier>);
+
+impl fmt::Debug for ClassifierSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
 /// Holds the optional receive observer so that the configuration stays
 /// `Debug`.
 #[derive(Clone, Default)]
@@ -365,6 +395,22 @@ pub struct CacheMeshConfig {
     /// not two of 1352. Receivers take the symbol size from each block's
     /// header. False pads every object to `symbol_size`. Default true.
     pub fitted_symbols: bool,
+    /// Split the mesh by class: when non-zero, a second socket at the main
+    /// port plus this offset carries the parts and initializations of the
+    /// video playlists (see `with_stream_classifier`), with its own receive
+    /// task, sync task and replica server, and the main socket carries the
+    /// audio playlists. Hellos, leases, replica requests and loss reports
+    /// stay on the main socket. Every node of a mesh must use the same
+    /// offset: a node sends a peer's video parts to the peer's main port plus
+    /// the offset, and takes a datagram on its class socket from port `p` as
+    /// one from the peer at `p` minus the offset. Zero, the default, keeps
+    /// one socket and one pair of tasks for every playlist, as before.
+    pub class_port_offset: u16,
+    /// The class of each playlist. Without one every playlist is audio.
+    stream_classifier: ClassifierSlot,
+    /// The observer of the class socket's receive task: `None` uses
+    /// `receive_observer` there too.
+    class_receive_observer: Option<ReceiveObserverSlot>,
 }
 
 impl CacheMeshConfig {
@@ -403,6 +449,9 @@ impl CacheMeshConfig {
             batched_send: true,
             gso: true,
             fitted_symbols: true,
+            class_port_offset: 0,
+            stream_classifier: ClassifierSlot(None),
+            class_receive_observer: None,
         }
     }
 
@@ -531,6 +580,93 @@ impl CacheMeshConfig {
         self.receive_observer = ReceiveObserverSlot(Some(observer));
         self
     }
+
+    /// Split the mesh by class, with the video socket at the main port plus
+    /// `offset` (see [`Self::class_port_offset`]). Zero keeps one socket.
+    pub fn with_class_port_offset(mut self, offset: u16) -> Self {
+        self.class_port_offset = offset;
+        self
+    }
+
+    /// Tell the mesh the class of each playlist. Used only when the mesh is
+    /// split by class.
+    pub fn with_stream_classifier(mut self, classifier: CacheMeshStreamClassifier) -> Self {
+        self.stream_classifier = ClassifierSlot(Some(classifier));
+        self
+    }
+
+    /// The observer of the class socket's receive task, which sees only the
+    /// datagrams of video playlists: `None` gives it no observer. Without
+    /// this call the class socket uses the observer of
+    /// [`Self::with_receive_observer`], so that both see their own class.
+    pub fn with_class_receive_observer(
+        mut self,
+        observer: Option<Arc<dyn CacheMeshReceiveObserver>>,
+    ) -> Self {
+        self.class_receive_observer = Some(ReceiveObserverSlot(observer));
+        self
+    }
+
+    /// The class of a playlist: what the classifier says, or audio.
+    pub fn stream_class(&self, stream_id: u64) -> StreamClass {
+        self.stream_classifier
+            .0
+            .as_ref()
+            .map_or(StreamClass::Audio, |classify| classify(stream_id))
+    }
+}
+
+/// One socket of the cache mesh and the playlists whose parts it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lane {
+    /// The class of playlists that the lane carries; `None` when the mesh is
+    /// not split, and its one lane carries every playlist.
+    class: Option<StreamClass>,
+    /// How far the lane's port is above the main port, at this node and at
+    /// every peer.
+    port_offset: u16,
+}
+
+impl Lane {
+    /// The one lane of a mesh that is not split.
+    const ALL: Lane = Lane {
+        class: None,
+        port_offset: 0,
+    };
+
+    fn split(&self) -> bool {
+        self.class.is_some()
+    }
+
+    /// Whether this lane sends the parts of a playlist.
+    fn carries(&self, config: &CacheMeshConfig, stream_id: u64) -> bool {
+        self.class
+            .is_none_or(|class| config.stream_class(stream_id) == class)
+    }
+
+    /// The address of the socket of this lane at the peer whose main
+    /// address is `peer`. `None` when it would be beyond the last port.
+    fn peer_socket(&self, peer: SocketAddr) -> Option<SocketAddr> {
+        let port = peer.port().checked_add(self.port_offset)?;
+        let mut addr = peer;
+        addr.set_port(port);
+        Some(addr)
+    }
+
+    /// The main address of the peer whose socket of this lane is `from`.
+    fn peer_of(&self, from: SocketAddr) -> Option<SocketAddr> {
+        let port = from.port().checked_sub(self.port_offset)?;
+        let mut addr = from;
+        addr.set_port(port);
+        Some(addr)
+    }
+
+    /// Where to send a peer's datagrams of this lane. A peer without such a
+    /// socket is never a child of the lane (see the sync task), so the main
+    /// address is only a fallback.
+    fn to(&self, peer: SocketAddr) -> SocketAddr {
+        self.peer_socket(peer).unwrap_or(peer)
+    }
 }
 
 /// A lease that a child holds on one playlist of this node.
@@ -568,6 +704,34 @@ type LinkLossTable = Arc<StdMutex<HashMap<SocketAddr, (u32, Instant)>>>;
 /// Packet loss on the path from a peer to this node, as this node measures
 /// it.
 type MeasuredLossTable = Arc<StdMutex<HashMap<SocketAddr, u32>>>;
+/// The cursors of the playlists that moved from one lane to the other: by
+/// stream, stream index and child, the last part that the old lane sent.
+type CursorHandover = Arc<StdMutex<HashMap<(u64, usize, SocketAddr), usize>>>;
+
+/// A replica request for a video playlist, which the main receive task hands
+/// to the class lane's replica server.
+#[derive(Debug, Clone, Copy)]
+struct ReplicaJob {
+    peer: SocketAddr,
+    stream_id: u64,
+    from_slot: u64,
+    count: u32,
+}
+
+/// The loss measured on both lanes from each peer: the worse of the two.
+fn merged_measured_loss(
+    measured_loss: &MeasuredLossTable,
+    class_measured_loss: Option<&MeasuredLossTable>,
+) -> HashMap<SocketAddr, u32> {
+    let mut merged = lock(measured_loss).clone();
+    if let Some(class) = class_measured_loss {
+        for (peer, ppm) in lock(class).iter() {
+            let entry = merged.entry(*peer).or_insert(0);
+            *entry = (*entry).max(*ppm);
+        }
+    }
+    merged
+}
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -611,8 +775,8 @@ fn block_id_start_offset(config: &CacheMeshConfig) -> u32 {
     (xxh3_64(&seed) as u32) % BLOCK_ID_START_SPAN
 }
 
-fn bind_socket(config: &CacheMeshConfig) -> Result<UdpSocket, MeshError> {
-    let std_socket = std::net::UdpSocket::bind(config.bind_addr)?;
+fn bind_socket(config: &CacheMeshConfig, addr: SocketAddr) -> Result<UdpSocket, MeshError> {
+    let std_socket = std::net::UdpSocket::bind(addr)?;
     std_socket.set_nonblocking(true)?;
     if let Some(bytes) = config.socket_buffer_bytes {
         let socket = socket2::SockRef::from(&std_socket);
@@ -663,6 +827,37 @@ pub struct CacheMeshFecStats {
     pub rx_decode_errors: u64,
     pub rx_expired_objects: u64,
     pub rx_inflight_objects: u64,
+}
+
+impl CacheMeshFecStats {
+    /// The counts of two lanes together.
+    fn plus(self, other: Self) -> Self {
+        Self {
+            tx_objects: self.tx_objects + other.tx_objects,
+            tx_protected_bytes: self.tx_protected_bytes + other.tx_protected_bytes,
+            tx_source_datagrams: self.tx_source_datagrams + other.tx_source_datagrams,
+            tx_repair_datagrams: self.tx_repair_datagrams + other.tx_repair_datagrams,
+            tx_wire_bytes: self.tx_wire_bytes + other.tx_wire_bytes,
+            tx_errors: self.tx_errors + other.tx_errors,
+            tx_send_calls: self.tx_send_calls + other.tx_send_calls,
+            rx_wire_datagrams: self.rx_wire_datagrams + other.rx_wire_datagrams,
+            rx_wire_bytes: self.rx_wire_bytes + other.rx_wire_bytes,
+            rx_source_datagrams: self.rx_source_datagrams + other.rx_source_datagrams,
+            rx_repair_datagrams: self.rx_repair_datagrams + other.rx_repair_datagrams,
+            rx_decoded_objects: self.rx_decoded_objects + other.rx_decoded_objects,
+            rx_decoded_bytes: self.rx_decoded_bytes + other.rx_decoded_bytes,
+            rx_repaired_objects: self.rx_repaired_objects + other.rx_repaired_objects,
+            rx_repaired_source_datagrams: self.rx_repaired_source_datagrams
+                + other.rx_repaired_source_datagrams,
+            rx_late_source_datagrams: self.rx_late_source_datagrams
+                + other.rx_late_source_datagrams,
+            rx_presumed_lost_source_datagrams: self.rx_presumed_lost_source_datagrams
+                + other.rx_presumed_lost_source_datagrams,
+            rx_decode_errors: self.rx_decode_errors + other.rx_decode_errors,
+            rx_expired_objects: self.rx_expired_objects + other.rx_expired_objects,
+            rx_inflight_objects: self.rx_inflight_objects + other.rx_inflight_objects,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -731,8 +926,38 @@ impl CacheMesh {
 
     pub async fn start(mut self) -> Result<CacheMeshHandle, MeshError> {
         self.config.block_id_offset = block_id_start_offset(&self.config);
-        let socket = Arc::new(bind_socket(&self.config)?);
+        let socket = Arc::new(bind_socket(&self.config, self.config.bind_addr)?);
         let local_addr = socket.local_addr()?;
+        let class_offset = self.config.class_port_offset;
+        let class_lane = Lane {
+            class: Some(StreamClass::Video),
+            port_offset: class_offset,
+        };
+        let main_lane = if class_offset > 0 {
+            Lane {
+                class: Some(StreamClass::Audio),
+                port_offset: 0,
+            }
+        } else {
+            Lane::ALL
+        };
+        let class_socket = if class_offset > 0 {
+            let Some(class_addr) = class_lane.peer_socket(local_addr) else {
+                return Err(MeshError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "cache mesh class port offset {class_offset} puts the class socket of {local_addr} beyond the last port"
+                    ),
+                )));
+            };
+            Some(Arc::new(bind_socket(&self.config, class_addr)?))
+        } else {
+            None
+        };
+        let class_local_addr = match &class_socket {
+            Some(class_socket) => Some(class_socket.local_addr()?),
+            None => None,
+        };
         let peers = Arc::new(RwLock::new(
             self.config.peers.iter().copied().collect::<HashSet<_>>(),
         ));
@@ -747,6 +972,31 @@ impl CacheMesh {
         let link_loss: LinkLossTable = Arc::new(StdMutex::new(HashMap::new()));
         let measured_loss: MeasuredLossTable = Arc::new(StdMutex::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // The class lane keeps its own counters, loss measurements and
+        // served leases; the handle adds them to the main lane's.
+        let class_counters = class_socket
+            .as_ref()
+            .map(|_| Arc::new(CacheMeshFecCounters::default()));
+        let class_measured_loss: Option<MeasuredLossTable> = class_socket
+            .as_ref()
+            .map(|_| Arc::new(StdMutex::new(HashMap::new())));
+        let class_served: Option<ServedTable> = class_socket
+            .as_ref()
+            .map(|_| Arc::new(StdMutex::new(Vec::new())));
+        let handover: CursorHandover = Arc::new(StdMutex::new(HashMap::new()));
+        let shared = MeshShared {
+            leases: Arc::clone(&leases),
+            peer_seen: Arc::clone(&peer_seen),
+            wanted: Arc::clone(&wanted),
+            link_loss: Arc::clone(&link_loss),
+            measured_loss: Arc::clone(&measured_loss),
+        };
+        let (class_replicas_tx, class_replicas_rx) = if class_socket.is_some() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         tokio::spawn(receive_task(
             Arc::clone(&socket),
@@ -756,14 +1006,10 @@ impl CacheMesh {
             Arc::clone(&peer_roles),
             Arc::clone(&remote_slots),
             Arc::clone(&fec_counters),
-            MeshShared {
-                leases: Arc::clone(&leases),
-                peer_seen: Arc::clone(&peer_seen),
-                wanted: Arc::clone(&wanted),
-                link_loss: Arc::clone(&link_loss),
-                measured_loss: Arc::clone(&measured_loss),
-            },
+            shared.clone(),
             self.config.clone(),
+            main_lane,
+            class_replicas_tx,
             shutdown_rx.clone(),
         ));
         tokio::spawn(announce_task(
@@ -774,12 +1020,13 @@ impl CacheMesh {
             Arc::clone(&fec_counters),
             Arc::clone(&link_loss),
             Arc::clone(&measured_loss),
+            class_measured_loss.clone(),
             self.config.clone(),
             shutdown_rx.clone(),
         ));
         tokio::spawn(sync_task(
             Arc::clone(&socket),
-            self.cache,
+            Arc::clone(&self.cache),
             Arc::clone(&peers),
             Arc::clone(&peer_regions),
             Arc::clone(&peer_roles),
@@ -789,13 +1036,73 @@ impl CacheMesh {
             Arc::clone(&served),
             Arc::clone(&link_loss),
             self.config.clone(),
-            shutdown_rx,
+            main_lane,
+            Arc::clone(&handover),
+            shutdown_rx.clone(),
         ));
+        if let (
+            Some(class_socket),
+            Some(class_counters),
+            Some(class_measured_loss),
+            Some(class_served),
+            Some(class_replicas_rx),
+        ) = (
+            class_socket.as_ref(),
+            class_counters.as_ref(),
+            class_measured_loss.as_ref(),
+            class_served.as_ref(),
+            class_replicas_rx,
+        ) {
+            tokio::spawn(receive_task(
+                Arc::clone(class_socket),
+                Arc::clone(&self.cache),
+                Arc::clone(&peers),
+                Arc::clone(&peer_regions),
+                Arc::clone(&peer_roles),
+                Arc::clone(&remote_slots),
+                Arc::clone(class_counters),
+                MeshShared {
+                    measured_loss: Arc::clone(class_measured_loss),
+                    ..shared.clone()
+                },
+                self.config.clone(),
+                class_lane,
+                None,
+                shutdown_rx.clone(),
+            ));
+            tokio::spawn(class_replica_task(
+                Arc::clone(class_socket),
+                Arc::clone(&self.cache),
+                Arc::clone(class_counters),
+                Arc::clone(&link_loss),
+                self.config.clone(),
+                class_lane,
+                class_replicas_rx,
+                shutdown_rx.clone(),
+            ));
+            tokio::spawn(sync_task(
+                Arc::clone(class_socket),
+                Arc::clone(&self.cache),
+                Arc::clone(&peers),
+                Arc::clone(&peer_regions),
+                Arc::clone(&peer_roles),
+                Arc::clone(&remote_slots),
+                Arc::clone(class_counters),
+                Arc::clone(&leases),
+                Arc::clone(class_served),
+                Arc::clone(&link_loss),
+                self.config.clone(),
+                class_lane,
+                Arc::clone(&handover),
+                shutdown_rx,
+            ));
+        }
 
         info!(
             node_id = self.config.node_id,
             region = self.config.region,
             bind = %local_addr,
+            class_bind = ?class_local_addr,
             "cache mesh started"
         );
 
@@ -828,6 +1135,10 @@ impl CacheMesh {
             link_loss,
             measured_loss,
             remote_slots,
+            class_local_addr,
+            class_counters,
+            class_measured_loss,
+            class_served,
         })
     }
 }
@@ -868,6 +1179,12 @@ pub struct CacheMeshHandle {
     wanted: WantedStreams,
     link_loss: LinkLossTable,
     measured_loss: MeasuredLossTable,
+    /// The class socket of a mesh split by class, and its lane's counters,
+    /// loss measurements and served leases.
+    class_local_addr: Option<SocketAddr>,
+    class_counters: Option<Arc<CacheMeshFecCounters>>,
+    class_measured_loss: Option<MeasuredLossTable>,
+    class_served: Option<ServedTable>,
 }
 
 /// Packet loss on the links of this node to one peer, in parts per million.
@@ -885,7 +1202,7 @@ impl CacheMeshHandle {
     /// with. A node sends more repair symbols, in datagrams that fit one
     /// packet, to a peer that reports loss.
     pub fn link_loss(&self) -> Vec<LinkLoss> {
-        let measured = lock(&self.measured_loss).clone();
+        let measured = merged_measured_loss(&self.measured_loss, self.class_measured_loss.as_ref());
         let reported = lock(&self.link_loss).clone();
         let now = Instant::now();
         let mut peers = measured
@@ -948,8 +1265,23 @@ impl CacheMeshHandle {
         self.peers.write().await.insert(peer)
     }
 
+    /// The counts of every socket of the mesh together.
     pub fn fec_stats(&self) -> CacheMeshFecStats {
-        self.fec_counters.snapshot()
+        let main = self.fec_counters.snapshot();
+        match &self.class_counters {
+            Some(class) => main.plus(class.snapshot()),
+            None => main,
+        }
+    }
+
+    /// The counts of the class socket alone, when the mesh is split by class.
+    pub fn class_fec_stats(&self) -> Option<CacheMeshFecStats> {
+        self.class_counters.as_ref().map(|class| class.snapshot())
+    }
+
+    /// The address of the class socket, when the mesh is split by class.
+    pub fn class_local_addr(&self) -> Option<SocketAddr> {
+        self.class_local_addr
     }
 
     pub async fn request_replica(
@@ -1032,7 +1364,19 @@ impl CacheMeshHandle {
 
     /// Subscription leases that this node currently serves to children.
     pub fn served_subscriptions(&self) -> Vec<ServedSubscription> {
-        lock(&self.served).clone()
+        let mut served = lock(&self.served).clone();
+        if let Some(class_served) = &self.class_served {
+            // Each lane lists the leases of its own class. A playlist that
+            // has just changed class can be in both lists for a pass.
+            for subscription in lock(class_served).iter() {
+                if !served.iter().any(|main| {
+                    (main.child, main.stream_id) == (subscription.child, subscription.stream_id)
+                }) {
+                    served.push(*subscription);
+                }
+            }
+        }
+        served
     }
 
     pub fn replication(&self) -> ReplicationMode {
@@ -1883,10 +2227,12 @@ impl FecSender {
     ///
     /// Returns when the first datagram was handed to the kernel, in wall-clock
     /// microseconds since the Unix epoch.
+    /// `dest` is where the datagrams go: the peer's socket of the lane.
     async fn send_object(
         &mut self,
         socket: &UdpSocket,
         peer: SocketAddr,
+        dest: SocketAddr,
         key: (u64, u64),
         content: u64,
         frame: &[u8],
@@ -1900,7 +2246,7 @@ impl FecSender {
                 first_sent_us = unix_micros();
             }
             self.stats.tx_send_calls.fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = socket.send_to(&object.datagram(position), peer).await {
+            if let Err(err) = socket.send_to(&object.datagram(position), dest).await {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 self.count_sent(&object, position);
                 return Err(err.into());
@@ -1924,6 +2270,18 @@ impl FecSender {
         peer: SocketAddr,
         frame: &[u8],
     ) -> Result<(), MeshError> {
+        self.send_to(socket, peer, peer, frame).await
+    }
+
+    /// Send a frame to `peer` at `dest`, its socket of a lane. The repair
+    /// follows the loss that `peer` reports.
+    async fn send_to(
+        &mut self,
+        socket: &UdpSocket,
+        peer: SocketAddr,
+        dest: SocketAddr,
+        frame: &[u8],
+    ) -> Result<(), MeshError> {
         let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
         let object = match self.encoder.encode(&[frame], symbol_size, repair_symbols) {
             Ok(object) => object,
@@ -1939,7 +2297,7 @@ impl FecSender {
 
         for index in 0..object.count() {
             self.stats.tx_send_calls.fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = socket.send_to(&object.datagram(index), peer).await {
+            if let Err(err) = socket.send_to(&object.datagram(index), dest).await {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 self.count_sent(&object, index);
                 return Err(err.into());
@@ -2328,8 +2686,21 @@ async fn receive_task(
     stats: Arc<CacheMeshFecCounters>,
     shared: MeshShared,
     config: CacheMeshConfig,
+    lane: Lane,
+    class_replicas: Option<mpsc::UnboundedSender<ReplicaJob>>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
+    // The class socket takes parts and initializations only: everything else
+    // (hellos, leases, requests, loss reports) is on the main socket.
+    let class_socket = lane.port_offset > 0;
+    let observer = if class_socket {
+        config
+            .class_receive_observer
+            .clone()
+            .unwrap_or_else(|| config.receive_observer.clone())
+    } else {
+        config.receive_observer.clone()
+    };
     let mut receiver =
         FecReceiver::new(Arc::clone(&stats)).with_measured_loss(Arc::clone(&shared.measured_loss));
     let mut reply_sender = FecSender::from_config_with_initial_block_id(
@@ -2352,7 +2723,7 @@ async fn receive_task(
                 return;
             }
             result = socket.recv_from(&mut buf) => {
-                let (len, peer) = match result {
+                let (len, from) = match result {
                     Ok(received) => received,
                     Err(err) => {
                         error!(error = %err, "cache mesh UDP receive failed");
@@ -2360,6 +2731,16 @@ async fn receive_task(
                     }
                 };
                 let received_us = unix_micros();
+                // A datagram on the class socket comes from the peer's class
+                // socket: the peer is known by its main address.
+                let peer = if class_socket {
+                    match lane.peer_of(from) {
+                        Some(peer) => peer,
+                        None => continue,
+                    }
+                } else {
+                    from
+                };
                 if config.receive_loss_ppm > 0 {
                     loss_state ^= loss_state << 13;
                     loss_state ^= loss_state >> 7;
@@ -2369,13 +2750,13 @@ async fn receive_task(
                     }
                 }
 
-                if let Some(observer) = &config.receive_observer.0 {
+                if let Some(observer) = &observer.0 {
                     observer.datagram(peer, &buf[..len]);
                 }
                 let DecodedBlock { frame: decoded, first_seen_us } =
                     match receiver.push_at(peer, &buf[..len], received_us) {
                         Ok(Some(decoded)) => {
-                            if let Some(observer) = &config.receive_observer.0 {
+                            if let Some(observer) = &observer.0 {
                                 observer.decoded(peer, &buf[..len], &decoded.frame);
                             }
                             decoded
@@ -2392,6 +2773,15 @@ async fn receive_task(
                         if frame.node_id() == config.node_id {
                             continue;
                         }
+                        if class_socket
+                            && !matches!(
+                                frame,
+                                MeshFrame::Chunk { .. } | MeshFrame::Initialization { .. }
+                            )
+                        {
+                            debug!(peer = %peer, "cache mesh control frame on the class socket ignored");
+                            continue;
+                        }
                         handle_frame(
                             frame,
                             peer,
@@ -2405,6 +2795,7 @@ async fn receive_task(
                                 shared: &shared,
                                 config: &config,
                                 reply_sender: &mut reply_sender,
+                                class_replicas: class_replicas.as_ref(),
                                 rx_first_us: first_seen_us,
                                 decoded_us,
                             },
@@ -2427,6 +2818,9 @@ struct FrameHandler<'a> {
     shared: &'a MeshShared,
     config: &'a CacheMeshConfig,
     reply_sender: &'a mut FecSender,
+    /// Where a replica request for a video playlist goes on a mesh split by
+    /// class: the class lane serves it on its own socket and task.
+    class_replicas: Option<&'a mpsc::UnboundedSender<ReplicaJob>>,
     /// When the first datagram of the frame's FEC block arrived.
     rx_first_us: u64,
     /// When the frame's FEC block decoded.
@@ -2607,11 +3001,25 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 return;
             }
             handler.peers.write().await.insert(peer);
+            if let Some(class_replicas) = handler.class_replicas {
+                if handler.config.stream_class(stream_id) == StreamClass::Video {
+                    // A video window or hole is sent from the class socket by
+                    // its own task, so it never holds this task back.
+                    let _ = class_replicas.send(ReplicaJob {
+                        peer,
+                        stream_id,
+                        from_slot,
+                        count,
+                    });
+                    return;
+                }
+            }
             if let Err(err) = serve_replica_request(
                 handler.socket,
                 handler.cache,
                 handler.reply_sender,
                 handler.config,
+                peer,
                 peer,
                 stream_id,
                 from_slot,
@@ -2712,12 +3120,16 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     true
 }
 
+/// Serve a replica request of `peer`, sending to `dest`, the peer's socket of
+/// the lane that serves it.
+#[allow(clippy::too_many_arguments)]
 async fn serve_replica_request(
     socket: &UdpSocket,
     cache: &ChunkCache,
     sender: &mut FecSender,
     config: &CacheMeshConfig,
     peer: SocketAddr,
+    dest: SocketAddr,
     stream_id: u64,
     from_slot: u64,
     count: u32,
@@ -2747,7 +3159,7 @@ async fn serve_replica_request(
             let frame =
                 MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
                     .encode()?;
-            sender.send(socket, peer, &frame).await?;
+            sender.send_to(socket, peer, dest, &frame).await?;
             sent = sent.saturating_add(1);
         }
         debug!(peer = %peer, stream_id, from_slot, count, sent, "cache mesh hole filled");
@@ -2756,7 +3168,7 @@ async fn serve_replica_request(
     if let Some(initialization) = cache.stream_initialization(stream_id) {
         let frame = MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
             .encode()?;
-        sender.send(socket, peer, &frame).await?;
+        sender.send_to(socket, peer, dest, &frame).await?;
         sent = sent.saturating_add(1);
     }
     let Some(last) = cache.last(stream_idx) else {
@@ -2776,11 +3188,67 @@ async fn serve_replica_request(
         }
         let frame = MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
             .encode()?;
-        sender.send(socket, peer, &frame).await?;
+        sender.send_to(socket, peer, dest, &frame).await?;
         sent = sent.saturating_add(1);
     }
     debug!(peer = %peer, stream_id, sent, "cache mesh replica request served");
     Ok(sent)
+}
+
+/// Serves the replica requests for video playlists of a mesh split by class,
+/// from the class socket, to the requester's class socket.
+#[allow(clippy::too_many_arguments)]
+async fn class_replica_task(
+    socket: Arc<UdpSocket>,
+    cache: Arc<ChunkCache>,
+    stats: Arc<CacheMeshFecCounters>,
+    link_loss: LinkLossTable,
+    config: CacheMeshConfig,
+    lane: Lane,
+    mut jobs: mpsc::UnboundedReceiver<ReplicaJob>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        REPLY_BLOCK_ID_BASE + config.block_id_offset,
+        stats,
+    )
+    .with_link_loss(link_loss);
+    loop {
+        let job = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                debug!("cache mesh class replica task shutting down");
+                return;
+            }
+            job = jobs.recv() => match job {
+                Some(job) => job,
+                None => return,
+            },
+        };
+        let Some(dest) = lane.peer_socket(job.peer) else {
+            continue;
+        };
+        if let Err(err) = serve_replica_request(
+            &socket,
+            &cache,
+            &mut sender,
+            &config,
+            job.peer,
+            dest,
+            job.stream_id,
+            job.from_slot,
+            job.count,
+        )
+        .await
+        {
+            debug!(
+                peer = %job.peer,
+                stream_id = job.stream_id,
+                error = %err,
+                "cache mesh class replica request could not be served"
+            );
+        }
+    }
 }
 
 async fn announce_task(
@@ -2791,6 +3259,7 @@ async fn announce_task(
     stats: Arc<CacheMeshFecCounters>,
     link_loss: LinkLossTable,
     measured_loss: MeasuredLossTable,
+    class_measured_loss: Option<MeasuredLossTable>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
@@ -2845,7 +3314,9 @@ async fn announce_task(
                 }
                 // Tell each peer what this node loses of what the peer
                 // sends, so that the peer protects the path accordingly.
-                let measured = lock(&measured_loss).clone();
+                // On a mesh split by class, the worse of the two sockets.
+                let measured =
+                    merged_measured_loss(&measured_loss, class_measured_loss.as_ref());
                 for (peer, loss_ppm) in measured {
                     if !current_peers.contains(&peer) {
                         continue;
@@ -3011,6 +3482,8 @@ async fn sync_task(
     served: ServedTable,
     link_loss: LinkLossTable,
     config: CacheMeshConfig,
+    lane: Lane,
+    handover: CursorHandover,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     if config.role == CacheMeshRole::Edge {
@@ -3068,6 +3541,13 @@ async fn sync_task(
     // woken by a publication visits only the streams whose watermark moved
     // since, and the parts at or below it were not published since then.
     let mut seen_last = SeenWatermarks::default();
+    // On a mesh split by class: whether this lane carried each stream when
+    // a pass last looked at it. A stream that leaves the lane hands its
+    // cursors to the other lane, and a stream that comes from the other lane
+    // takes them from there.
+    let mut carried: HashMap<(u64, usize), bool> = HashMap::new();
+    // Only the main lane prunes the remote slots, which both lanes share.
+    let prunes_remote_slots = lane.port_offset == 0;
     let publication = cache.publication_notify();
     let mut published = std::pin::pin!(publication.notified());
     published.as_mut().enable();
@@ -3102,8 +3582,12 @@ async fn sync_task(
                     leases.retain(|_, lease| lease.expires > now);
                     for (key, lease) in leases.iter_mut() {
                         current.insert(*key);
-                        if let Some(open) = lease.open.take() {
-                            pending_open.insert(*key, open);
+                        // The lane of the playlist's class starts its
+                        // warm-up window.
+                        if lease.open.is_some() && lane.carries(&config, key.1) {
+                            if let Some(open) = lease.open.take() {
+                                pending_open.insert(*key, open);
+                            }
                         }
                     }
                 }
@@ -3118,6 +3602,11 @@ async fn sync_task(
                     });
                     backfills.remove(&(*peer, *stream_id));
                     pending_open.remove(&(*peer, *stream_id));
+                    if lane.split() {
+                        lock(&handover).retain(|(handed_stream, _, handed_peer), _| {
+                            handed_stream != stream_id || handed_peer != peer
+                        });
+                    }
                 }
                 backfill_tokens.retain(|peer, _| current.iter().any(|(child, _)| child == peer));
                 active = current;
@@ -3131,6 +3620,7 @@ async fn sync_task(
                 }
                 *lock(&served) = active
                     .iter()
+                    .filter(|(_, stream_id)| !lane.split() || lane.carries(&config, *stream_id))
                     .map(|(child, stream_id)| ServedSubscription {
                         child: *child,
                         stream_id: *stream_id,
@@ -3163,6 +3653,9 @@ async fn sync_task(
                                 .get(peer)
                                 .is_none_or(|role| *role == CacheMeshRole::Edge)
                     })
+                    // A peer whose class socket would be beyond the last
+                    // port has none.
+                    .filter(|peer| lane.port_offset == 0 || lane.peer_socket(*peer).is_some())
                     .collect::<Vec<_>>();
                 peers.sort_unstable();
                 let max_children = config.max_children.max(1);
@@ -3184,7 +3677,17 @@ async fn sync_task(
                 // long ago are not reported as live sends to a child that
                 // comes later.
                 seen_last.refresh(&cache, &stream_ids);
-                if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
+                if lane.split() {
+                    forget_released_streams(
+                        &mut carried,
+                        &handover,
+                        prunes_remote_slots,
+                        &stream_ids,
+                    );
+                }
+                if prunes_remote_slots
+                    && last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL
+                {
                     last_remote_slot_prune = Instant::now();
                     forget_unretained_remote_slots(&cache, &remote_slots).await;
                 }
@@ -3200,11 +3703,15 @@ async fn sync_task(
         moved.drain(&mut moved_idxs);
         if tick {
             let stream_ids = cache.stream_ids().await;
-            if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
+            if prunes_remote_slots && last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL
+            {
                 last_remote_slot_prune = Instant::now();
                 forget_unretained_remote_slots(&cache, &remote_slots).await;
             }
             seen_last.retain_streams(&stream_ids);
+            if lane.split() {
+                forget_released_streams(&mut carried, &handover, prunes_remote_slots, &stream_ids);
+            }
             stream_at.clear();
             stream_at.extend(stream_ids.iter().map(|(stream_id, idx)| (*idx, *stream_id)));
             pass_streams = stream_ids;
@@ -3247,6 +3754,26 @@ async fn sync_task(
             if !tick && (last.is_none() || last == previous) {
                 continue;
             }
+            // On a mesh split by class each lane sends the playlists of its
+            // own class. A playlist that changed class since this lane last
+            // carried it (audio until its first video) goes on the other
+            // lane from the part after the last one that this lane sent.
+            let mut arrived = false;
+            if lane.split() {
+                let here = lane.carries(&config, stream_id);
+                let before = carried.insert((stream_id, stream_idx), here);
+                if !here {
+                    if before == Some(true) {
+                        hand_over_cursors(&mut sent, &handover, stream_id, stream_idx);
+                        sent_initializations.retain(|(sent_stream, sent_idx, _), _| {
+                            (*sent_stream, *sent_idx) != (stream_id, stream_idx)
+                        });
+                        backfills.retain(|(_, backfill_stream), _| *backfill_stream != stream_id);
+                    }
+                    continue;
+                }
+                arrived = before == Some(false);
+            }
             // In demand replication a child receives a playlist only
             // while it holds a lease for it.
             stream_children.clear();
@@ -3281,6 +3808,7 @@ async fn sync_task(
                             &mut sender,
                             &mut batch_sender,
                             *peer,
+                            lane.to(*peer),
                             batches.get_mut(peer),
                             &mut call_times,
                             &mut sent,
@@ -3304,7 +3832,7 @@ async fn sync_task(
                             }
                         },
                     };
-                    match sender.send(&socket, *peer, frame).await {
+                    match sender.send_to(&socket, *peer, lane.to(*peer), frame).await {
                         Ok(()) => {
                             sent_initializations.insert(key, initialization.clone());
                         }
@@ -3347,10 +3875,20 @@ async fn sync_task(
                 // A cursor beyond the newest part means that the
                 // stream restarted with a new publication, whose
                 // sequence starts again. Send it from its beginning.
-                let cursor = sent
+                let mut cursor = sent
                     .get(&(stream_id, stream_idx, *peer))
                     .copied()
                     .filter(|slot| *slot <= last);
+                if cursor.is_none() && lane.split() {
+                    cursor = take_handed_over_cursor(
+                        &handover,
+                        &mut sent,
+                        (stream_id, stream_idx, *peer),
+                        arrived,
+                        published_from,
+                    )
+                    .filter(|slot| *slot <= last);
+                }
                 let next = cursor
                     .and_then(|slot| slot.checked_add(1))
                     .unwrap_or(retained_start)
@@ -3436,6 +3974,7 @@ async fn sync_task(
                                         &mut sender,
                                         &mut batch_sender,
                                         *peer,
+                                        lane.to(*peer),
                                         Some(batch),
                                         &mut call_times,
                                         &mut sent,
@@ -3480,7 +4019,14 @@ async fn sync_task(
                         }
                     };
                     match sender
-                        .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
+                        .send_object(
+                            &socket,
+                            *peer,
+                            lane.to(*peer),
+                            (stream_id, slot_id as u64),
+                            hash,
+                            &frame,
+                        )
                         .await
                     {
                         Ok(sent_us) => {
@@ -3508,6 +4054,7 @@ async fn sync_task(
                         &mut sender,
                         &mut batch_sender,
                         *peer,
+                        lane.to(*peer),
                         batches.get_mut(peer),
                         &mut call_times,
                         &mut sent,
@@ -3597,7 +4144,14 @@ async fn sync_task(
                             }
                         };
                         match sender
-                            .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
+                            .send_object(
+                                &socket,
+                                *peer,
+                                lane.to(*peer),
+                                (stream_id, slot_id as u64),
+                                hash,
+                                &frame,
+                            )
                             .await
                         {
                             // A warm-up part is not a live send: the observer
@@ -3636,6 +4190,7 @@ async fn sync_task(
                     &mut sender,
                     &mut batch_sender,
                     *peer,
+                    lane.to(*peer),
                     Some(batch),
                     &mut call_times,
                     &mut sent,
@@ -3651,6 +4206,83 @@ async fn sync_task(
             }
         }
     }
+}
+
+/// Forget the streams that the cache no longer holds: from the streams that
+/// a lane looked at, and (for the main lane, `handover_too`) from the
+/// handover table.
+fn forget_released_streams(
+    carried: &mut HashMap<(u64, usize), bool>,
+    handover: &CursorHandover,
+    handover_too: bool,
+    stream_ids: &[(u64, usize)],
+) {
+    let mut handover = handover_too.then(|| lock(handover));
+    let handover_stale = handover
+        .as_ref()
+        .is_some_and(|handover| !handover.is_empty());
+    if carried.len() <= stream_ids.len() && !handover_stale {
+        return;
+    }
+    let current = stream_ids.iter().copied().collect::<HashSet<_>>();
+    carried.retain(|stream, _| current.contains(stream));
+    if let Some(handover) = handover.as_mut() {
+        handover
+            .retain(|(stream_id, stream_idx, _), _| current.contains(&(*stream_id, *stream_idx)));
+    }
+}
+
+/// Move the cursors of a playlist that left this lane to the handover table,
+/// for the lane that carries it now.
+fn hand_over_cursors(
+    sent: &mut HashMap<(u64, usize, SocketAddr), usize>,
+    handover: &CursorHandover,
+    stream_id: u64,
+    stream_idx: usize,
+) {
+    let mut handover = lock(handover);
+    sent.retain(|&(sent_stream, sent_idx, peer), slot| {
+        if (sent_stream, sent_idx) != (stream_id, stream_idx) {
+            return true;
+        }
+        handover.insert((sent_stream, sent_idx, peer), *slot);
+        false
+    });
+}
+
+/// The cursor of a child that this lane has none for, on a mesh split by
+/// class, and it becomes this lane's cursor: the last part that the other
+/// lane sent the child, if it handed the playlist over; or, for a playlist
+/// that has just come to this lane (`arrived`) before the other lane handed
+/// it over, the part before the first one published since this lane last
+/// looked, so that the child is not sent the window again. `None` for a
+/// child that is new to the playlist.
+fn take_handed_over_cursor(
+    handover: &CursorHandover,
+    sent: &mut HashMap<(u64, usize, SocketAddr), usize>,
+    key: (u64, usize, SocketAddr),
+    arrived: bool,
+    published_from: usize,
+) -> Option<usize> {
+    let handed = {
+        let mut handover = lock(handover);
+        if handover.is_empty() {
+            None
+        } else {
+            handover.remove(&key)
+        }
+    };
+    let cursor = handed.or_else(|| {
+        if arrived {
+            published_from.checked_sub(1)
+        } else {
+            None
+        }
+    });
+    if let Some(cursor) = cursor {
+        sent.insert(key, cursor);
+    }
+    cursor
 }
 
 /// The payload of `slot_id` of a stream and its hash, read from the cache
@@ -3683,6 +4315,7 @@ async fn flush_child(
     sender: &mut FecSender,
     batch_sender: &mut BatchSender,
     peer: SocketAddr,
+    dest: SocketAddr,
     batch: Option<&mut ChildBatch>,
     call_times: &mut Vec<(usize, u64)>,
     sent: &mut HashMap<(u64, usize, SocketAddr), usize>,
@@ -3696,7 +4329,7 @@ async fn flush_child(
     }
     call_times.clear();
     let (delivered, error) = batch_sender
-        .send(socket, peer, &batch.messages, call_times)
+        .send(socket, dest, &batch.messages, call_times)
         .await;
     sender
         .stats
@@ -6458,5 +7091,506 @@ mod tests {
             distributor.shutdown();
             edge.shutdown();
         }
+    }
+
+    /// An address whose port and the port `offset` above it are both free.
+    fn class_split_addr(offset: u16) -> SocketAddr {
+        loop {
+            let addr = loopback_addr();
+            let class = SocketAddr::from(([127, 0, 0, 1], addr.port() + offset));
+            if std::net::UdpSocket::bind(class).is_ok() {
+                return addr;
+            }
+        }
+    }
+
+    /// Video for the given streams, audio for every other.
+    fn video_streams(video: &'static [u64]) -> CacheMeshStreamClassifier {
+        Arc::new(move |stream_id| {
+            if video.contains(&stream_id) {
+                StreamClass::Video
+            } else {
+                StreamClass::Audio
+            }
+        })
+    }
+
+    /// Records the stream and slot of every chunk that a receive task
+    /// decodes.
+    #[derive(Default)]
+    struct DecodedChunks(StdMutex<Vec<(u64, u64)>>);
+
+    impl CacheMeshReceiveObserver for DecodedChunks {
+        fn datagram(&self, _peer: SocketAddr, _datagram: &[u8]) {}
+
+        fn decoded(&self, _peer: SocketAddr, _datagram: &[u8], frame: &[u8]) {
+            if let Some(slot) = chunk_frame_slot(frame) {
+                lock(&self.0).push(slot);
+            }
+        }
+    }
+
+    const TEST_CLASS_OFFSET: u16 = 7_000;
+
+    #[test]
+    fn a_mesh_is_split_by_class_only_when_asked() {
+        let addr = SocketAddr::from(([10, 0, 0, 1], 29_101));
+        let config = CacheMeshConfig::new("node", "uk", addr);
+        assert_eq!(config.class_port_offset, 0);
+        assert_eq!(config.stream_class(9), StreamClass::Audio);
+        let config = config
+            .with_class_port_offset(1_000)
+            .with_stream_classifier(video_streams(&[9]));
+        assert_eq!(config.class_port_offset, 1_000);
+        assert_eq!(config.stream_class(9), StreamClass::Video);
+        assert_eq!(config.stream_class(7), StreamClass::Audio);
+        assert!(format!("{config:?}").contains("stream_classifier: Some(..)"));
+
+        // The one lane of a mesh that is not split carries everything.
+        assert!(!Lane::ALL.split());
+        assert!(Lane::ALL.carries(&config, 9) && Lane::ALL.carries(&config, 7));
+        assert_eq!(Lane::ALL.to(addr), addr);
+        let audio = Lane {
+            class: Some(StreamClass::Audio),
+            port_offset: 0,
+        };
+        let video = Lane {
+            class: Some(StreamClass::Video),
+            port_offset: 1_000,
+        };
+        assert!(audio.carries(&config, 7) && !audio.carries(&config, 9));
+        assert!(video.carries(&config, 9) && !video.carries(&config, 7));
+        // A peer's class socket is its main port plus the offset, and a
+        // datagram from there is the peer's.
+        let class_addr = SocketAddr::from(([10, 0, 0, 1], 30_101));
+        assert_eq!(video.peer_socket(addr), Some(class_addr));
+        assert_eq!(video.to(addr), class_addr);
+        assert_eq!(video.peer_of(class_addr), Some(addr));
+        assert_eq!(audio.to(addr), addr);
+        let high = SocketAddr::from(([10, 0, 0, 1], 65_000));
+        assert_eq!(video.peer_socket(high), None);
+        assert_eq!(video.peer_of(SocketAddr::from(([10, 0, 0, 1], 999))), None);
+    }
+
+    #[tokio::test]
+    async fn a_class_socket_beyond_the_last_port_is_refused() {
+        let cache = Arc::new(ChunkCache::new(demand_options()));
+        let config =
+            CacheMeshConfig::new("node", "uk", loopback_addr()).with_class_port_offset(60_000);
+        let err = CacheMesh::new(cache, config)
+            .start()
+            .await
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("beyond the last port"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_class_split_mesh_sends_video_parts_on_the_class_socket() {
+        let distributor_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let edge_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let edge_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let sent: Arc<StdMutex<Vec<SentRecord>>> = Arc::default();
+        let observer = {
+            let sent = Arc::clone(&sent);
+            Arc::new(move |stream_id, slot_id, child, sent_us| {
+                lock(&sent).push((stream_id, slot_id, child, sent_us));
+            })
+        };
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_peer(edge_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_class_port_offset(TEST_CLASS_OFFSET)
+                .with_stream_classifier(video_streams(&[9]))
+                .with_send_observer(observer),
+        )
+        .start()
+        .await
+        .unwrap();
+        assert_eq!(
+            distributor.class_local_addr().map(|addr| addr.port()),
+            Some(distributor_addr.port() + TEST_CLASS_OFFSET)
+        );
+        let main_chunks = Arc::new(DecodedChunks::default());
+        let class_chunks = Arc::new(DecodedChunks::default());
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_class_port_offset(TEST_CLASS_OFFSET)
+                .with_stream_classifier(video_streams(&[9]))
+                .with_receive_observer(Arc::clone(&main_chunks) as _)
+                .with_class_receive_observer(Some(Arc::clone(&class_chunks) as _))
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        let init = Bytes::from_static(b"ftyp-moov-of-the-video");
+        distributor_cache
+            .set_stream_initialization(9, init.clone())
+            .await
+            .unwrap();
+        for slot in 0..6 {
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 120]))
+                .await
+                .unwrap();
+            distributor_cache
+                .add_for_stream_id(9, slot, Bytes::from(vec![slot as u8; 20_000]))
+                .await
+                .unwrap();
+        }
+        let mut applied = Vec::new();
+        timeout(Duration::from_secs(3), async {
+            while applied.len() < 12 {
+                applied.push(applied_rx.recv().await.unwrap());
+            }
+        })
+        .await
+        .expect("every part reached the edge");
+        for slot in 0..6 {
+            assert_eq!(
+                edge_cache.get_for_stream_id(9, slot).await.unwrap().0,
+                Bytes::from(vec![slot as u8; 20_000])
+            );
+        }
+        assert_eq!(edge_cache.stream_initialization(9), Some(init));
+        // Parts of both classes come from the parent's main address.
+        assert!(applied.iter().all(|event| event.parent == distributor_addr));
+
+        // The video parts and the initialization went on the class socket
+        // and nothing else did; the audio parts on the main socket.
+        let class_sent = distributor.class_fec_stats().unwrap();
+        assert_eq!(class_sent.tx_objects, 7, "{class_sent:?}");
+        let class_received = edge.class_fec_stats().unwrap();
+        assert_eq!(class_received.rx_decoded_objects, 7, "{class_received:?}");
+        assert!(edge.fec_stats().rx_decoded_objects > class_received.rx_decoded_objects);
+        let mut main = lock(&main_chunks.0).clone();
+        main.sort_unstable();
+        assert_eq!(main, (0..6).map(|slot| (7, slot)).collect::<Vec<_>>());
+        let mut class = lock(&class_chunks.0).clone();
+        class.sort_unstable();
+        assert_eq!(class, (0..6).map(|slot| (9, slot)).collect::<Vec<_>>());
+
+        // The send observer names the child by its main address.
+        timeout(Duration::from_secs(1), async {
+            while lock(&sent).len() < 12 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the send observer saw every part");
+        assert!(lock(&sent)
+            .iter()
+            .all(|(_, _, child, _)| *child == edge_addr));
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_video_replica_request_is_served_from_the_class_socket() {
+        let distributor_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let edge_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let edge_cache = Arc::new(ChunkCache::new(large_part_options()));
+        // Demand replication without a lease: the distributor pushes
+        // nothing, and sends only what it is asked for.
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            demand_distributor("distributor", distributor_addr)
+                .with_peer(edge_addr)
+                .with_class_port_offset(TEST_CLASS_OFFSET)
+                .with_stream_classifier(video_streams(&[9])),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_same_region_only(true)
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_class_port_offset(TEST_CLASS_OFFSET)
+                .with_stream_classifier(video_streams(&[9])),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        wait_for_hello(&distributor, 1).await;
+        for slot in 0..4 {
+            distributor_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 100]))
+                .await
+                .unwrap();
+            distributor_cache
+                .add_for_stream_id(9, slot, Bytes::from(vec![slot as u8; 10_000]))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(edge_cache.get_stream_idx(9).await.is_none());
+
+        assert_eq!(edge.request_parts(9, 1, 2, 1).await.unwrap(), 1);
+        wait_for_slot(&edge_cache, 9, 1).await;
+        wait_for_slot(&edge_cache, 9, 2).await;
+        assert!(edge_cache.get_for_stream_id(9, 3).await.is_none());
+        assert_eq!(edge.request_parts(7, 0, 2, 1).await.unwrap(), 1);
+        wait_for_slot(&edge_cache, 7, 0).await;
+        wait_for_slot(&edge_cache, 7, 1).await;
+        // The request went on the main socket; the video parts came back on
+        // the class socket, and the audio parts did not.
+        assert_eq!(distributor.class_fec_stats().unwrap().tx_objects, 2);
+        assert_eq!(edge.class_fec_stats().unwrap().rx_decoded_objects, 2);
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    /// A distributor holds a window of 200 video parts when an edge appears,
+    /// and sends it the window in one pass. While that runs, an audio part
+    /// is published. Returns how long the audio part took to reach the edge
+    /// and how many video parts the distributor had encoded by then.
+    async fn audio_part_during_a_video_burst(split: bool) -> (Duration, u64) {
+        const VIDEO_PARTS: usize = 200;
+        let offset = if split { TEST_CLASS_OFFSET } else { 0 };
+        let distributor_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let edge_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
+        let edge_cache = Arc::new(ChunkCache::new(large_part_options()));
+        for slot in 0..VIDEO_PARTS {
+            distributor_cache
+                .add_for_stream_id(9, slot, Bytes::from(vec![slot as u8; 12_000]))
+                .await
+                .unwrap();
+        }
+        distributor_cache
+            .add_for_stream_id(7, 0, Bytes::from(vec![0u8; 100]))
+            .await
+            .unwrap();
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_announce_interval(Duration::from_millis(50))
+                .with_sync_interval(Duration::from_millis(10))
+                .with_socket_buffer_bytes(4 << 20)
+                .with_class_port_offset(offset)
+                .with_stream_classifier(video_streams(&[9])),
+        )
+        .start()
+        .await
+        .unwrap();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(50))
+                .with_socket_buffer_bytes(4 << 20)
+                .with_class_port_offset(offset)
+                .with_stream_classifier(video_streams(&[9]))
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        // The video parts encoded so far: on the class socket when the mesh
+        // is split, otherwise among every object of the one socket.
+        let video_encoded = || match distributor.class_fec_stats() {
+            Some(class) => class.tx_objects,
+            None => distributor.fec_stats().tx_objects,
+        };
+        // The distributor hears the edge and sends it the window.
+        timeout(Duration::from_secs(5), async {
+            while video_encoded() < 20 {
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+        })
+        .await
+        .expect("the video window did not start");
+        let published = Instant::now();
+        distributor_cache
+            .add_for_stream_id(7, 1, Bytes::from(vec![1u8; 100]))
+            .await
+            .unwrap();
+        let encoded = timeout(Duration::from_secs(10), async {
+            loop {
+                let event: AppliedSlot = applied_rx.recv().await.unwrap();
+                if (event.stream_id, event.slot_id) == (7, 1) {
+                    return video_encoded();
+                }
+            }
+        })
+        .await
+        .expect("the audio part did not reach the edge");
+        let latency = published.elapsed();
+        distributor.shutdown();
+        edge.shutdown();
+        (latency, encoded)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_video_burst_does_not_hold_back_an_audio_part_on_a_split_mesh() {
+        let (latency, encoded) = audio_part_during_a_video_burst(true).await;
+        assert!(
+            encoded < 200,
+            "the audio part waited for the video window: {encoded} video parts first, {latency:?}"
+        );
+        assert!(latency < Duration::from_millis(50), "{latency:?}");
+
+        // On one socket the audio part leaves after the whole window.
+        let (latency, encoded) = audio_part_during_a_video_burst(false).await;
+        assert!(encoded >= 200, "{encoded} video parts first, {latency:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_playlist_that_becomes_video_moves_to_the_class_socket_from_the_next_part() {
+        for replication in [ReplicationMode::All, ReplicationMode::Demand] {
+            let distributor_addr = class_split_addr(TEST_CLASS_OFFSET);
+            let edge_addr = class_split_addr(TEST_CLASS_OFFSET);
+            let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            // Stream 9 is audio until its first video, as a muxed stream is.
+            let is_video = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let classifier: CacheMeshStreamClassifier = {
+                let is_video = Arc::clone(&is_video);
+                Arc::new(move |stream_id| {
+                    if stream_id == 9 && is_video.load(std::sync::atomic::Ordering::Acquire) {
+                        StreamClass::Video
+                    } else {
+                        StreamClass::Audio
+                    }
+                })
+            };
+            let distributor = CacheMesh::new(
+                Arc::clone(&distributor_cache),
+                demand_distributor("distributor", distributor_addr)
+                    .with_peer(edge_addr)
+                    .with_replication(replication)
+                    .with_class_port_offset(TEST_CLASS_OFFSET)
+                    .with_stream_classifier(Arc::clone(&classifier)),
+            )
+            .start()
+            .await
+            .unwrap();
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peer(distributor_addr)
+                    .with_replication(replication)
+                    .with_class_port_offset(TEST_CLASS_OFFSET)
+                    .with_stream_classifier(classifier),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            wait_for_hello(&distributor, 1).await;
+            if replication == ReplicationMode::Demand {
+                edge.subscribe(9, 0, 16).await.unwrap();
+                timeout(Duration::from_secs(2), async {
+                    while distributor.served_subscriptions().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("the lease did not open");
+            }
+            for slot in 0..5 {
+                distributor_cache
+                    .add_for_stream_id(9, slot, Bytes::from(vec![slot as u8; 200]))
+                    .await
+                    .unwrap();
+                wait_for_slot(&edge_cache, 9, slot).await;
+            }
+            assert_eq!(distributor.class_fec_stats().unwrap().tx_objects, 0);
+
+            is_video.store(true, std::sync::atomic::Ordering::Release);
+            // Let a tick of each lane see the change, then publish more.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            for slot in 5..8 {
+                distributor_cache
+                    .add_for_stream_id(9, slot, Bytes::from(vec![slot as u8; 200]))
+                    .await
+                    .unwrap();
+                wait_for_slot(&edge_cache, 9, slot).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Only the new parts went on the class socket: the window that
+            // the edge had was not sent again.
+            assert_eq!(
+                distributor.class_fec_stats().unwrap().tx_objects,
+                3,
+                "{replication:?}"
+            );
+            assert_eq!(edge.class_fec_stats().unwrap().rx_decoded_objects, 3);
+            if replication == ReplicationMode::Demand {
+                // The lease is listed once, by the lane of its class now.
+                let served = distributor.served_subscriptions();
+                assert_eq!(served.len(), 1, "{served:?}");
+                assert_eq!((served[0].child, served[0].stream_id), (edge_addr, 9));
+            }
+            distributor.shutdown();
+            edge.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_lane_takes_the_cursors_that_the_other_lane_handed_over() {
+        let child = SocketAddr::from(([127, 0, 0, 1], 9_000));
+        let other = SocketAddr::from(([127, 0, 0, 1], 9_001));
+        let handover: CursorHandover = Arc::default();
+        let mut audio_sent =
+            HashMap::from([((9, 1, child), 41), ((9, 1, other), 40), ((7, 0, child), 3)]);
+        hand_over_cursors(&mut audio_sent, &handover, 9, 1);
+        assert_eq!(audio_sent, HashMap::from([((7, 0, child), 3)]));
+        let mut video_sent = HashMap::new();
+        assert_eq!(
+            take_handed_over_cursor(&handover, &mut video_sent, (9, 1, child), true, 50),
+            Some(41)
+        );
+        assert_eq!(video_sent.get(&(9, 1, child)), Some(&41));
+        // Before the other lane hands over, a playlist that has just arrived
+        // goes on from the parts published since this lane last looked.
+        assert_eq!(
+            take_handed_over_cursor(
+                &handover,
+                &mut video_sent,
+                (9, 1, SocketAddr::from(([127, 0, 0, 1], 9_002))),
+                true,
+                50
+            ),
+            Some(49)
+        );
+        // A child that is new to a playlist that the lane already carries
+        // has no cursor.
+        assert_eq!(
+            take_handed_over_cursor(
+                &handover,
+                &mut video_sent,
+                (9, 1, SocketAddr::from(([127, 0, 0, 1], 9_003))),
+                false,
+                50
+            ),
+            None
+        );
+        // The released stream's handover is forgotten.
+        let mut carried = HashMap::from([((9, 1), true), ((7, 0), false)]);
+        forget_released_streams(&mut carried, &handover, true, &[(7, 0)]);
+        assert_eq!(carried, HashMap::from([((7, 0), false)]));
+        assert!(lock(&handover).is_empty());
     }
 }
