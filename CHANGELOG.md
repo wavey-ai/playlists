@@ -11,6 +11,7 @@ Cargo.toml version 0.2.0 (the last published version is 0.1.6; the older
 
 - `Options` has new public fields. A struct literal that lists every field, with no `..Options::default()`, no longer compiles (E0063): add `..playlists::Options::default()`. av-contrib's `playlist_options` is such a literal.
 - `M3u8Manifest::opens_segment` takes the part's duration.
+- `CacheMeshFecStats` has a new field, `tx_send_calls` (kernel send calls: one per datagram unbatched, one per `sendmmsg` batched).
 
 ### Changed
 
