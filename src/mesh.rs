@@ -1,5 +1,7 @@
 use crate::chunk_cache::ChunkCache;
-use crate::mesh_send::{call_time, BatchSender, Message, ObjectDatagrams, ObjectEncoder};
+use crate::mesh_send::{
+    call_time, BatchSender, Message, ObjectDatagrams, ObjectEncoder, MESSAGES_PER_CALL,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(test)]
 use raptorq_datagram_fec::DatagramFecEncoder;
@@ -3022,8 +3024,12 @@ async fn sync_task(
         sender = sender.with_max_symbol_size(0);
     }
     // The children's batches of a pass, kept from pass to pass for their
-    // capacity.
+    // capacity: the live parts of the stream that the pass is on, sent when
+    // the pass has queued them for every child of the stream (or a child's
+    // batch fills a call), and the warm-up parts, sent after the live parts
+    // of every stream of the pass.
     let mut batches: HashMap<SocketAddr, ChildBatch> = HashMap::new();
+    let mut warm_batches: HashMap<SocketAddr, ChildBatch> = HashMap::new();
     let mut call_times: Vec<(usize, u64)> = Vec::new();
     let mut frame_header: Vec<u8> = Vec::new();
     // The payloads of the stream that the pass is on, by slot.
@@ -3415,6 +3421,21 @@ async fn sync_task(
                                     warm_up: false,
                                     object: Some((object, count)),
                                 });
+                                if batch.messages.len() >= MESSAGES_PER_CALL {
+                                    // A full call: a catch-up of many parts
+                                    // does not hold the first of them back.
+                                    flush_child(
+                                        &socket,
+                                        &mut sender,
+                                        &mut batch_sender,
+                                        *peer,
+                                        Some(batch),
+                                        &mut call_times,
+                                        &mut sent,
+                                        &config,
+                                    )
+                                    .await;
+                                }
                             }
                             Err(err) => {
                                 warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
@@ -3471,6 +3492,24 @@ async fn sync_task(
                 }
             }
 
+            if batched {
+                // The stream's live parts leave now, one call for each
+                // child, before the pass encodes the next stream.
+                for peer in &stream_children {
+                    flush_child(
+                        &socket,
+                        &mut sender,
+                        &mut batch_sender,
+                        *peer,
+                        batches.get_mut(peer),
+                        &mut call_times,
+                        &mut sent,
+                        &config,
+                    )
+                    .await;
+                }
+            }
+
             // Warm-up windows go after the live parts of the tick,
             // newest part first, within the allowance of each child.
             // Only the tick sends them: it paces them.
@@ -3500,7 +3539,8 @@ async fn sync_task(
                     }
                     let bytes = payload.len();
                     if batched {
-                        // Queued behind the live parts of the pass.
+                        // Sent after the live parts of every stream of the
+                        // pass.
                         chunk_frame_header(
                             &mut frame_header,
                             &config.node_id,
@@ -3515,7 +3555,7 @@ async fn sync_task(
                             &[&frame_header, &payload],
                         ) {
                             Ok((object, count)) => {
-                                let batch = batches.entry(*peer).or_default();
+                                let batch = warm_batches.entry(*peer).or_default();
                                 let first_message = batch.messages.len();
                                 batch_sender.push(&mut batch.messages, &object, count);
                                 batch.parts.push(QueuedPart {
@@ -3577,9 +3617,10 @@ async fn sync_task(
         }
 
         if batched {
-            // Each child's datagrams of the pass, in as few calls as the
-            // kernel takes them.
-            for (peer, batch) in batches.iter_mut() {
+            // The warm-up parts of the pass, after every live part, each
+            // child's in as few calls as the kernel takes them. (The live
+            // batches are empty here: each stream sent its own.)
+            for (peer, batch) in batches.iter_mut().chain(warm_batches.iter_mut()) {
                 if batch.is_empty() {
                     continue;
                 }
@@ -3597,6 +3638,9 @@ async fn sync_task(
             }
             if batches.len() > children.len().max(1) * 4 {
                 batches.retain(|peer, _| children.contains(peer));
+            }
+            if warm_batches.len() > children.len().max(1) * 4 {
+                warm_batches.retain(|peer, _| children.contains(peer));
             }
         }
     }
@@ -4633,6 +4677,79 @@ mod tests {
             .await
             .unwrap();
         wait_for_slot(&edge_cache, 7, 20).await;
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    /// A child's warm-up window goes after the live parts of every stream of
+    /// the pass, so a live part never waits behind another stream's
+    /// warm-up. (When the pass visits the warm-up stream first, a pass that
+    /// queued everything in one batch per child sent the window first.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_live_part_is_not_held_behind_a_warm_up_window() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        // Only the tick sends, so that the live part and the warm-up window
+        // share a pass.
+        let mut parent_config = demand_distributor("parent", parent_addr)
+            .with_peer(edge_addr)
+            .with_sync_on_publish(false)
+            .with_subscription_lease(Duration::from_secs(5));
+        parent_config.sync_interval = Duration::from_millis(200);
+        let parent = CacheMesh::new(Arc::clone(&parent_cache), parent_config)
+            .start()
+            .await
+            .unwrap();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peer(parent_addr)
+                .with_subscription_lease(Duration::from_secs(5))
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        // Stream 8 is live at the edge.
+        parent_cache
+            .add_for_stream_id(8, 0, Bytes::from(vec![8_u8; 100]))
+            .await
+            .unwrap();
+        edge.subscribe(8, 0, 1).await.unwrap();
+        wait_for_slot(&edge_cache, 8, 0).await;
+        while applied_rx.try_recv().is_ok() {}
+
+        // Stream 7 has forty parts that the edge has not asked for yet.
+        for slot in 0..40 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 1_000]))
+                .await
+                .unwrap();
+        }
+        // A live part of stream 8, then a lease on stream 7 with its whole
+        // window: the next tick has both.
+        parent_cache
+            .add_for_stream_id(8, 1, Bytes::from(vec![8_u8; 100]))
+            .await
+            .unwrap();
+        edge.subscribe(7, 0, 40).await.unwrap();
+
+        let mut order = Vec::new();
+        while order.len() < 41 {
+            let applied = timeout(Duration::from_secs(3), applied_rx.recv())
+                .await
+                .expect("a part did not arrive")
+                .unwrap();
+            order.push((applied.stream_id, applied.slot_id));
+        }
+        assert_eq!(order[0], (8, 1), "{order:?}");
+        assert!(order[1..].iter().all(|(stream_id, _)| *stream_id == 7));
 
         parent.shutdown();
         edge.shutdown();
