@@ -190,6 +190,70 @@ pub struct AppliedSlot {
 /// It runs inline on the sync task and must be cheap: record and return.
 pub type CacheMeshSendObserver = Arc<dyn Fn(u64, u64, SocketAddr, u64) + Send + Sync>;
 
+/// Told of every datagram that the cache mesh receives, before it is decoded,
+/// and of every block once it is decoded. A node uses it to forward the
+/// source symbols of a part on as they arrive (cut-through), without waiting
+/// for the block.
+///
+/// Both calls run inline on the receive task and must be cheap: no waiting,
+/// no blocking send.
+pub trait CacheMeshReceiveObserver: Send + Sync {
+    /// A datagram from `peer`, exactly as it arrived.
+    fn datagram(&self, peer: SocketAddr, datagram: &[u8]);
+    /// The datagram that completed a block from `peer`, and the frame that
+    /// the block decoded to.
+    fn decoded(&self, peer: SocketAddr, datagram: &[u8], frame: &[u8]);
+}
+
+/// Holds the optional receive observer so that the configuration stays
+/// `Debug`.
+#[derive(Clone, Default)]
+struct ReceiveObserverSlot(Option<Arc<dyn CacheMeshReceiveObserver>>);
+
+impl fmt::Debug for ReceiveObserverSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
+/// The stream and slot of a chunk frame, from its first bytes: the first
+/// source symbol of the frame's block is enough. `None` for any other frame,
+/// or when `prefix` is too short.
+pub fn chunk_frame_slot(prefix: &[u8]) -> Option<(u64, u64)> {
+    let header = FRAME_MAGIC.len() + 2;
+    if prefix.len() < header + 2 || &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+        return None;
+    }
+    let version = prefix[FRAME_MAGIC.len()];
+    if version != FRAME_VERSION && version != FRAME_VERSION_LEGACY {
+        return None;
+    }
+    if prefix[FRAME_MAGIC.len() + 1] != FRAME_CHUNK {
+        return None;
+    }
+    let node_len = usize::from(u16::from_be_bytes([prefix[header], prefix[header + 1]]));
+    let start = header + 2 + node_len;
+    let ids = prefix.get(start..start + 16)?;
+    Some((
+        u64::from_be_bytes(ids[..8].try_into().ok()?),
+        u64::from_be_bytes(ids[8..].try_into().ok()?),
+    ))
+}
+
+/// The slot payload of a decoded chunk frame: what the cache stores for the
+/// slot.
+pub fn chunk_frame_payload(frame: &[u8]) -> Option<(u64, u64, Bytes)> {
+    match MeshFrame::decode(frame).ok()? {
+        MeshFrame::Chunk {
+            stream_id,
+            slot_id,
+            payload,
+            ..
+        } => Some((stream_id, slot_id, payload)),
+        _ => None,
+    }
+}
+
 /// Holds the optional send observer so that the configuration stays `Debug`.
 #[derive(Clone, Default)]
 struct SendObserverSlot(Option<CacheMeshSendObserver>);
@@ -266,6 +330,8 @@ pub struct CacheMeshConfig {
     block_id_offset: u32,
     /// Told when the first datagram of each part leaves for a child.
     send_observer: SendObserverSlot,
+    /// Told of every received datagram and decoded block.
+    receive_observer: ReceiveObserverSlot,
 }
 
 impl CacheMeshConfig {
@@ -300,6 +366,7 @@ impl CacheMeshConfig {
             receive_loss_ppm: 0,
             block_id_offset: 0,
             send_observer: SendObserverSlot(None),
+            receive_observer: ReceiveObserverSlot(None),
         }
     }
 
@@ -398,6 +465,13 @@ impl CacheMeshConfig {
     /// task hands the first datagram of a part to the kernel for a child.
     pub fn with_send_observer(mut self, observer: CacheMeshSendObserver) -> Self {
         self.send_observer = SendObserverSlot(Some(observer));
+        self
+    }
+
+    /// Be told of every received datagram, before it is decoded, and of
+    /// every decoded block (see [`CacheMeshReceiveObserver`]).
+    pub fn with_receive_observer(mut self, observer: Arc<dyn CacheMeshReceiveObserver>) -> Self {
+        self.receive_observer = ReceiveObserverSlot(Some(observer));
         self
     }
 }
@@ -2209,9 +2283,17 @@ async fn receive_task(
                     }
                 }
 
+                if let Some(observer) = &config.receive_observer.0 {
+                    observer.datagram(peer, &buf[..len]);
+                }
                 let DecodedBlock { frame: decoded, first_seen_us } =
                     match receiver.push_at(peer, &buf[..len], received_us) {
-                        Ok(Some(decoded)) => decoded,
+                        Ok(Some(decoded)) => {
+                            if let Some(observer) = &config.receive_observer.0 {
+                                observer.decoded(peer, &buf[..len], &decoded.frame);
+                            }
+                            decoded
+                        }
                         Ok(None) => continue,
                         Err(err) => {
                             warn!(peer = %peer, error = %err, "cache mesh FEC decode failed");
@@ -3712,6 +3794,24 @@ mod tests {
         assert_eq!(receiver.push(peer, late_source).unwrap(), None);
         assert_eq!(stats.rx_late_source_datagrams, 0);
         assert_eq!(receiver.stats.snapshot().rx_late_source_datagrams, 1);
+    }
+
+    #[test]
+    fn the_slot_of_a_chunk_frame_is_read_from_its_first_bytes() {
+        let frame = MeshFrame::chunk("distributor-a", 3001, 77, Bytes::from_static(b"part"))
+            .encode()
+            .unwrap();
+        assert_eq!(chunk_frame_slot(&frame[..45]), Some((3001, 77)));
+        assert_eq!(chunk_frame_slot(&frame), Some((3001, 77)));
+        assert_eq!(chunk_frame_slot(&frame[..20]), None);
+        assert_eq!(
+            chunk_frame_payload(&frame),
+            Some((3001, 77, Bytes::from_static(b"part")))
+        );
+        let hello = MeshFrame::hello_with_role("n", "r", CacheMeshRole::Edge, Vec::new())
+            .encode()
+            .unwrap();
+        assert_eq!(chunk_frame_slot(&hello), None);
     }
 
     #[test]
