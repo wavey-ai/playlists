@@ -208,9 +208,16 @@ impl M3u8Manifest {
         self.open.parts
     }
 
-    /// Whether a part with this independence would open a new segment.
-    pub fn opens_segment(&self, key: bool) -> bool {
-        key && self.open.duration_us >= u64::from(self.options.segment_min_ms) * 1_000
+    /// Whether a part of `duration_us` with this independence would open a
+    /// new segment: an independent part once the open segment is at least
+    /// `segment_min_ms` long, or any part that would make the open
+    /// segment's EXTINF round above TARGETDURATION.
+    pub fn opens_segment(&self, duration_us: u64, key: bool) -> bool {
+        if self.open.parts == 0 {
+            return false;
+        }
+        (key && self.open.duration_us >= u64::from(self.options.segment_min_ms) * 1_000)
+            || self.open.duration_us.saturating_add(duration_us) >= self.options.segment_limit_us()
     }
 
     pub fn set_rendition_reports(&mut self, reports: Vec<RenditionReport>) {
@@ -223,7 +230,7 @@ impl M3u8Manifest {
     }
 
     fn target_duration_us(&self) -> u64 {
-        u64::from(ms_to_target_duration(self.options.target_duration_ms)) * 1_000_000
+        u64::from(self.options.target_duration_secs()) * 1_000_000
     }
 
     fn end_us(&self) -> u64 {
@@ -304,7 +311,9 @@ impl M3u8Manifest {
 
     /// Add a part of `duration_us` microseconds without rendering the
     /// playlist. A part that is independent (`key`) opens a new segment once
-    /// the open one is at least `segment_min_ms` long.
+    /// the open one is at least `segment_min_ms` long; any part opens one
+    /// that the open segment cannot take without its EXTINF rounding above
+    /// TARGETDURATION.
     pub fn push_part_us(
         &mut self,
         duration_us: u64,
@@ -312,7 +321,7 @@ impl M3u8Manifest {
         byte_range: Option<MediaByteRange>,
         byte_len: Option<u64>,
     ) -> PartPosition {
-        let new_segment = self.opens_segment(key);
+        let new_segment = self.opens_segment(duration_us, key);
         if new_segment {
             self.close_segment();
         }
@@ -454,7 +463,7 @@ impl M3u8Manifest {
         }
         append_rendition_reports(&mut tail, &self.rendition_reports);
 
-        let target_duration = ms_to_target_duration(self.options.target_duration_ms);
+        let target_duration = self.options.target_duration_secs();
         let target_duration_us = u64::from(target_duration) * 1_000_000;
         let can_skip_until_us = target_duration_us * 6;
         let can_skip = self
@@ -593,10 +602,6 @@ fn valid_quoted_string_value(value: &str) -> bool {
     !value
         .bytes()
         .any(|byte| matches!(byte, b'"' | b'\n' | b'\r'))
-}
-
-fn ms_to_target_duration(ms: u32) -> u32 {
-    u64::from(ms).div_ceil(1000).max(1) as u32
 }
 
 #[cfg(test)]
@@ -903,11 +908,13 @@ mod tests {
     fn options_derive_ring_sizes_from_time_and_keep_given_counts() {
         let options = Options::default().normalized();
         assert_eq!(options.part_target_us(), 2_500);
-        // 1 s segments of 2.5 ms parts: 400 parts, a quarter more and 8.
-        assert_eq!(options.max_parts_per_segment, 508);
+        // A segment is closed before 1.5 s (TARGETDURATION 1): 600 parts of
+        // 2.5 ms, a quarter more and 8.
+        assert_eq!(options.segment_limit_us(), 1_500_000);
+        assert_eq!(options.max_parts_per_segment, 758);
         // 12 s of 1 s segments and the open one.
         assert_eq!(options.max_segments, 13);
-        assert_eq!(options.normalized().max_parts_per_segment, 508);
+        assert_eq!(options.normalized().max_parts_per_segment, 758);
         assert_eq!(options.normalized().part_target_us(), 2_500);
 
         let quarter_ms = Options {
@@ -915,7 +922,17 @@ mod tests {
             ..Options::default()
         }
         .normalized();
-        assert_eq!(quarter_ms.max_parts_per_segment, 4_000 + 1_000 + 8);
+        assert_eq!(quarter_ms.max_parts_per_segment, 6_000 + 1_500 + 8);
+
+        // The target duration covers the minimum segment.
+        let long_segments = Options {
+            segment_min_ms: 1_500,
+            ..Options::default()
+        }
+        .normalized();
+        assert_eq!(long_segments.target_duration_ms, 1_500);
+        assert_eq!(long_segments.target_duration_secs(), 2);
+        assert_eq!(long_segments.normalized().target_duration_ms, 1_500);
 
         // The millisecond field still works, and wins when set.
         let legacy = Options {
@@ -1006,6 +1023,76 @@ mod tests {
         assert!(playlist.contains("#EXT-X-PART:DURATION=0.041708,"));
         assert!(playlist.contains("#EXT-X-PART:DURATION=0.041709,"));
         assert!(playlist.contains("#EXTINF:2.002,\ns1.mp4"));
+        assert_valid_ll_hls(&playlist);
+    }
+
+    /// Frames of `fps_num / fps_den` frames a second with a key frame every
+    /// `gop` frames, for `frames` frames, into a playlist of default options
+    /// but the part target.
+    fn video_with_default_options(
+        fps_num: u64,
+        fps_den: u64,
+        gop: u64,
+        frames: u64,
+        part_target_us: u32,
+    ) -> String {
+        let mut manifest = M3u8Manifest::new(Options {
+            part_target_us,
+            ..Options::default()
+        });
+        let mut elapsed = 0_u64;
+        for frame in 0..frames {
+            let end = (frame + 1) * 1_000_000 * fps_den / fps_num;
+            manifest.push_part_us(end - elapsed, frame % gop == 0, None, None);
+            elapsed = end;
+        }
+        String::from_utf8(manifest.m3u8().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn a_gop_longer_than_the_target_duration_keeps_the_playlist_valid() {
+        // 60 fps, a key frame every 2 s, default options (TARGETDURATION 1).
+        let playlist = video_with_default_options(60, 1, 120, 600, 16_667);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"));
+        assert_valid_ll_hls(&playlist);
+        // A segment that a key frame does not close is closed before its
+        // EXTINF rounds above 1: at 89 frames, 1.483333 s.
+        assert!(playlist.contains("#EXTINF:1.483333,\ns1.mp4"), "{playlist}");
+
+        // 23.976 fps, a key frame every 48 frames (2.002 s).
+        let playlist = video_with_default_options(24_000, 1_001, 48, 480, 41_709);
+        assert_valid_ll_hls(&playlist);
+
+        // With the target duration set to the GOP, every segment starts on
+        // a key frame, as before.
+        let mut manifest = M3u8Manifest::new(Options {
+            part_target_us: 16_667,
+            target_duration_ms: 2_000,
+            ..Options::default()
+        });
+        let mut elapsed = 0_u64;
+        for frame in 0..600_u64 {
+            let end = (frame + 1) * 1_000_000 / 60;
+            manifest.push_part_us(end - elapsed, frame % 120 == 0, None, None);
+            elapsed = end;
+        }
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        assert!(playlist.contains("#EXTINF:2.000,\ns1.mp4"));
+        assert_valid_ll_hls(&playlist);
+    }
+
+    #[test]
+    fn a_minimum_segment_longer_than_the_target_raises_the_target() {
+        let mut manifest = M3u8Manifest::new(Options {
+            segment_min_ms: 1_500,
+            ..Options::default()
+        });
+        for _ in 0..2_000 {
+            manifest.push_part_us(2_500, true, None, None);
+        }
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(playlist.contains("#EXTINF:1.500,\ns1.mp4"));
         assert_valid_ll_hls(&playlist);
     }
 

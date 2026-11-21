@@ -337,7 +337,7 @@ impl M3u8Cache {
             let manifest = slot
                 .manifest
                 .get_or_insert_with(|| M3u8Manifest::new(options));
-            if !manifest.opens_segment(key)
+            if !manifest.opens_segment(duration_us, key)
                 && manifest.open_parts() >= options.max_parts_per_segment
             {
                 return Err(CacheError::IndexOutOfBounds);
@@ -1013,6 +1013,35 @@ mod tests {
         ));
         // Nothing was added for the refused part.
         assert_eq!(cache.last_position(9), Some((1, 3)));
+    }
+
+    #[test]
+    fn default_options_take_every_frame_of_a_long_gop() {
+        // 60 fps with a key frame every 2 s, and 23.976 fps with one every 48
+        // frames: every frame is taken, for ten seconds.
+        for (fps_num, fps_den, gop, part_target_us) in
+            [(60_u64, 1_u64, 120_u64, 16_667_u32), (24_000, 1_001, 48, 41_709)]
+        {
+            let cache = M3u8Cache::new(Options {
+                part_target_us,
+                ..Options::default()
+            });
+            let mut elapsed = 0_u64;
+            let frames = 10 * fps_num / fps_den;
+            for frame in 0..frames {
+                let end = (frame + 1) * 1_000_000 * fps_den / fps_num;
+                cache
+                    .add_part_us(9, end - elapsed, frame % gop == 0, None)
+                    .unwrap_or_else(|err| panic!("frame {frame} refused: {err}"));
+                elapsed = end;
+            }
+            let playlist = decompress(&cache.last(9).unwrap().unwrap().0);
+            assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"));
+            for extinf in playlist.lines().filter_map(|line| line.strip_prefix("#EXTINF:")) {
+                let seconds: f64 = extinf.trim_end_matches(',').parse().unwrap();
+                assert!(seconds.round() <= 1.0, "{extinf}");
+            }
+        }
     }
 
     #[test]

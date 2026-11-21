@@ -56,6 +56,13 @@ pub struct Options {
     /// `parted_target_durations` applies.
     pub max_parted_segments: usize,
     pub segment_min_ms: u32,
+    /// EXT-X-TARGETDURATION, rounded up to whole seconds. It is at least
+    /// `segment_min_ms`. A segment closes on the first independent part at
+    /// or after `segment_min_ms`, and before its EXTINF would round above
+    /// the target duration even when that part is not independent (RFC
+    /// 8216bis 4.4.3.1). Video with a GOP longer than about the target
+    /// duration therefore gets segments that do not all start with a key
+    /// frame: set the target to the GOP to keep them aligned.
     pub target_duration_ms: u32,
     /// PART-TARGET in whole milliseconds. Kept for compatibility: a non-zero
     /// value wins over `part_target_us`. Zero (the default) uses
@@ -124,6 +131,19 @@ impl Options {
         }
     }
 
+    /// EXT-X-TARGETDURATION in whole seconds: the target duration rounded
+    /// up, at least one.
+    pub fn target_duration_secs(&self) -> u32 {
+        u32::try_from(u64::from(self.target_duration_ms).div_ceil(1_000).max(1)).unwrap_or(u32::MAX)
+    }
+
+    /// A segment is closed before it reaches this many microseconds, so that
+    /// its EXTINF, rounded to the nearest second, is at most
+    /// TARGETDURATION.
+    pub fn segment_limit_us(&self) -> u64 {
+        u64::from(self.target_duration_secs()) * 1_000_000 + 500_000
+    }
+
     /// PART-HOLD-BACK in microseconds: three part targets, or the configured
     /// floor when it is larger.
     pub fn part_hold_back_us(&self) -> u64 {
@@ -143,15 +163,21 @@ impl Options {
         };
         self.num_playlists = self.num_playlists.max(1);
         self.segment_min_ms = self.segment_min_ms.max(1);
-        self.target_duration_ms = self.target_duration_ms.max(1000);
+        // A segment is at least `segment_min_ms` long, and its EXTINF must
+        // not round above TARGETDURATION.
+        self.target_duration_ms = self
+            .target_duration_ms
+            .max(self.segment_min_ms)
+            .max(1000);
         if self.window_ms == 0 {
             self.window_ms = DEFAULT_WINDOW_MS;
         }
         if self.max_parts_per_segment == 0 {
             // A segment closes on the first independent part at or after
-            // `segment_min_ms`, and is at most the target duration long. A
-            // quarter more, plus a few parts, covers a segment that runs long.
-            let segment_us = u64::from(self.segment_min_ms.max(self.target_duration_ms)) * 1_000;
+            // `segment_min_ms`, and in any case before it reaches
+            // `segment_limit_us`. A quarter more, plus a few parts, covers
+            // parts that are shorter than the part target.
+            let segment_us = self.segment_limit_us();
             let parts = segment_us.div_ceil(u64::from(part_us));
             let parts = parts + parts.div_ceil(4) + 8;
             self.max_parts_per_segment = usize::try_from(parts).unwrap_or(usize::MAX);
