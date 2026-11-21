@@ -1,28 +1,69 @@
+use crate::m3u8_manifest::{parse_seconds_us, M3u8Manifest, PartPosition};
 use crate::Options;
 
 use crate::CacheError;
-use bytes::{BufMut, Bytes, BytesMut};
-use flate2::read::GzDecoder;
+use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::collections::BTreeMap;
 use std::io::prelude::*;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Mutex, RwLock,
+    Mutex, MutexGuard, RwLock,
 };
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
-const M3U8_HEADER_LEN: usize = 24;
+/// Playlists are compressed when a reader asks for them, once for each new
+/// part: the fastest level keeps that cheap.
+const PLAYLIST_GZIP_LEVEL: Compression = Compression::fast();
 
 #[derive(Debug, Clone, Copy)]
 struct MediaSegmentBlock {
     start: usize,
-    duration_ms: u64,
+    duration_us: u64,
 }
 
+/// One rendering of a playlist.
+#[derive(Clone)]
+struct Rendered {
+    version: u64,
+    text: Bytes,
+    gzip: Bytes,
+    hash: u64,
+}
+
+/// The playlist of one stream slot.
+#[derive(Default)]
+struct PlaylistSlot {
+    /// Generation of the stream slot that this state belongs to.
+    generation: usize,
+    /// Advances with every part, and with every stored playlist.
+    version: u64,
+    /// The live playlist, when parts are added with
+    /// [`M3u8Cache::add_part_us`]. A playlist is rendered from it only when it
+    /// is read.
+    manifest: Option<M3u8Manifest>,
+    /// The newest rendering, or the playlist stored with [`M3u8Cache::add`].
+    rendered: Option<Rendered>,
+    /// The delta update of `rendered`.
+    delta: Option<(u64, Option<(Bytes, u64)>)>,
+}
+
+/// Compressed LL-HLS playlists of live streams, and their initialization
+/// sections.
+///
+/// A stream's playlist is kept as a live [`M3u8Manifest`] and rendered when it
+/// is read, once for each new part however many readers ask, so adding a part
+/// costs no rendering or compression. The memory is one playlist per stream,
+/// not one snapshot per part. A reader that asks for a part's playlist is
+/// given the newest playlist, which contains that part (RFC 8216bis: a
+/// blocking reload is answered with a playlist that contains the part or a
+/// later one).
 pub struct M3u8Cache {
-    buffer: Vec<RwLock<Bytes>>,
+    slots: Vec<Mutex<PlaylistSlot>>,
+    /// Readers that render take this, so that one renders and the others
+    /// find the rendering. Writers never take it.
+    render_locks: Vec<Mutex<()>>,
     seg_parts: Vec<AtomicUsize>,
     last_seg: Vec<AtomicUsize>,
     last_part: Vec<AtomicUsize>,
@@ -35,26 +76,32 @@ pub struct M3u8Cache {
     stream_id_mutex: Mutex<()>,
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl M3u8Cache {
     pub fn new(mut options: Options) -> Self {
         options = options.normalized();
-        options.buffer_size_kb = 5;
-        let buffer_size_bytes = options.buffer_size_kb * 1024;
         let init_size_bytes = options.init_size_kb * 1024;
-
-        let buffer_repeat_value = Bytes::from(vec![0u8; buffer_size_bytes]);
         let init_repeat_value = Bytes::from(vec![0u8; init_size_bytes]);
 
-        let buffer_size =
-            options.num_playlists * options.max_parts_per_segment * options.max_segments;
-        let buffer = (0..buffer_size)
-            .map(|_| RwLock::new(buffer_repeat_value.clone()))
+        let num_playlists = options.num_playlists;
+        let slots = (0..num_playlists)
+            .map(|_| {
+                Mutex::new(PlaylistSlot {
+                    generation: 1,
+                    ..PlaylistSlot::default()
+                })
+            })
             .collect();
+        let render_locks = (0..num_playlists).map(|_| Mutex::new(())).collect();
 
-        let seg_parts_size = options.max_segments * options.num_playlists;
+        let seg_parts_size = options.max_segments * num_playlists;
         let seg_parts = (0..seg_parts_size).map(|_| AtomicUsize::new(0)).collect();
 
-        let num_playlists = options.num_playlists;
         let last_seg = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
         let last_part = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
         let last_seq = (0..num_playlists).map(|_| AtomicUsize::new(0)).collect();
@@ -64,7 +111,8 @@ impl M3u8Cache {
             .collect();
 
         Self {
-            buffer,
+            slots,
+            render_locks,
             seg_parts,
             last_seg,
             last_part,
@@ -76,6 +124,10 @@ impl M3u8Cache {
             options,
             stream_id_mutex: Mutex::new(()),
         }
+    }
+
+    pub fn options(&self) -> &Options {
+        &self.options
     }
 
     fn offset(&self, stream_id: u64) -> Option<usize> {
@@ -136,15 +188,6 @@ impl M3u8Cache {
         self.set_last_part(stream_id, 0)?;
         self.set_last_seq(stream_id, 0)?;
 
-        let seg_idx = self
-            .options
-            .max_segments
-            .checked_mul(idx)
-            .ok_or(CacheError::ArithmeticOverflow)?;
-        for n in seg_idx..(seg_idx + self.options.max_segments) {
-            self.seg_parts[n].store(0, Ordering::Release);
-        }
-
         self.offset.store(next_offset, Ordering::Release);
         Ok(())
     }
@@ -164,12 +207,17 @@ impl M3u8Cache {
         self.last_seg[idx].store(0, Ordering::Release);
         self.last_part[idx].store(0, Ordering::Release);
         self.last_seq[idx].store(0, Ordering::Release);
-        let next = self.generations[idx]
+        let mut next = self.generations[idx]
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         if next == 0 {
+            next = 1;
             self.generations[idx].store(1, Ordering::Release);
         }
+        *lock(&self.slots[idx]) = PlaylistSlot {
+            generation: next,
+            ..PlaylistSlot::default()
+        };
 
         let seg_idx = self
             .options
@@ -229,6 +277,91 @@ impl M3u8Cache {
         }
     }
 
+    /// The stream's slot and generation, creating the stream when it is new.
+    fn stream_slot(&self, stream_id: u64) -> Result<(usize, usize), CacheError> {
+        if self.offset(stream_id).is_none() {
+            self.add_stream_id(stream_id)?;
+        }
+        self.offset_and_generation(stream_id)
+            .ok_or(CacheError::StreamNotFound)
+    }
+
+    /// Record that part `seq` at `idx` of segment `segment_id` is the newest.
+    fn advance_position(
+        &self,
+        n: usize,
+        generation: usize,
+        segment_id: usize,
+        seq: usize,
+        idx: usize,
+    ) -> Result<(), CacheError> {
+        if idx == 0 {
+            // The first part of a segment closes the one before it.
+            if let Some(previous) = segment_id.checked_sub(1) {
+                let wrapped = previous % self.options.max_segments;
+                if let Some(slot) = self.seg_parts.get(n * self.options.max_segments + wrapped) {
+                    slot.store(seq, Ordering::Release);
+                }
+            }
+        }
+        if self.generations[n].load(Ordering::Acquire) != generation {
+            return Err(CacheError::StreamNotFound);
+        }
+        self.last_seg[n].store(segment_id, Ordering::Release);
+        self.last_part[n].store(idx, Ordering::Release);
+        self.last_seq[n].store(seq, Ordering::Release);
+        Ok(())
+    }
+
+    /// Add a part of `duration_us` microseconds to the stream's live playlist,
+    /// creating the stream when it is new. No playlist is rendered unless the
+    /// options ask for eager rendering: a reader renders it.
+    ///
+    /// Fails with [`CacheError::IndexOutOfBounds`], and adds nothing, when
+    /// the part would not open a new segment and the open one already holds
+    /// `max_parts_per_segment` parts.
+    pub fn add_part_us(
+        &self,
+        stream_id: u64,
+        duration_us: u64,
+        key: bool,
+        byte_len: Option<usize>,
+    ) -> Result<PartPosition, CacheError> {
+        let (n, generation) = self.stream_slot(stream_id)?;
+        let position = {
+            let mut slot = lock(&self.slots[n]);
+            if slot.generation != generation {
+                return Err(CacheError::StreamNotFound);
+            }
+            let options = self.options;
+            let manifest = slot
+                .manifest
+                .get_or_insert_with(|| M3u8Manifest::new(options));
+            if !manifest.opens_segment(key)
+                && manifest.open_parts() >= options.max_parts_per_segment
+            {
+                return Err(CacheError::IndexOutOfBounds);
+            }
+            let position =
+                manifest.push_part_us(duration_us, key, None, byte_len.map(|len| len as u64));
+            slot.version += 1;
+            position
+        };
+        self.advance_position(
+            n,
+            generation,
+            position.segment_id,
+            position.sequence,
+            position.index,
+        )?;
+        if self.options.eager_render {
+            let _ = self.render(n, generation);
+        }
+        Ok(position)
+    }
+
+    /// Store a rendered playlist as the stream's newest, for part `seq` at
+    /// `idx` of segment `segment_id`. Returns the hash of the playlist.
     pub fn add(
         &self,
         stream_id: u64,
@@ -237,48 +370,28 @@ impl M3u8Cache {
         idx: usize,
         data: Bytes,
     ) -> Result<u64, CacheError> {
-        if self.offset(stream_id).is_none() {
-            self.add_stream_id(stream_id)?;
-        }
-        let (_, generation) = self
-            .offset_and_generation(stream_id)
-            .ok_or(CacheError::StreamNotFound)?;
-
-        if idx == 0 {
-            self.end_segment(stream_id, segment_id, seq)?;
-        }
-
-        let h = const_xxh3(&data);
-        let gz = self.compress_data(&data)?;
-        let b = Bytes::from(gz);
-        if segment_id > u32::MAX as usize || b.len() > u32::MAX as usize {
+        let (n, generation) = self.stream_slot(stream_id)?;
+        if segment_id > u32::MAX as usize {
             return Err(CacheError::BufferOverflow);
         }
-
-        let mut packet = BytesMut::new();
-        packet.put_u32(segment_id as u32);
-        packet.put_u32(b.len() as u32);
-        packet.put_u64(generation as u64);
-        packet.put_u64(h);
-        packet.put(b);
-
-        if let Some(i) = self.calculate_index(stream_id, segment_id, idx)? {
-            let mut lock = self.buffer[i].write().unwrap();
-            *lock = packet.freeze();
-        }
-
-        if self
-            .offset_and_generation(stream_id)
-            .map(|(_, current_generation)| current_generation)
-            != Some(generation)
+        let hash = const_xxh3(&data);
+        let gzip = Bytes::from(compress_data(&data)?);
         {
-            return Err(CacheError::StreamNotFound);
+            let mut slot = lock(&self.slots[n]);
+            if slot.generation != generation {
+                return Err(CacheError::StreamNotFound);
+            }
+            slot.version += 1;
+            slot.manifest = None;
+            slot.rendered = Some(Rendered {
+                version: slot.version,
+                text: data,
+                gzip,
+                hash,
+            });
         }
-        self.set_last_seg(stream_id, segment_id)?;
-        self.set_last_part(stream_id, idx)?;
-        self.set_last_seq(stream_id, seq)?;
-
-        Ok(h)
+        self.advance_position(n, generation, segment_id, seq, idx)?;
+        Ok(hash)
     }
 
     pub fn end_segment(
@@ -295,60 +408,103 @@ impl M3u8Cache {
         ) {
             self.seg_parts[idx].store(part_id, Ordering::Release);
         }
-        if let Ok(idx) = self.calculate_seg_index(stream_id, segment_id) {
-            self.zero_buffer(idx);
-        }
         Ok(())
     }
 
-    fn zero_buffer(&self, idx: usize) {
-        let buffer_size_bytes = self.options.buffer_size_kb * 1024;
-        let buffer_repeat_value = Bytes::from(vec![0u8; buffer_size_bytes]);
-
-        let Some(start) = idx.checked_mul(self.options.max_parts_per_segment) else {
-            return;
+    /// The newest playlist of slot `n`, rendered now if no reader has
+    /// rendered it since the last part.
+    fn render(&self, n: usize, generation: usize) -> Option<Rendered> {
+        let fresh = |slot: &PlaylistSlot| {
+            slot.rendered
+                .as_ref()
+                .filter(|rendered| {
+                    slot.generation == generation && rendered.version == slot.version
+                })
+                .cloned()
         };
-        if start >= self.buffer.len() {
-            return;
+        if let Some(rendered) = fresh(&lock(&self.slots[n])) {
+            return Some(rendered);
         }
-        let end = start
-            .saturating_add(self.options.max_parts_per_segment)
-            .min(self.buffer.len());
-        for lock in &self.buffer[start..end] {
-            let mut buf = lock.write().unwrap();
-            *buf = buffer_repeat_value.clone();
+        let _render = lock(&self.render_locks[n]);
+        let (version, pieces) = {
+            let slot = lock(&self.slots[n]);
+            if slot.generation != generation {
+                return None;
+            }
+            if let Some(rendered) = fresh(&slot) {
+                return Some(rendered);
+            }
+            match &slot.manifest {
+                Some(manifest) => (slot.version, manifest.pieces()),
+                // A stored playlist that a newer one has not replaced.
+                None => return slot.rendered.clone(),
+            }
+        };
+        let text = pieces.into_bytes();
+        let hash = const_xxh3(&text);
+        let gzip = Bytes::from(compress_data(&text).ok()?);
+        let rendered = Rendered {
+            version,
+            text,
+            gzip,
+            hash,
+        };
+        let mut slot = lock(&self.slots[n]);
+        if slot.generation == generation
+            && slot
+                .rendered
+                .as_ref()
+                .is_none_or(|current| current.version < version)
+        {
+            slot.rendered = Some(rendered.clone());
         }
+        Some(rendered)
     }
 
-    fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data)?;
-        Ok(encoder.finish()?)
-    }
-
-    fn decompress_data(&self, data: &[u8]) -> Result<String, CacheError> {
-        let mut decoder = GzDecoder::new(data);
-        let mut decoded = String::new();
-        decoder.read_to_string(&mut decoded)?;
-        Ok(decoded)
-    }
-
-    fn delta_from_gzip(&self, data: &Bytes) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let playlist = self.decompress_data(data)?;
-        let Some(delta) = playlist_delta_update(&playlist) else {
+    /// The delta update of the newest playlist of slot `n`.
+    fn render_delta(
+        &self,
+        n: usize,
+        generation: usize,
+    ) -> Result<Option<(Bytes, u64)>, CacheError> {
+        let Some(rendered) = self.render(n, generation) else {
             return Ok(None);
         };
-        let h = const_xxh3(delta.as_bytes());
-        Ok(Some((
-            Bytes::from(self.compress_data(delta.as_bytes())?),
-            h,
-        )))
+        {
+            let slot = lock(&self.slots[n]);
+            if let Some((version, delta)) = &slot.delta {
+                if slot.generation == generation && *version == rendered.version {
+                    return Ok(delta.clone());
+                }
+            }
+        }
+        let text = std::str::from_utf8(&rendered.text).map_err(|_| {
+            CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "playlist is not UTF-8",
+            ))
+        })?;
+        let delta = match playlist_delta_update(text) {
+            Some(delta) => {
+                let hash = const_xxh3(delta.as_bytes());
+                Some((Bytes::from(compress_data(delta.as_bytes())?), hash))
+            }
+            None => None,
+        };
+        let mut slot = lock(&self.slots[n]);
+        if slot.generation == generation {
+            slot.delta = Some((rendered.version, delta.clone()));
+        }
+        Ok(delta)
     }
 
     fn is_included(&self, stream_id: u64, segment_id: usize, part_idx: usize) -> bool {
         if let (Some(last_seg), Some(last_part)) =
             (self.last_seg(stream_id), self.last_part(stream_id))
         {
+            if last_seg == 0 {
+                return false;
+            }
             if segment_id < last_seg || (segment_id == last_seg && part_idx <= last_part) {
                 return true;
             }
@@ -365,50 +521,6 @@ impl M3u8Cache {
                 .checked_mul(segments_per_stream)
                 .and_then(|result| result.checked_add(wrapped_segment_idx))
                 .ok_or(CacheError::ArithmeticOverflow)
-        } else {
-            Err(CacheError::StreamNotFound)
-        }
-    }
-
-    fn calculate_index(
-        &self,
-        stream_id: u64,
-        segment_id: usize,
-        seq: usize,
-    ) -> Result<Option<usize>, CacheError> {
-        if segment_id == 0 {
-            return Ok(None);
-        }
-
-        if let Some(offset) = self.offset(stream_id) {
-            let parts_per_segment = self.options.max_parts_per_segment;
-            let segments_per_stream = self.options.max_segments;
-
-            if seq >= parts_per_segment {
-                return Err(CacheError::IndexOutOfBounds);
-            }
-
-            // Calculate the wrapped segment index
-            let wrapped_segment_idx = (segment_id - 1) % segments_per_stream;
-
-            // Calculate the index within the stream's buffer
-            let stream_index = wrapped_segment_idx
-                .checked_mul(parts_per_segment)
-                .and_then(|result| result.checked_add(seq))
-                .ok_or(CacheError::ArithmeticOverflow)?;
-
-            // Calculate the global index
-            let stream_capacity = segments_per_stream
-                .checked_mul(parts_per_segment)
-                .ok_or(CacheError::ArithmeticOverflow)?;
-            let global_index = offset
-                .checked_mul(stream_capacity)
-                .and_then(|result| result.checked_add(stream_index))
-                .ok_or(CacheError::ArithmeticOverflow)?;
-
-            // Ensure the global index wraps within the total buffer size
-            let total_buffer_size = self.buffer.len();
-            Ok(Some(global_index % total_buffer_size))
         } else {
             Err(CacheError::StreamNotFound)
         }
@@ -443,50 +555,19 @@ impl M3u8Cache {
         Ok(None)
     }
 
-    fn get_bytes(&self, data: &Bytes) -> Result<(Bytes, usize, usize, u64), CacheError> {
-        if data.len() < M3U8_HEADER_LEN {
-            return Err(CacheError::BufferOverflow);
-        }
-        let seg_id = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
-        let data_size = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
-        let generation = u64::from_be_bytes(data[8..16].try_into().unwrap());
-        let h = u64::from_be_bytes(data[16..24].try_into().unwrap());
-        let end = M3U8_HEADER_LEN
-            .checked_add(data_size)
-            .ok_or(CacheError::BufferOverflow)?;
-        if data.len() < end || generation > usize::MAX as u64 {
-            return Err(CacheError::BufferOverflow);
-        }
-        let payload = data.slice(M3U8_HEADER_LEN..end);
-        Ok((payload, seg_id, generation as usize, h))
-    }
-
+    /// The compressed playlist that answers a request for part `part_idx` of
+    /// segment `segment_id`, and the hash of the playlist text: the newest
+    /// playlist, once it contains that part. `None` before then.
     pub fn get(
         &self,
         stream_id: u64,
         segment_id: usize,
         part_idx: usize,
     ) -> Result<Option<(Bytes, u64)>, CacheError> {
-        if self.is_included(stream_id, segment_id, part_idx) {
-            let (_, generation) = self
-                .offset_and_generation(stream_id)
-                .ok_or(CacheError::StreamNotFound)?;
-            if let Some(idx) = self.calculate_index(stream_id, segment_id, part_idx)? {
-                let lock = self.buffer[idx].read().unwrap();
-                let (payload, seg_id, stored_generation, h) = self.get_bytes(&lock)?;
-                if seg_id != segment_id || stored_generation != generation {
-                    Ok(None)
-                } else if h != 0 {
-                    Ok(Some((payload, h)))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
+        if !self.is_included(stream_id, segment_id, part_idx) {
+            return Ok(None);
         }
+        self.last(stream_id)
     }
 
     pub fn get_delta(
@@ -495,41 +576,50 @@ impl M3u8Cache {
         segment_id: usize,
         part_idx: usize,
     ) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let Some((data, _)) = self.get(stream_id, segment_id, part_idx)? else {
+        if !self.is_included(stream_id, segment_id, part_idx) {
             return Ok(None);
-        };
-        self.delta_from_gzip(&data)
+        }
+        self.last_delta(stream_id)
     }
 
+    /// The newest compressed playlist and the hash of its text.
     pub fn last(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
-        if let (Some(last_seg), Some(last_part)) =
-            (self.last_seg(stream_id), self.last_part(stream_id))
-        {
-            let (_, generation) = self
-                .offset_and_generation(stream_id)
-                .ok_or(CacheError::StreamNotFound)?;
-            if let Some(idx) = self.calculate_index(stream_id, last_seg, last_part)? {
-                let lock = self.buffer[idx].read().unwrap();
-                let (payload, seg_id, stored_generation, h) = self.get_bytes(&lock)?;
-                if seg_id == last_seg && stored_generation == generation && h != 0 {
-                    Ok(Some((payload, h)))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
+        let (n, generation) = self
+            .offset_and_generation(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        Ok(self
+            .render(n, generation)
+            .map(|rendered| (rendered.gzip, rendered.hash)))
+    }
+
+    /// The newest playlist, uncompressed.
+    pub fn last_text(&self, stream_id: u64) -> Result<Option<Bytes>, CacheError> {
+        let (n, generation) = self
+            .offset_and_generation(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        Ok(self.render(n, generation).map(|rendered| rendered.text))
     }
 
     pub fn last_delta(&self, stream_id: u64) -> Result<Option<(Bytes, u64)>, CacheError> {
-        let Some((data, _)) = self.last(stream_id)? else {
-            return Ok(None);
-        };
-        self.delta_from_gzip(&data)
+        let (n, generation) = self
+            .offset_and_generation(stream_id)
+            .ok_or(CacheError::StreamNotFound)?;
+        self.render_delta(n, generation)
     }
+}
+
+fn compress_data(data: &[u8]) -> Result<Vec<u8>, CacheError> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 4 + 64), PLAYLIST_GZIP_LEVEL);
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
+}
+
+#[cfg(test)]
+fn decompress_data(data: &[u8]) -> Result<String, CacheError> {
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded)?;
+    Ok(decoded)
 }
 
 fn playlist_delta_update(playlist: &str) -> Option<String> {
@@ -537,24 +627,24 @@ fn playlist_delta_update(playlist: &str) -> Option<String> {
         return None;
     }
 
-    let skip_boundary_ms = parse_can_skip_until_ms(playlist)?;
+    let skip_boundary_us = parse_can_skip_until_us(playlist)?;
     let lines: Vec<&str> = playlist.lines().collect();
-    let (blocks, trailing_start, trailing_part_duration_ms) = parse_media_timeline(&lines);
+    let (blocks, trailing_start, trailing_part_duration_us) = parse_media_timeline(&lines);
     let insert_at = blocks
         .first()
         .map(|block| block.start)
         .unwrap_or(trailing_start);
 
-    let total_parent_duration_ms = blocks
+    let total_parent_duration_us = blocks
         .iter()
-        .map(|block| block.duration_ms)
-        .fold(trailing_part_duration_ms, u64::saturating_add);
+        .map(|block| block.duration_us)
+        .fold(trailing_part_duration_us, u64::saturating_add);
 
     let mut skipped_segments = 0;
-    let mut elapsed_ms = 0_u64;
+    let mut elapsed_us = 0_u64;
     for block in &blocks {
-        elapsed_ms = elapsed_ms.saturating_add(block.duration_ms);
-        if total_parent_duration_ms.saturating_sub(elapsed_ms) > skip_boundary_ms {
+        elapsed_us = elapsed_us.saturating_add(block.duration_us);
+        if total_parent_duration_us.saturating_sub(elapsed_us) > skip_boundary_us {
             skipped_segments += 1;
         } else {
             break;
@@ -575,49 +665,47 @@ fn playlist_delta_update(playlist: &str) -> Option<String> {
     Some(delta)
 }
 
-fn parse_can_skip_until_ms(playlist: &str) -> Option<u64> {
+fn parse_can_skip_until_us(playlist: &str) -> Option<u64> {
     playlist
         .lines()
         .find_map(|line| {
             line.strip_prefix("#EXT-X-SERVER-CONTROL:")
                 .and_then(|attributes| parse_attribute_value(attributes, "CAN-SKIP-UNTIL"))
         })
-        .and_then(|seconds| seconds.parse::<f64>().ok())
-        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-        .map(|seconds| (seconds * 1000.0).round() as u64)
+        .and_then(parse_duration_us)
 }
 
 fn parse_media_timeline(lines: &[&str]) -> (Vec<MediaSegmentBlock>, usize, u64) {
     let mut blocks = Vec::new();
     let mut current_start = None;
-    let mut current_duration_ms = None;
+    let mut current_duration_us = None;
 
     for (idx, line) in lines.iter().enumerate() {
         if is_segment_scoped_tag(line) {
             current_start.get_or_insert(idx);
         }
 
-        if let Some(duration_ms) = parse_extinf_duration_ms(line) {
+        if let Some(duration_us) = parse_extinf_duration_us(line) {
             current_start.get_or_insert(idx);
-            current_duration_ms = Some(duration_ms);
+            current_duration_us = Some(duration_us);
         }
 
         if is_uri_line(line) {
-            if let (Some(start), Some(duration_ms)) =
-                (current_start.take(), current_duration_ms.take())
+            if let (Some(start), Some(duration_us)) =
+                (current_start.take(), current_duration_us.take())
             {
-                blocks.push(MediaSegmentBlock { start, duration_ms });
+                blocks.push(MediaSegmentBlock { start, duration_us });
             }
         }
     }
 
     let trailing_start = current_start.unwrap_or(lines.len());
-    let trailing_part_duration_ms = lines[trailing_start..]
+    let trailing_part_duration_us = lines[trailing_start..]
         .iter()
-        .filter_map(|line| parse_part_duration_ms(line))
+        .filter_map(|line| parse_part_duration_us(line))
         .fold(0_u64, u64::saturating_add);
 
-    (blocks, trailing_start, trailing_part_duration_ms)
+    (blocks, trailing_start, trailing_part_duration_us)
 }
 
 fn is_segment_scoped_tag(line: &str) -> bool {
@@ -635,24 +723,28 @@ fn is_uri_line(line: &str) -> bool {
     !line.is_empty() && !line.starts_with('#')
 }
 
-fn parse_extinf_duration_ms(line: &str) -> Option<u64> {
+fn parse_extinf_duration_us(line: &str) -> Option<u64> {
     line.strip_prefix("#EXTINF:")
         .and_then(|value| value.split_once(',').map(|(duration, _)| duration))
-        .and_then(parse_duration_ms)
+        .and_then(parse_duration_us)
 }
 
-fn parse_part_duration_ms(line: &str) -> Option<u64> {
+fn parse_part_duration_us(line: &str) -> Option<u64> {
     line.strip_prefix("#EXT-X-PART:")
         .and_then(|attributes| parse_attribute_value(attributes, "DURATION"))
-        .and_then(parse_duration_ms)
+        .and_then(parse_duration_us)
 }
 
-fn parse_duration_ms(value: &str) -> Option<u64> {
-    value
-        .parse::<f64>()
-        .ok()
-        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-        .map(|seconds| (seconds * 1000.0).round() as u64)
+/// Decimal seconds as exact microseconds; a value in another notation (an
+/// exponent, say) through floating point.
+fn parse_duration_us(value: &str) -> Option<u64> {
+    parse_seconds_us(value).or_else(|| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| (seconds * 1_000_000.0).round() as u64)
+    })
 }
 
 fn parse_attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
@@ -675,10 +767,7 @@ mod tests {
     use crate::m3u8_manifest::M3u8Manifest;
 
     fn decompress(data: &[u8]) -> String {
-        let mut decoder = GzDecoder::new(data);
-        let mut decoded = String::new();
-        decoder.read_to_string(&mut decoded).unwrap();
-        decoded
+        decompress_data(data).unwrap()
     }
 
     #[test]
@@ -788,7 +877,7 @@ mod tests {
 
         assert!(delta.contains("#EXT-X-VERSION:9"));
         assert!(delta.contains("#EXT-X-SERVER-CONTROL:"));
-        assert!(delta.contains("CAN-SKIP-UNTIL=6.00000"));
+        assert!(delta.contains("CAN-SKIP-UNTIL=6.000"));
         assert!(delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"));
         assert_eq!(delta.matches("#EXT-X-SKIP:").count(), 1);
         assert!(!delta.contains("s3.mp4"));
@@ -858,17 +947,111 @@ mod tests {
     }
 
     #[test]
-    fn truncated_packet_is_rejected_without_panic() {
+    fn a_part_is_added_without_rendering_and_read_renders_once() {
         let cache = M3u8Cache::new(Options::default());
-        let mut packet = BytesMut::new();
-        packet.put_u32(1);
-        packet.put_u32(64);
-        packet.put_u64(1);
-        packet.put_u64(99);
+        for _ in 0..800 {
+            cache.add_part_us(9, 2_500, true, Some(40)).unwrap();
+        }
+        let n = cache.offset(9).unwrap();
+        assert!(lock(&cache.slots[n]).rendered.is_none(), "rendered on add");
+        assert_eq!(cache.last_position(9), Some((2, 399)));
 
+        let (first, hash) = cache.last(9).unwrap().unwrap();
+        let (again, again_hash) = cache.last(9).unwrap().unwrap();
+        // The second reader is given the same rendering.
+        assert_eq!(first.as_ptr(), again.as_ptr());
+        assert_eq!(hash, again_hash);
+        let playlist = decompress(&first);
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.0025\n"));
+        assert!(playlist.contains("#EXTINF:1.000,\n#EXT-X-BYTERANGE:16000@0\ns1.mp4"));
+        assert!(playlist.contains("URI=\"s2.mp4\",BYTERANGE=\"40@15960\",INDEPENDENT=YES"));
+        assert_eq!(const_xxh3(playlist.as_bytes()), hash);
+
+        // A new part makes a new rendering that contains it.
+        cache.add_part_us(9, 2_500, true, Some(40)).unwrap();
+        let (next, _) = cache.get(9, 3, 0).unwrap().unwrap();
+        assert_ne!(next.as_ptr(), first.as_ptr());
+        assert!(decompress(&next).contains("#EXTINF:1.000,\n#EXT-X-BYTERANGE:16000@0\ns2.mp4"));
+        // A part that is not there yet has no playlist.
+        assert!(cache.get(9, 3, 1).unwrap().is_none());
+        // A part that is there is answered with the newest playlist.
+        assert_eq!(
+            cache.get(9, 2, 17).unwrap().unwrap().0.as_ptr(),
+            next.as_ptr()
+        );
+        assert_eq!(cache.get_idxs(9, 2).unwrap(), Some((401, 801)));
+    }
+
+    #[test]
+    fn eager_render_renders_each_part_as_it_is_added() {
+        let cache = M3u8Cache::new(Options {
+            eager_render: true,
+            ..Options::default()
+        });
+        cache.add_part_us(9, 2_500, true, None).unwrap();
+        let n = cache.offset(9).unwrap();
+        let rendered = lock(&cache.slots[n]).rendered.clone().unwrap();
+        assert_eq!(rendered.version, 1);
+        assert_eq!(
+            cache.last(9).unwrap().unwrap().0.as_ptr(),
+            rendered.gzip.as_ptr()
+        );
+    }
+
+    #[test]
+    fn a_segment_is_capped_at_its_part_capacity() {
+        let cache = M3u8Cache::new(Options {
+            max_parts_per_segment: 4,
+            ..Options::default()
+        });
+        for _ in 0..4 {
+            cache.add_part_us(9, 2_500, false, None).unwrap();
+        }
         assert!(matches!(
-            cache.get_bytes(&packet.freeze()),
-            Err(CacheError::BufferOverflow)
+            cache.add_part_us(9, 2_500, false, None),
+            Err(CacheError::IndexOutOfBounds)
         ));
+        // Nothing was added for the refused part.
+        assert_eq!(cache.last_position(9), Some((1, 3)));
+    }
+
+    #[test]
+    fn a_reused_slot_starts_a_new_playlist() {
+        let cache = M3u8Cache::new(Options {
+            num_playlists: 1,
+            ..Options::default()
+        });
+        cache.add_part_us(1, 2_500, true, None).unwrap();
+        cache.add_part_us(1, 2_500, true, None).unwrap();
+        cache.add_part_us(2, 2_500, true, None).unwrap();
+        assert!(matches!(cache.last(1), Err(CacheError::StreamNotFound)));
+        let playlist = decompress(&cache.last(2).unwrap().unwrap().0);
+        assert_eq!(playlist.matches("#EXT-X-PART:").count(), 1);
+        assert!(playlist.contains("#EXT-X-PART:DURATION=0.0025,URI=\"p1.mp4\""));
+    }
+
+    #[test]
+    fn delta_update_reads_small_part_durations_exactly() {
+        let options = Options {
+            target_duration_ms: 1_000,
+            ..Options::default()
+        };
+        let cache = M3u8Cache::new(options);
+        // 9.5 s of 2.5 ms parts in 1 s segments.
+        for _ in 0..3_800 {
+            cache.add_part_us(1, 2_500, true, None).unwrap();
+        }
+        let delta = decompress(&cache.last_delta(1).unwrap().unwrap().0);
+        // 9 closed segments and 0.5 s open: segments that end more than 6 s
+        // before the end are skipped, s1 to s3.
+        assert!(
+            delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3\n"),
+            "{delta}"
+        );
+        assert!(!delta.contains("s3.mp4"));
+        assert!(delta.contains("s4.mp4"));
+        // The delta is kept for the version it was made from.
+        let again = cache.last_delta(1).unwrap().unwrap().0;
+        assert_eq!(decompress(&again), delta);
     }
 }

@@ -10,8 +10,8 @@ Low-Latency HLS (LL-HLS) segments and other binary-packet workloads.
 Components
 
 * ChunkCache – fixed-size circular buffer of `bytes::Bytes` slots
-* M3u8Cache – companion buffer that stores compressed playlist data and
-  initialisation fragments
+* M3u8Cache – the live playlist of each stream, rendered and compressed when
+  it is read (once for each new part), and initialisation fragments
 * M3u8Manifest – manifest builder that rolls segments and parts following the
   LL-HLS draft spec
 * CacheMesh – UDP/RaptorQ-FEC peer discovery and cache-slot replication for
@@ -29,7 +29,21 @@ ChunkCache layout
         stream = atomic last id + atomic generation + atomic content version
 
 M3u8Cache layout
-    identical shape, but payload is gzip-compressed playlist data
+    num_playlists live playlists, each rendered on demand and kept until the
+    next part; segment boundaries in a ring of max_segments per playlist
+
+Time and sizes (`Options`)
+    PART-TARGET is held in microseconds (`part_target_us`, default 2500 = one
+    2.5 ms Opus frame; the old `part_target_ms` still works and wins when set).
+    Durations are rendered exactly as decimal seconds with up to six decimals
+    ("0.0025", "0.001", "0.00025", "0.041708"), so the parts of a segment sum
+    to its EXTINF. Only segments that start within `parted_target_durations`
+    (default 3) target durations of the end carry EXT-X-PART lines, and at
+    most `max_parted_segments` of them when that is set. PART-HOLD-BACK is
+    three part targets or `part_hold_back_ms`, whichever is larger.
+    `max_segments` and `max_parts_per_segment` default to 0, which derives
+    them from `window_ms` (default 12 s), `segment_min_ms` (default 1 s) and the
+    part target; a non-zero count is kept as given.
 
 • Each playlist gets its own ring buffer. Unrelated playlists never block each other.
 • Writes lock exactly one slot. Reads take shared locks and can run in parallel.
