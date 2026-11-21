@@ -1,6 +1,6 @@
 [package]
 name = "playlists"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 description = "M3u8 playlist and ring buffers"
 license = "MIT"
