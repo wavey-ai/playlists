@@ -1078,3 +1078,68 @@ A review of `7e27ac3` raised nine claims, each checked by two verifiers. Each wa
   The edges p99 was worse than `7e27ac3` in 9 of 10 paired rounds of that batch, where the fix always ran right after `7e27ac3`. In the third batch, which swapped the order each round (load average 7–9), it was worse in 7 of 14 and better in 7: p50 84 against 86.5 µs, p99 377.5 against 563.5 µs, with 1 failed 2 ms bound against 3. In the first batch (load average 3–23) the fix failed the edges bound twice, at load average 20 and 23, where `7e27ac3` reached 1.3 ms. No regression is found beyond noise.
 - **Gates.** `nice cargo test --all-features` three times (215 passed, 2 ignored, each time); `nice cargo test --release --all-features mesh::` (88 passed); `cargo clippy --all-features --all-targets -- -D warnings`; `cargo fmt --check`. One earlier debug run at load average 16 failed three timing bounds (`a_committed_part_leaves_at_once`, the two-worker audio-during-video test and the 4,000/s sender's debug bound); 6 alternating debug runs of `7e27ac3` and the fix after it had no failure on either side.
 - **Public API.** No signature changes. Behaviour: a write with id `usize::MAX` by stream ID fails as before (`"Chunk id out of range"`) but no longer creates the stream; a `fin` on an entry another `fin` has ended clears nothing.
+
+### 4K reader regression
+
+**Report.** The product's namespace-lab bench (2 CPUs per node, London h2/h3 readers blocked on parts at the edge, a 4K stream of about 18 Mbit/s in 2 MiB parts on the class socket) put the edge's `edge_committed -> reply` hop for Opus 2.5 ms parts with 4K at p99 0.879/0.590 ms and max 7.5/5.8 ms on av-mesh `8c4196d` (playlists `89964dc`), against 1.626/1.170 ms and 11.06/10.47 ms on `5382857` (playlists `8c18f7e`). That is two ABBA pairs. Every earlier hop was unchanged, and audio-only runs showed no regression.
+
+**Three hypotheses, all ruled out as a difference between the lines.** Each was checked by code review and by a bench that alternated the two revisions.
+
+- **Cache read path (A).** No lock or shared structure is held across the 2 MiB write on any path that the audio writer or reader uses. The merged video write costs 10–25× less CPU than LL's, because LL used `const_xxh3`. A microbench of a blocked audio reader beside 2 MiB writes, on 2 CPUs and on 32 CPUs, measured the same on both lines (the merged line was worse in about half the paired rounds).
+- **av-mesh port (B).** Every function on the edge's part-request path is byte-identical between `8c4196d` and `5382857`. That covers `get_part_repairing_holes` through `finish_part_response`, and `part_times_unix_us`, `remember_*` and `stream_part_us`. An in-process edge (real class-split meshes, `run_mesh_applied_parts`, `AppRouter`, 8 or 32 blocked readers, 2 MiB 4K) measured the same on both lines.
+- **Edge receive CPU (C).** Per 2 MiB part, the merged receive path costs the same as LL's or less: zero-copy decode (3 µs against 105 µs), and `xxh3_64` in the apply (0.1 ms against 1.6 ms). An edge never takes the `remote_slots` lock.
+
+**The lab journals.** In `needletail-plmerge/target/latency-bench/*/hops.raw.ndjson`, the `edge_committed -> reply` delays over 0.5 ms come mostly in episodes about 510 ms apart: 60–93 per 40 s run on each London edge, 2–4 ms long. These appear in every run, before and after, with and without 4K, and follow the readers' 500 ms playlist reload. The after-with-4K runs have more off-cadence episodes (11–24 against 4–7 per edge), but these are short (median 0.6–1.0 ms). Earlier before-with-4K sessions on the same lab (`before1-opus-4k`, `before2-opus-4k`) reached p99 4.5 and 4.2 ms on this hop, which is worse than any after run. The difference between sessions is therefore larger than the reported regression, and no bench outside the lab reproduces it.
+
+**What 4K does cost an edge, on both lines: the FEC decoder's sequence tracking.** `DatagramFecDecoder` (raptorq-datagram-fec 0.1.6) tracks every datagram's packet sequence in a `SequenceTracker`. When a sequence is never observed, `next_expected` stays at it. From then on, every datagram inserts `min(diff, 4096)` entries into the `missing` set, and `future_received` grows without bound. `FecReceiver::push_at` returns before the decoder for any datagram of a completed block. The repair symbols behind each decoded block are therefore never observed, and the tracker stalls after the first block. The result is about 65 µs per datagram: ~100 ms of class-thread CPU for each 2 MiB part (1,620 datagrams), and ~65 µs for each audio part on the media thread. On a 2-CPU edge, that occupies one CPU for ~120 ms after each 4K part. Nothing in playlists reads `sequence_stats()`.
+
+**Fix (`LaneDecoder`).** Each lane of `PeerDecoders` now wraps its decoder:
+
+- `finished` mirrors the decoder's window of finished block ids (decoded or expired), using the decoder's own rule: insert the id, then drop every id more than `COMPLETED_WINDOW` below it.
+- A datagram of a block that the receiver has completed is shown to the decoder (`observe_finished`) only if `finished` holds the block. The decoder records the sequence and returns `Ok(None)` at once. It never takes the datagram as a new block.
+- Before a datagram of a new block, if the decoder has no block in flight and the datagram would leave a sequence gap (loss, a block outside the window, a part sent only to other children, a datagram refused before the decoder), the decoder is replaced by a fresh one. The fresh decoder is told every finished id, from the highest down so that the window drops none of them.
+
+Generation safety and delivery are unchanged:
+
+- A decoder is replaced only with nothing in flight, so no symbol is lost.
+- The fresh decoder refuses the same finished and expired blocks as the one it replaces. A late datagram therefore cannot recreate decoder state or deliver a block a second time.
+- `FecReceiver.completed`, stream handles, generations, the remote-slot set and every cache write and read are untouched.
+
+Remaining cost: loss inside a block that is still arriving leaves the tracker stalled until the block ends. That costs up to ~20 ms on a 2 MiB part, against 100 ms on every part before. The real fix belongs in raptorq-datagram-fec's `SequenceTracker::observe`: insert only the newly skipped range, and bound the window. That fix is not made here.
+
+**Tests.**
+
+- `fec_receiver_keeps_sequence_tracking_in_step_on_a_clean_link`: 300 mixed one-symbol and four-symbol blocks. The tracker never reports a missing sequence, it sees every datagram, and it never restarts.
+- `fec_receiver_restarts_sequence_tracking_after_a_lost_datagram`: a lost source symbol. The tracker restarts at the next block. A late copy of the lost datagram decodes nothing and starts no block.
+- `a_restarted_lane_decoder_still_refuses_a_finished_block`: an expired block is still refused after a restart.
+
+All three fail with the fix removed. The control in `an_edge_applies_audio_parts_while_it_decodes_a_video_window{,_on_two_workers}` required the one-socket edge to hold an audio part at least 10 ms behind a 200-part window. That wait was the tracker's: it is now about 1–3 ms. The control keeps only its relative claim, that one socket waits longer than split (15 of 15 release runs passed).
+
+**Measurements.** Release builds. Host shared and loaded (load average 4–15). Variants alternate in a rotating order each round.
+
+- **C's single-thread micro**, one 2 MiB part (1,620 datagrams), FEC push plus decode plus apply, CPU µs, median [range] of 12 rounds, `taskset -c 4`: `89964dc` 112,418 [110,556–115,455]; `8c18f7e` 111,244 [109,941–190,338]; fix 3,159 [2,906–5,032]. FEC push alone: 110,701 / 111,121 / 3,045.
+- **C's end-to-end edge probe**: a class-split distributor feeds an edge whose mesh and blocked readers share CPUs 4,5. The load is 12 parts of 2 MiB at 900 ms, plus 4,320 audio parts at 2.5 ms. Medians of 12 rounds, `89964dc` / `8c18f7e` / fix:
+  - class-thread CPU per 4K part: 99.3 / 99.0 / 6.3 ms
+  - 4K first datagram to commit: 117.7 / 117.8 / 6.0 ms
+  - media-thread CPU: 468 / 489 / 167 ms (fix lower in 12/12 rounds against both)
+  - audio first datagram to commit, p99: 237 / 253 / 49 µs
+  - publish to reader wake, p99: 415 / 443 / 340 µs
+  - commit to reader wake: p99 57 / 69 / 64 µs; max 951 / 1,515 / 493 µs. These are at parity: the wake path is unchanged, and the fix was worse than `89964dc` at p99 in 8 of 12 rounds, by single microseconds.
+- **B's in-process av-mesh edge** (`hypb_edge_committed_to_reply_beside_4k`, `taskset -c 28,29`, 2 MiB 4K at 930 ms, 8 s). `committed -> reply`, median of per-round values, before `8c4196d` / after `5382857` / after with this fix:
+  - 8 readers, 11 complete rounds: p50 0.054 / 0.051 / 0.053, p99 0.214 / 0.183 / 0.196, max 1.94 / 0.52 / 0.37 ms. One before run panicked in the harness's distributor commit.
+  - 32 readers, 6 rounds: p50 0.131 / 0.112 / 0.113, p99 0.336 / 0.290 / 0.289, max 3.48 / 2.59 / 2.37 ms.
+  - This harness puts the edge's mesh on the readers' runtime and has no lab load, so it shows no 4K penalty on either line. All three are at parity.
+- **In-crate tests**, 12 alternating rounds, `taskset -c 4,5`, median µs, `89964dc` / `8c18f7e` / fix:
+  - `an_edge_applies_audio_parts_while_it_decodes_a_video_window`, one-socket max: 35,778 / 35,234 / 2,608; split max: 529 / 569 / 230.
+  - Its two-worker variant, one-socket max: 28,145 / 25,807 / 3,211.
+  - `a_distributor_on_one_core_keeps_two_edges_at_four_thousand_parts_a_second`: p50 91 / 92 / 60, p99 461 / 447 / 270. Round 3 failed the 2 ms bound on all three, and round 6 failed it on `89964dc`.
+  - Video-burst tests, split: 57 / 61 / 62 and 75 / 96 / 105, within their ranges.
+
+**Gates.**
+
+- `nice cargo test --all-features` twice: 218 passed, 2 ignored, each time.
+- `nice cargo test --release --all-features mesh::`: 91 passed.
+- `cargo clippy --all-features --all-targets -- -D warnings`
+- `cargo fmt --check`
+
+**Not confirmed.** The lab bench has not been re-run with this commit, because the lab belongs to another session. That run must show whether the London `edge_committed -> reply` p99 with 4K comes back to the before level or below it. It must also show whether the small after-only difference in the lab is real: none of the three benches could reproduce it.
