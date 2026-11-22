@@ -1196,3 +1196,53 @@ All three fail with the fix removed. The control in `an_edge_applies_audio_parts
 **Cause taken.** A London distributor hears every part twice, from the relay primary and from the contributor. Step 6 kept August's rule that an `AlreadyPresent` put also publishes. In `put_if_absent_contiguous_for_handle`, every duplicate copy also ran the contiguous scan behind a SeqCst fence, took the exact-waiter shard lock and fired the lane notifier: at 1,000 parts a second, that doubled the per-part wake-ups on the node's two CPUs. Low-latency did nothing for a duplicate.
 
 **Fix.** The inserter of a part publishes it and wakes its readers, as on low-latency. A duplicate copy wakes no one. It finishes a publication only when the watermark does not yet cover it (one atomic load in the common case), so August's guarantee holds: a part that a non-publishing path stored is published by its contiguous copy. `put_if_absent_for_handle` likewise wakes exact-part waiters only on `Inserted`. Test: `a_duplicate_contiguous_copy_wakes_no_one_but_finishes_an_uncovered_publication`, which fails if a duplicate wakes the lane notifier.
+
+### Wave 5 (av-mesh 05780d0)
+
+Playlists did not change in wave 5 (`c14d921`). av-mesh `05780d0` is merged into the port branch `playlists-merge-august` (`c41ed91`). The commit path resolves a stream once per part instead of four to six times. The repair-horizon and NACK-from-cache paths read through a handle. A 4K fixture needs slots of at least `--slot-kb`, because the merged cache refuses a part larger than its slot.
+
+## 8. Latency before and after
+
+**Setup.** The product session's local namespace lab. Each node has 2 CPUs and 4 GB, and the contributor has 4 and 8. Each run lasts 40 s with one reader of each kind on lon-readers and new-readers. Plain `scripts/compare/latency-bench.py --seconds 40 --payload … --epoch-samples … [--video]`, with `scripts/edge_lab.py down` before each run, as the product session runs it. The order is ABBA (before, after, after, before) per configuration. Figures are London h3 probe latency in ms, the median of the runs. Raw results are in `needletail-plmerge5/target/latency-bench/{before,after}-w5-*` and `needletail-plmerge/target/latency-bench/*`.
+
+**Wave 5: what main serves.** Before is av-mesh `05780d0` with playlists `c14d921`. After is av-mesh `c41ed91` (`05780d0` ported) with playlists `edcb84a`. Both use av-contrib `bbedb01` and needletail `a35ce1b` at lab defaults (fast-plane edges). "Opus 1 ms" is Opus Custom, the bench's new default.
+
+| Configuration | p50 before | p50 after | p99 before | p99 after |
+|---|---|---|---|---|
+| Opus 2.5 ms | 2.60 | 2.59 | 3.34 | 3.33 |
+| Opus 2.5 ms + 4K | 2.58 | 2.58 | 3.31 | 3.29 |
+| PCM 1 ms | 2.60 | 2.52 | 3.46 | 3.23 |
+| PCM 1 ms + 4K | 2.54 | 2.53 | 3.31 | 3.22 |
+| Opus 1 ms | 2.62 | 2.59 | 3.50 | 3.52 |
+| Opus 1 ms + 4K | 2.67 | 2.61 | 3.67 | 3.50 |
+
+No p50 or p99 is worse beyond the spread of its own runs. Opus 1 ms p99: the runs were 3.58 and 3.43 before, 3.49 and 3.54 after.
+
+**Distributor CPU per part.** The in-crate gates measure the distributor thread on one core at 4,000 parts/s, against the low-latency line at each merge. The results were 25.3 against 25.2 µs at `4a3896e`, 24.9 against 25.4 µs at `7e27ac3`, and 24.7 against 24.5 µs at `5682670`, all at parity. In the lab, per-process CPU of the London distributor's av-mesh (wave-4 routing, PCM 1 ms) was 758–795 ms/s before and 772–808 ms/s after, within a host drift of about ±35 ms/s. The cgroup CPU figures include the node's kernel network time and are too noisy to compare.
+
+**Wave 4: distributor-fed edges.** Before is av-mesh `d532114` with playlists `c14d921`. After is the port with playlists `5682670`, and from the fix below on, `edcb84a`.
+
+- Opus 2.5 ms, with and without 4K, was level: p99 3.74 against 3.79, and 3.80 against 3.79.
+- PCM 1 ms was worse after: 10 of 12 ABBA pairs at p99. The two exceptions had a burst in the before run.
+- PCM 1 ms + 4K was worse after: 13 of 13 pairs, about 0.3–0.5 ms at p99 and 0.05 ms at p50.
+- The extra time was on the London distributors, in two hops: relay_first → committed (the tee task's wait to run) and watermark → mesh_sent (the sync task's start).
+- One cause was found and fixed: the duplicate-copy work (section 7). It did not close the gap.
+
+Instrumented before and after builds (identical metrics, `plmerge-bench/instr`, pcm1 ABBA) showed every per-call cost equal or lower after:
+
+| Metric | Before | After |
+|---|---|---|
+| Contiguous scan p50 | 8.7 µs | 0.27 µs |
+| Receive per datagram p99 | 623 µs | 55 µs |
+| Slot hash p50 | 1.3 µs | 0.3 µs |
+
+Longer tasks on the node's two runtime workers became more frequent:
+
+| Task | Before | After |
+|---|---|---|
+| Replica serves over 1 ms | 253 | 352 |
+| Main-lane tick passes over 1 ms | 60 | 110 |
+| Tee queue waits over 1 ms | 11,691 | 19,462 |
+| Tee queue-wait p99 | 885 µs | 1,114 µs |
+
+Wave 5 takes the distributor's tee and sync task off the live path, and there PCM 1 ms is better after, as the table above shows. The wave-4 effect is recorded as an open item in TODO.md for any deployment that returns to distributor-fed edges.

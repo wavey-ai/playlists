@@ -72,12 +72,35 @@ Raise the default if `rx_evicted_objects` is above 0 without real loss. The
 class lane's receiver of a mesh split by class has the same bound: check its
 `rx_evicted_objects` too.
 
-### [ ] Product latency bench against the low-latency baseline
+### [x] Product latency bench against the low-latency baseline
 
-Run the product bench (Opus 2.5 ms parts and PCM 1 ms parts, audio only and
-with 4K on the mesh) for p50, p99, and distributor CPU per part, against
-`89964dc`, the low-latency line with the class split. The in-crate 4,000 parts/s gates show no regression, but they use
-72-byte parts only.
+Done: `docs/merge-august.md`, section 8. On the wave-5 pair no p50 or p99 is
+worse.
+
+### [ ] A London distributor's runtime under wave-4 routing at 1 ms parts
+
+When the distributor's tee and cache-mesh sync task are on the live path (wave-4
+routing), PCM 1 ms parts were about 0.3–0.5 ms worse at p99 after the merge.
+The tee and the sync task waited longer for one of the node's two tokio workers.
+Every per-call cost was equal or lower. Replica serves (`replica_task`) and
+sync tick passes over 1 ms happened more often (section 8). Wave 5 feeds edges
+from the forwarders' fast plane, and there the same configs are level or
+better. If a deployment goes back to distributor-fed edges, keep long replica
+serves and warm-up passes from holding a worker: yield inside them, or run
+them on their own thread as the class lane does.
+
+### [ ] Bump `raptorq-datagram-fec` for the bounded sequence tracker
+
+0.1.6's tracker costs an edge about 100 ms of CPU per 2 MiB 4K part (section 7,
+"4K reader regression"). av-mesh and av-contrib patch it to raptor-fec
+`68a1840`. Publish that fix and bump it here.
+
+### [ ] `access-unit` from git with no rev
+
+`Cargo.toml` takes `access-unit` from git with no rev (on both lines since
+`516b838`). A dependent that uses crates.io `access-unit` 0.1.3 gets a second
+`Fmp4` type and must `[patch.crates-io]` it to the git source. Pin a rev or use
+the published crate.
 
 ### [x] Merge the low-latency class split
 
