@@ -1,4 +1,6 @@
 pub mod chunk_cache;
+#[cfg(feature = "compact-object")]
+pub mod compact_object;
 pub mod m3u8_cache;
 pub mod m3u8_manifest;
 #[cfg(feature = "mesh")]

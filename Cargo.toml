@@ -10,6 +10,8 @@ readme = "README.md"
 [features]
 default = []
 mesh = ["dep:raptorq-datagram-fec", "dep:raptorq", "dep:socket2", "dep:libc"]
+# Compact relay objects (slim audio envelopes and RLC1 datagrams).
+compact-object = ["dep:media-object"]
 
 [dependencies]
 arc-swap = "1.7"
@@ -18,6 +20,7 @@ chrono = "0.4.38"
 flate2 = "1.0.28"
 raptorq-datagram-fec = { version = "0.1.6", optional = true }
 raptorq = { version = "2.0.1", optional = true }
+media-object = { version = "0.1.1", optional = true }
 libc = { version = "0.2", optional = true }
 socket2 = { version = "0.6", optional = true }
 xxhash-rust = { version = "0.8.10", features = ["xxh3", "const_xxh3"] }
