@@ -791,6 +791,10 @@ impl Backfill {
 
 type LeaseTable = Arc<StdMutex<HashMap<(SocketAddr, u64), Lease>>>;
 type ServedTable = Arc<StdMutex<Vec<ServedSubscription>>>;
+/// A count that goes up whenever the leases that either lane serves change
+/// (a child or a playlist comes or goes), so that a consumer of the served
+/// leases need not poll them.
+type ServedChanged = Arc<watch::Sender<u64>>;
 type PeerSeen = Arc<StdMutex<HashMap<SocketAddr, Instant>>>;
 type WantedStreams = Arc<StdMutex<HashSet<u64>>>;
 /// Packet loss on the path from this node to a peer, in parts per million,
@@ -1429,6 +1433,7 @@ impl CacheMesh {
         let fec_counters = Arc::new(CacheMeshFecCounters::default());
         let leases: LeaseTable = Arc::new(StdMutex::new(HashMap::new()));
         let served: ServedTable = Arc::new(StdMutex::new(Vec::new()));
+        let served_changed: ServedChanged = Arc::new(watch::channel(0).0);
         let peer_seen: PeerSeen = Arc::new(StdMutex::new(HashMap::new()));
         let wanted: WantedStreams = Arc::new(StdMutex::new(HashSet::new()));
         let link_loss: LinkLossTable = Arc::new(StdMutex::new(HashMap::new()));
@@ -1503,6 +1508,7 @@ impl CacheMesh {
             Arc::clone(&fec_counters),
             Arc::clone(&leases),
             Arc::clone(&served),
+            Arc::clone(&served_changed),
             Arc::clone(&link_loss),
             self.config.clone(),
             main_lane,
@@ -1567,6 +1573,7 @@ impl CacheMesh {
                 Arc::clone(class_counters),
                 Arc::clone(&leases),
                 Arc::clone(class_served),
+                Arc::clone(&served_changed),
                 Arc::clone(&link_loss),
                 self.config.clone(),
                 class_lane,
@@ -1622,6 +1629,7 @@ impl CacheMesh {
             subscription_lease: self.config.subscription_lease,
             peer_timeout: self.config.peer_timeout,
             served,
+            served_changed,
             peer_seen,
             wanted,
             link_loss,
@@ -1667,6 +1675,7 @@ pub struct CacheMeshHandle {
     subscription_lease: Duration,
     peer_timeout: Duration,
     served: ServedTable,
+    served_changed: ServedChanged,
     remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
@@ -1879,6 +1888,15 @@ impl CacheMeshHandle {
             }
         }
         served
+    }
+
+    /// A watch that changes whenever the leases of
+    /// [`Self::served_subscriptions`] change: a child or a playlist comes or
+    /// goes, by a new lease, an Unsubscribe or an expiry. The leases are
+    /// looked at once a sync tick, so a change is seen within one
+    /// `sync_interval`. The value is a count with no other meaning.
+    pub fn served_changed(&self) -> watch::Receiver<u64> {
+        self.served_changed.subscribe()
     }
 
     pub fn replication(&self) -> ReplicationMode {
@@ -4007,6 +4025,20 @@ impl ChildBatch {
     }
 }
 
+/// Whether two lists of served leases differ in their (child, playlist)
+/// pairs. The warm-up count of a lease is not a change.
+fn served_keys_differ(old: &[ServedSubscription], new: &[ServedSubscription]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    let keys: HashSet<(SocketAddr, u64)> = old
+        .iter()
+        .map(|served| (served.child, served.stream_id))
+        .collect();
+    new.iter()
+        .any(|served| !keys.contains(&(served.child, served.stream_id)))
+}
+
 async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
@@ -4017,6 +4049,7 @@ async fn sync_task(
     stats: Arc<CacheMeshFecCounters>,
     leases: LeaseTable,
     served: ServedTable,
+    served_changed: ServedChanged,
     link_loss: LinkLossTable,
     config: CacheMeshConfig,
     lane: Lane,
@@ -4157,7 +4190,7 @@ async fn sync_task(
                         *tokens = (*tokens + rate * elapsed.as_secs_f64()).min(burst);
                     }
                 }
-                *lock(&served) = active
+                let now_served: Vec<ServedSubscription> = active
                     .iter()
                     .filter(|(_, stream_id)| !lane.split() || lane.carries(&config, *stream_id))
                     .map(|(child, stream_id)| ServedSubscription {
@@ -4176,6 +4209,15 @@ async fn sync_task(
                             .unwrap_or(0),
                     })
                     .collect();
+                let changed = {
+                    let mut served = lock(&served);
+                    let changed = served_keys_differ(&served, &now_served);
+                    *served = now_served;
+                    changed
+                };
+                if changed {
+                    served_changed.send_modify(|version| *version = version.wrapping_add(1));
+                }
             }
             children = {
                 let regions = peer_regions.read().await;
@@ -5734,6 +5776,82 @@ mod tests {
         let served = parent.served_subscriptions();
         assert_eq!(served.len(), 1);
         assert_eq!((served[0].child, served[0].stream_id), (edge_addr, 7));
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_served_leases_watch_changes_when_a_lease_comes_or_goes() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        let mut changed = parent.served_changed();
+        changed.mark_unchanged();
+        let wait_change = |changed: &mut watch::Receiver<u64>| {
+            let mut changed = changed.clone();
+            async move {
+                timeout(Duration::from_secs(2), changed.changed())
+                    .await
+                    .expect("the served leases watch changes")
+                    .unwrap();
+            }
+        };
+
+        // A new lease is a change.
+        edge.subscribe(7, 0, 0).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(
+            parent
+                .served_subscriptions()
+                .iter()
+                .map(|served| (served.child, served.stream_id))
+                .collect::<Vec<_>>(),
+            vec![(edge_addr, 7)]
+        );
+
+        // Renewing it is not.
+        edge.subscribe(7, 0, 0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!changed.has_changed().unwrap(), "a renewal is no change");
+
+        // A second playlist is, and so is the release of the first.
+        edge.subscribe(8, 0, 0).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(parent.served_subscriptions().len(), 2);
+        edge.unsubscribe(7).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(
+            parent
+                .served_subscriptions()
+                .iter()
+                .map(|served| served.stream_id)
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+
+        // A lease that lapses is a change too.
+        wait_change(&mut changed).await;
+        assert!(parent.served_subscriptions().is_empty());
 
         parent.shutdown();
         edge.shutdown();
