@@ -343,6 +343,54 @@ outcomes. It separates:
 - replica queue depth, peak depth, drops, service count, errors, and time
 - decode time, and encode and decode errors.
 
+### Split by class
+
+`with_class_port_offset(n)` splits the mesh by class; 0, the default, keeps one
+socket. A second socket at the main port plus `n` carries the parts and
+initializations of the playlists that `with_stream_classifier` calls
+`StreamClass::Video`, with its own receive task, sync task and replica server.
+The main socket keeps the audio playlists, and the hellos, leases, replica
+requests and loss reports of both. A 4K encode, send or decode then never holds
+an audio part back. Every node of a mesh uses the same offset.
+
+- The class lane runs on a thread of its own with a current-thread runtime
+  (`ClassLaneRuntime::OwnThread`, the default), or on a runtime that you give
+  (`ClassLaneRuntime::Handle`, with `with_class_runtime`).
+- The main socket of a split mesh has `SO_PRIORITY` 6
+  (`AUDIO_SOCKET_PRIORITY`, `with_main_socket_priority`), so a `prio` qdisc
+  puts the audio in band 0. `with_class_socket_priority` sets the class
+  socket's; it is unset by default. A failure to set it is logged, not fatal.
+- A datagram on the class socket from port `p` is the peer's at `p - n`:
+  leases, liveness, `AppliedSlot::parent` and the send observer name the peer's
+  main address. The class socket takes chunk and initialization frames only.
+- The allowlist covers the class socket. Authorizing a peer in any of the ways
+  above authorizes its class socket (its address at the main port plus `n`),
+  on the class socket only. A class datagram from any other address is dropped
+  before the class observer and FEC decode, and counted in the class lane's
+  `rx_unauthorized_datagrams`.
+- The class lane has its own FEC receiver, with the same limits, its own sender
+  and its own counters. `fec_stats()` is the sum of both lanes and
+  `class_fec_stats()` the class lane alone. The loss reported to a peer is the
+  worse of the two lanes.
+- Replica requests for video playlists go to the class lane's own bounded
+  queue (`replica_queue_capacity`). A request that a queued window covers is
+  served once. Drops are counted in `class_replica_requests_dropped`.
+- `with_class_receive_observer` gives the class receive task an observer. It
+  has none by default, so the main observer (an edge's cut-through) runs on the
+  audio receive task only. `with_class_applied_tx` sends the class lane's
+  applied parts to a channel of their own; by default they go to `applied_tx`.
+- A playlist that changes class (a muxed stream is audio until its first
+  video) is handed over by the lane that it leaves, with each child's cursor,
+  initialization, warm-up window and unstarted lease. The lane that it comes to
+  sends nothing of it until then, so no part is lost or sent twice. The lanes
+  key this, like the rest of the send state, by `StreamHandle`.
+
+With a 200-part window of 12 kB video parts being sent, an audio part published
+meanwhile reaches the edge in about 0.1 ms split, and after the whole window
+(about 50 ms in a release build) on one socket. An edge that decodes such a
+window applies audio parts from another distributor within about 0.2 ms split;
+on one socket the first waits about 25–35 ms.
+
 ## Operation costs
 
 | Operation | Expected cost |

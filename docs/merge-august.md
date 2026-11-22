@@ -985,3 +985,71 @@ Built from LL (`ff09196`, the merge's HEAD side), with AUG ported by feature. `m
   - The single uncontended mapped read is slower (the registry resolve, as step 5 found). Handle reads avoid it: `handle-full` does about 20 M/s on one worker.
 - **Compatibility sweep** of `src`, `benches` (there is no `tests/` or `examples/`). It found no compatibility code left. The only hits were a test comment ("kept for the version") and the test `with_gso_a_large_part_keeps_symbols_that_fit_a_packet`, whose no-GSO arm uses the planned `#[cfg(test)] without_gso`. `send_object`, `zero_stream_id_sync`, `stream_idx`, `frame_queue*`, `FrameWork`, `new_playlist_tx`, the stored-playlist path and `add_part*` wrappers are gone. `CacheError::Superseded` is gone; `PutIfAbsentResult::Superseded` (AUG's older-id protection) stays. Doc hits are left for step 9.
 - **Not changed:** `chunk_workloads` accepts `write`/`write-handle` and `mixed`/`mixed-handle` as names for the same modes, as AUG wrote it. These are short names, not old ones.
+
+### Merge of 89964dc (class split)
+
+`origin/low-latency` moved to `89964dc` after the merge above: `fe8318c` (the mesh split by class: video parts on their own socket and tasks) and `89964dc` (review fixes: lossless lane handover, the class lane on its own thread, audio priority). Both change only `src/mesh.rs` (+2,354 lines). It is merged with `git merge --no-ff origin/low-latency` onto `4a3896e`: 41 conflict hunks, all in `mesh.rs`. The merged mesh (handles, `MeshShared`, allowlist, bounded receiver, replica queue) is kept, and the class split is ported onto it by feature.
+
+- **Shared state.** `MeshShared` gains `class: Option<ClassLaneShared>` (the class socket's address, counters, measured loss, served leases and dropped replica requests) and `handover: LaneHandover`. They replace LL's separate `class_counters`, `class_measured_loss`, `class_served`, `class_replicas_dropped` and `Arc<LaneHandover>`. `counters_of(lane)`, `measured_loss_of(lane)` and `served_of(lane)` give a lane its own; `Lane::is_class()` is `port_offset > 0`. `measured_loss()` is the worse of the two lanes, for `link_loss()` and the link reports.
+- **Handles.** The lanes key what LL keyed by `(stream_id, index)` by `StreamHandle`, as the merged `sync_task` does:
+  - `LaneChildren::{sent, sent_initializations}` by `(StreamHandle, SocketAddr)`;
+  - the ownership table, `owns` and `waiting` by `StreamHandle`. `take_stream`, `put_stream`, `visit_stream` and `hand_over_stream` take a handle, and `forget_released_streams` takes `stream_handles()`, so a stream recreated in a new lifetime is a new playlist for the handover too;
+  - pending lease windows and backfills stay keyed by `(peer, stream_id)`, as on both lines: leases are by stream ID. `forget_lease` is LL's lease-end cleanup as a method.
+  - A playlist handed over to a lane is visited at once: its index joins the pass's drained indices, and `handle_at` names it.
+- **Receive.** One `receive_task` serves both sockets, with its `lane`.
+  - The allowlist check is `MeshShared::authorized_sender(lane, from)`: the peer is `lane.peer_of(from)` (the address itself on the main socket), and it must be in `allowed_peers`. The allowlist holds main addresses only. So every way of authorizing a peer (`with_peer`, `with_peers`, `with_allowed_peers`, `add_peer`, and a gossiped peer, which joins only if it is allowed) authorizes its class socket, on the class socket only. A peer's class address is not authorized on the main socket, nor its main address on the class socket. Storing the class addresses as entries of their own was the alternative; deriving them keeps one set, with no moment at which a peer is authorized on one socket and not the other.
+  - The check runs where it runs on the main socket: after the loss injection, before the observer and FEC decode. A refused class datagram counts in the class lane's `rx_unauthorized_datagrams`. A source port below the offset is nobody's class socket and is refused and counted; LL skipped it uncounted.
+  - The class lane's receiver is `FecReceiver::with_limits` (`max_peers`, `max_inflight_frames`, `max_frame_bytes`), so an oversized transfer is refused there before a decoder is made, as on the main socket. LL's class receiver had no bounds.
+  - After decode the class socket ignores control frames (LL). Chunks go through the one `handle_frame`: mark-before-write in the one remote-slot set that both lanes share, under the lock held across `add_remote_for_handle`. `FrameHandler::counters` puts `remote_slot_evictions` on the lane's counters.
+- **Replica requests.** The main receive task admits the requester (merged), then hands a request for a video playlist to the class lane (`ClassReplicas::offer`), and any other request to the bounded `replica_task`.
+  - The class queue is `replica_queue_capacity` long; LL's constant `CLASS_REPLICA_QUEUE` (64, the same as the default) is gone, so there is one setting for both queues.
+  - `class_replica_task` coalesces (LL), and also counts the requests served, their errors and time on the class lane's counters. A dropped request counts in `class_replica_requests_dropped` and in the class lane's `replica_queue_drops` (`ClassLaneShared::snapshot`).
+  - `serve_replica_request` takes `dest`, and keeps the merged rule that only a window (`count == 0`) sends the initialization.
+- **Send.** One `sync_task` per lane, with its `lane`: the merged body with LL's lane logic. A lease window is opened only by the lane that carries the playlist; a lease's end calls `forget_lease` and `forget_child_in_transit`; each lane lists only its own served leases; the class lane skips children without a class port; `visit_stream` runs before the watermark check; the select waits for a handover; and a lane without children hands over on its tick what it no longer carries.
+  - `flush_child`, the initialization send and `serve_replica_request` send to `dest` (`lane.to(peer)`). The send observer, the loss lookup and the cursors use the main address.
+  - The 250 ms prune is `prune_lane`. Only the main lane prunes the remote slots and the ownership table, which both lanes share. Each lane prunes its own cursors (`forget_dead_cursors`, the merged prune). Only the main lane records the test-only cursor snapshot.
+- **Start.** `max_frame_bytes` and `max_remote_slots` are filled in before either lane's configuration is cloned. The class socket is bound in the class runtime's context and its three tasks are spawned there; the own thread runs that runtime until shutdown (LL).
+- **Stats.** `CacheMeshFecStats::plus` adds the merged counters too; `replica_queue_max_depth` is the larger of the two lanes', since each lane has its own queue.
+- **Removed.** `ClassLaneRuntime::Caller`: it is `fe8318c`'s behaviour, which `89964dc` found holds audio back on av-mesh's one-thread media runtime, and `ClassLaneRuntime::Handle(tokio::runtime::Handle::current())` does the same. From the LL side of the conflicts: the `batched_send`, `gso` and `fitted_symbols` fields, `send_object` (LL gave it a `dest`; the merged mesh has no `send_object`), and `sync_on_publish` in the select. No opt-out or compatibility code is added.
+- **Tests: kept.** All 16 of `fe8318c`'s and `89964dc`'s tests are kept, with their assertions. Changes:
+  - C9: `with_allowed_peers([edge_addr])` on the distributors that learn their edge from its hello: `audio_part_during_a_video_burst`, `audio_parts_while_an_edge_decodes_a_video_window` and `the_class_lane_has_its_own_applied_channel_and_no_observer_by_default`.
+  - `a_playlist_changes_lane_only_when_the_lane_that_it_leaves_hands_it_over` keys by handles that a cache gives (`resolve_or_create_stream`), not `(stream_id, index)` tuples.
+  - `a_video_replica_request_is_served_from_the_class_socket`: `resolve_stream(9).is_none()` for `get_stream_idx(9)`.
+  - `audio_parts_while_an_edge_decodes_a_video_window` starts the video distributor only after audio part 0 has reached the edge, and waits for 20 more decoded objects from there. Its comment said the audio distributor knows the edge first, but nothing made it so: both distributors learned the edge from the same hello, and when the 200-part window reached the edge first (debug, full suite: 4 runs in 10), part 0 waited behind all of it (0.7–1.1 s), the window was over when the audio parts were published, and on one socket they did not wait. The test's own bound then failed (`one_max >= 10 ms`). LL's runs did not hit this (0 in 10); the order of the two windows is a race on both lines.
+  - The burst and receive helpers print their timings, for the comparison below.
+- **Tests: merged line.** `a_batched_pass_makes_one_call_for_many_datagrams` failed about once in 25 suite runs with 216 of the 240 datagrams counted: a part is counted when its child's `sendmmsg` call has returned, which can be after the raw child has it. It now waits (at most 1 s) for the distributor's counts to reach 240 before it reads them; the assertions are unchanged.
+- **Tests: added.**
+  - `a_class_socket_drops_unauthorized_datagrams_before_decode`: a chunk on the class socket from an unknown address and from an authorized peer's main address, and on the main socket from the peer's class address, is dropped and counted (4 class, 2 main), with no wire datagram, decoder, observer call or write. From the peer's class socket, an oversized frame is refused (`rx_oversized_objects`) and a part is applied, the observer naming the peer's main address.
+  - `every_way_of_authorizing_a_peer_authorizes_its_class_socket`: `with_peer`, `with_peers`, `with_allowed_peers`, `add_peer` and a gossiped allowed peer; each address on its own socket only; a gossiped stranger and a port below the offset are refused.
+  - `a_class_split_mesh_between_authorized_peers_passes_video_and_audio`: a distributor that knows its edge only from `with_allowed_peers` learns it from its hello; video and the initialization go on the class socket and audio on the main one, with no refused or oversized datagram on either node.
+  - A mutation that lets any class datagram through (`authorized_sender` skipping the allowlist on the class lane) fails the first two.
+- **Gates.** `nice cargo build --all-features`; `nice cargo test --all-features` three times (211 passed, 2 ignored, each time); `nice cargo test --release --all-features mesh::` (85 passed); `cargo clippy --all-features --all-targets -- -D warnings`; `cargo fmt --check`. Before the gate runs, 10 alternating debug suite runs of `origin/low-latency` and the merge had no failure besides the two described above. One release `mesh::` run at load average 8.7 failed `a_distributor_and_its_edges_keep_up_while_caches_churn_and_readers_block` on p99, as recorded for 5.1 above; the next three passed.
+- **Performance.** Release, `origin/low-latency` (`89964dc`, in `/tmp/claude-1000/plmerge-baseline`) against the merge, each test in its own process, alternating, on a host shared with other sessions (load average 5–9). Two batches of 14 rounds of every test, and a third batch of 30 rounds of the edges test. Medians [range]:
+
+  | Test | Side | p50 µs | p99 µs | CPU µs/part |
+  |---|---|---|---|---|
+  | `sends_four_thousand_parts_a_second` (28) | LL | 60.0 [55–77] | 100.0 [82–185] | 25.4 [23–37] |
+  | | merged | 61.0 [54–74] | 100.5 [89–152] | 24.9 [23–38] |
+  | `keeps_two_edges_at_four_thousand_parts_a_second` (58) | LL | 79.0 [60–117] | 181.5 [147–1,379] | 26.1 [22–34] |
+  | | merged | 79.0 [66–112] | 189.0 [145–2,079] | 26.4 [23–34] |
+
+  The edges p99 was worse in 10 of 14 and 9 of 14 paired rounds of the first two batches, and even (15 and 15) in the 30-round third batch; over all 58 rounds, 34 worse and 24 better, +7.5 µs at the median. Every other paired count is within 13–16 of 28. One merged edges round failed its 2 ms bound (p99 2,079 µs, max 5 ms), as both lines do at times under this load. No regression is found beyond noise, so no hot-path change is made: on a mesh that is not split, the merge adds a port subtraction of 0 to the allowlist check and a `None` test in the sync task.
+
+  The class-split tests (28 rounds each; the latency of the audio part, or of the 10 audio parts, in µs):
+
+  | Test | LL | merged |
+  |---|---|---|
+  | burst, split, 4 workers | 114.5 [79–191] | 110.0 [82–180] |
+  | burst, one socket, 4 workers | 48,273 [45,497–69,832] | 47,110 [45,106–70,327] |
+  | burst, split, current thread | 47.0 [37–85] | 49.5 [40–85] |
+  | burst, split, 2 workers | 111.0 [80–196] | 108.0 [80–209] |
+  | edge receive, split, current thread: p50 / max | 112 / 146.5 | 115 / 154 |
+  | edge receive, one socket, current thread: max | 34,731 | 34,853 |
+  | edge receive, split, 2 workers: p50 / max | 125 / 166.5 | 122.5 / 160 |
+  | edge receive, one socket, 2 workers: max | 24,690 | 23,924 |
+
+  The first datagram to the commit of a split audio part was 9–40 µs on both lines.
+- **For the product session.**
+  - `ClassLaneRuntime::Caller` is gone: use `ClassLaneRuntime::Handle(tokio::runtime::Handle::current())` if av-mesh chose it.
+  - C9 holds for the class socket: a class datagram is taken only from an authorized peer's main port plus the offset. Every node needs the same offset, and a NAT or proxy that changes the source port breaks the split.
+  - The class lane's receiver is now bounded by `max_inflight_frames` (64 by default). This adds to the owed 4K check in step 7.

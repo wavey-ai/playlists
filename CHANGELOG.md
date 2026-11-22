@@ -18,6 +18,7 @@ thing; the switches and aliases of both lines are removed.
 - `ChunkCache` records a lock-free write time per slot (`written_unix_us_for_stream_id`), signals `publication_notify` and `subscribe_publications` sets only when a watermark advances, takes a free index before it replaces a stream, and frees single slots and whole streams (`clear_for_stream_id`, `release_stream_id`). Exact-part waiters are keyed by stream ID and part ID and create no mapping, so a reader can wait for a stream's first part.
 - Mesh send path: a part leaves when the watermark reaches it, and a publication pass visits only the streams that moved. `ObjectEncoder` encodes once for all children, keeps the RaptorQ plan of each symbol count, repairs a one-symbol block by byte table, and caches encodings by stream, slot and payload hash. Objects smaller than `symbol_size` (at most 1,200 bytes) go in one symbol of their own length. Datagrams leave in `sendmmsg` batches, with UDP GSO where the kernel has it. Live parts go before warm-up windows. `CacheMeshFecStats::tx_send_calls` counts kernel send calls.
 - Mesh receive and topology: a receive observer for edge UDP cut-through, loss-driven repair (`LinkReport`, late-source grace), demand replication with subscription leases, `request_parts`, and block-id lanes per process start.
+- Mesh split by class (`with_class_port_offset`, `with_stream_classifier`, `StreamClass`): a second socket at the main port plus the offset carries the video playlists' parts and initializations, with its own receive task, sync task and replica server, on a thread of its own with a current-thread runtime by default (`ClassLaneRuntime::{OwnThread, Handle}`, `with_class_runtime`). Hellos, leases, replica requests and loss reports stay on the main socket. The main socket of a split mesh has `SO_PRIORITY` 6 (`AUDIO_SOCKET_PRIORITY`, `with_main_socket_priority`; `with_class_socket_priority`). A playlist that changes class is handed over losslessly, with every child's cursor, initialization, warm-up window and unstarted lease. Replica requests for video playlists are queued for the class lane and coalesced. `with_class_receive_observer` (none by default) and `with_class_applied_tx`; `class_fec_stats`, `class_local_addr` and `class_replica_requests_dropped` on the handle. `fec_stats` is the sum of both lanes, and the measured loss reported to a peer is the worse of the two.
 
 ### From the August line
 
@@ -45,6 +46,7 @@ thing; the switches and aliases of both lines are removed.
 - Received parts are marked remote before the write, under a lock held across it. Mesh-applied writes replace an older ID of the same generation, because the wire carries no generation and a restarted origin's parts must land.
 - Replica requests are served from the bounded replica queue on the reply lane, so a large range does not delay live receive.
 - A distributor serves only authorized children: list them with `with_peer`, `with_peers` or `with_allowed_peers`, or add them with `add_peer`.
+- The class split uses the merged mesh throughout: the class lane's cursors, initializations and lane ownership are keyed by `StreamHandle`, and it applies parts with `add_remote_for_handle`, marking them remote before the write in the remote-slot set that both lanes share. The allowlist covers the class socket: a datagram there is taken as the peer's at its port minus the offset, and is dropped before the class observer and FEC decode unless that peer is authorized. Authorizing a peer in any way (`with_peer`, `with_peers`, `with_allowed_peers`, `add_peer`) authorizes its class socket, on the class socket only. The class lane's FEC receiver has the same bounds (`max_peers`, `max_inflight_frames`, `max_frame_bytes`) and its replica queue is `replica_queue_capacity` long; its drops also count in the class lane's `replica_queue_drops`.
 
 ### Removed
 
@@ -55,6 +57,7 @@ thing; the switches and aliases of both lines are removed.
 - The numeric stream-index methods `add_stream_id`, `get_or_create_stream_idx`, `get_stream_idx`, `stream_idx` and `stream_ids`, `take_new_playlists_rx`, and `zero_stream_id_sync`.
 - `CacheError::Superseded`.
 - Mesh wire version 1 frames and 16-byte replica requests: every node must run this version.
+- `ClassLaneRuntime::Caller` of the low-latency line's class split. `ClassLaneRuntime::Handle(tokio::runtime::Handle::current())` does the same.
 
 ### Given up
 
