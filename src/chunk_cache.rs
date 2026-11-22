@@ -504,13 +504,11 @@ impl ChunkCache {
         if advanced {
             self.signal_publication(handle.index());
         }
-        if matches!(
-            result,
-            PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
-        ) {
-            self.notify_exact_part_waiters(handle.stream_id(), id);
-        }
+        // The writer that inserted a part woke its readers. A duplicate copy
+        // (a distributor hears every part from two relays) only finishes a
+        // publication that the watermark has not yet covered; it wakes no one.
         if result == PutIfAbsentResult::Inserted {
+            self.notify_exact_part_waiters(handle.stream_id(), id);
             self.notify_stream_update(handle.index());
         }
         Ok(result)
@@ -546,16 +544,29 @@ impl ChunkCache {
         let (result, _) = self
             .put_slot_if_absent_for_handle(handle, id, data_bytes, false)
             .await?;
-        if matches!(
-            result,
-            PutIfAbsentResult::Inserted | PutIfAbsentResult::AlreadyPresent
-        ) {
-            let advanced = self.publish_contiguous_last(handle, id, first_expected_id)?;
-            if advanced {
-                self.signal_publication(handle.index());
+        match result {
+            PutIfAbsentResult::Inserted => {
+                let advanced = self.publish_contiguous_last(handle, id, first_expected_id)?;
+                if advanced {
+                    self.signal_publication(handle.index());
+                }
+                self.notify_exact_part_waiters(handle.stream_id(), id);
+                self.notify_stream_update(handle.index());
             }
-            self.notify_exact_part_waiters(handle.stream_id(), id);
-            self.notify_stream_update(handle.index());
+            // A duplicate copy of a part already stored. Its inserter
+            // published and woke the readers; the copy only finishes a
+            // publication the watermark does not cover yet (the part was
+            // stored by a path that does not publish contiguously), with one
+            // atomic load in the common case.
+            PutIfAbsentResult::AlreadyPresent => {
+                let covered = self.stream_states[handle.index()]
+                    .last()
+                    .is_some_and(|last| last >= id);
+                if !covered && self.publish_contiguous_last(handle, id, first_expected_id)? {
+                    self.signal_publication(handle.index());
+                }
+            }
+            _ => {}
         }
         Ok(result)
     }
@@ -2272,6 +2283,64 @@ mod tests {
             PutIfAbsentResult::Inserted
         );
         assert_eq!(cache.last_for_handle(stream_handle), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_contiguous_copy_wakes_no_one_but_finishes_an_uncovered_publication() {
+        let cache = ChunkCache::new(Options::default());
+        let handle = cache.resolve_or_create_stream(64).await;
+        assert_eq!(
+            cache
+                .put_if_absent_contiguous_for_handle(handle, 0, 0, Bytes::from_static(b"p0"))
+                .await
+                .unwrap(),
+            PutIfAbsentResult::Inserted
+        );
+        assert_eq!(cache.last_for_handle(handle), Some(0));
+
+        // The second relay's copy of a published part: nothing to publish,
+        // and no reader or sync task is woken for it.
+        let lane = cache.update_notifier(handle.index()).unwrap();
+        let lane_woken = lane.notified();
+        tokio::pin!(lane_woken);
+        lane_woken.as_mut().enable();
+        let published = cache.publication_notify().notified();
+        tokio::pin!(published);
+        published.as_mut().enable();
+        assert_eq!(
+            cache
+                .put_if_absent_contiguous_for_handle(handle, 0, 0, Bytes::from_static(b"p0"))
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyPresent
+        );
+        let quiet = std::time::Duration::from_millis(20);
+        assert!(tokio::time::timeout(quiet, lane_woken.as_mut())
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(quiet, published.as_mut())
+            .await
+            .is_err());
+
+        // A part stored without contiguous publication: its duplicate copy
+        // finishes the publication (August's retry guarantee).
+        let (stored, _) = cache
+            .put_slot_if_absent_for_handle(handle, 1, Bytes::from_static(b"p1"), false)
+            .await
+            .unwrap();
+        assert_eq!(stored, PutIfAbsentResult::Inserted);
+        assert_eq!(cache.last_for_handle(handle), Some(0));
+        assert_eq!(
+            cache
+                .put_if_absent_contiguous_for_handle(handle, 1, 0, Bytes::from_static(b"p1"))
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyPresent
+        );
+        assert_eq!(cache.last_for_handle(handle), Some(1));
+        assert!(tokio::time::timeout(quiet, published.as_mut())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
