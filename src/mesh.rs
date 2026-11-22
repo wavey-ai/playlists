@@ -3201,28 +3201,54 @@ impl FecReceiver {
 /// second for a 4K part, and liveness is read in hundreds of milliseconds.
 const PEER_HEARD_STAMP_INTERVAL: Duration = Duration::from_millis(5);
 
-/// A receive task's own record of when it last stamped each peer heard.
+/// A receive task's own record of when it last stamped each peer heard, and
+/// of the addresses at which this node hears itself.
 #[derive(Default)]
-struct PeerHeard(HashMap<SocketAddr, Instant>);
+struct PeerHeard {
+    /// When each source was last considered for a stamp.
+    considered: HashMap<SocketAddr, Instant>,
+    /// Addresses from which this node's own frames arrived: a node whose
+    /// own address is among its peers (gossiped to it while it binds a
+    /// wildcard address) sends itself hellos, and is never its own parent.
+    own: HashSet<SocketAddr>,
+}
 
 impl PeerHeard {
-    /// Stamp `peer` heard now, at most once per
-    /// [`PEER_HEARD_STAMP_INTERVAL`]. The record of a peer that left is
-    /// replaced when the map holds many more than a node has peers.
-    fn stamp(&mut self, peer_seen: &PeerSeen, peer: SocketAddr) {
+    /// Whether a datagram from `peer` is due to stamp it heard: not this
+    /// node, and not considered within [`PEER_HEARD_STAMP_INTERVAL`]. The
+    /// caller still checks that `peer` is one of the node's peers, so a
+    /// datagram from anywhere else never grows the shared map. The record
+    /// of sources is replaced when it holds many more than a node has peers.
+    fn due(&mut self, peer: SocketAddr, bind_addr: SocketAddr) -> bool {
+        if peer == bind_addr || self.own.contains(&peer) {
+            return false;
+        }
         let now = Instant::now();
         if self
-            .0
+            .considered
             .get(&peer)
             .is_some_and(|last| now.duration_since(*last) < PEER_HEARD_STAMP_INTERVAL)
         {
-            return;
+            return false;
         }
-        if self.0.len() >= 4_096 {
-            self.0.clear();
+        if self.considered.len() >= 4_096 {
+            self.considered.clear();
         }
-        self.0.insert(peer, now);
-        lock(peer_seen).insert(peer, now);
+        self.considered.insert(peer, now);
+        true
+    }
+
+    /// Stamp `peer` heard now.
+    fn stamp(peer_seen: &PeerSeen, peer: SocketAddr) {
+        lock(peer_seen).insert(peer, Instant::now());
+    }
+
+    /// A frame of this node's own arrived from `peer`: it is never heard on
+    /// receipt again, and a stamp that its first datagram made is undone.
+    fn own_address(&mut self, peer_seen: &PeerSeen, peer: SocketAddr) {
+        if self.own.insert(peer) {
+            lock(peer_seen).remove(&peer);
+        }
     }
 }
 
@@ -3298,8 +3324,11 @@ async fn receive_task(
                     }
                 }
 
-                if config.liveness_on_receipt {
-                    heard.stamp(&shared.peer_seen, peer);
+                if config.liveness_on_receipt
+                    && heard.due(peer, config.bind_addr)
+                    && peers.read().await.contains(&peer)
+                {
+                    PeerHeard::stamp(&shared.peer_seen, peer);
                 }
                 if let Some(observer) = &observer.0 {
                     observer.datagram(peer, &buf[..len]);
@@ -3322,6 +3351,9 @@ async fn receive_task(
                 match MeshFrame::decode(&decoded) {
                     Ok(frame) => {
                         if frame.node_id() == config.node_id {
+                            if config.liveness_on_receipt {
+                                heard.own_address(&shared.peer_seen, peer);
+                            }
                             continue;
                         }
                         if class_socket
@@ -6168,12 +6200,33 @@ mod tests {
     /// Datagrams of a parent that never complete a block (a 4K part waiting
     /// for repair, a decode behind a burst) still say that the parent is
     /// alive: liveness is stamped on receipt, before FEC decode.
+    ///
+    /// On a mesh split by class the datagrams go only to the class socket,
+    /// from the parent's class socket (its main port plus the offset): a 4K
+    /// parent whose video is all on the class lane is heard there. Junk from
+    /// a source that is not a peer is never stamped, on either lane.
     #[tokio::test]
     async fn a_parent_is_heard_on_receipt_before_any_block_decodes() {
-        async fn heard_after_undecodable_datagrams(liveness_on_receipt: bool) -> Option<Duration> {
-            let parent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let parent_addr = parent.local_addr().unwrap();
-            let edge_addr = loopback_addr();
+        /// How long the edge's parents have been silent, and every address
+        /// that the edge has stamped heard.
+        async fn heard_after_undecodable_datagrams(
+            liveness_on_receipt: bool,
+            class_offset: u16,
+        ) -> (Option<Duration>, Vec<SocketAddr>) {
+            let (parent_addr, parent) = if class_offset == 0 {
+                let parent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                (parent.local_addr().unwrap(), parent)
+            } else {
+                let parent_addr = class_split_addr(class_offset);
+                let class = SocketAddr::from(([127, 0, 0, 1], parent_addr.port() + class_offset));
+                (parent_addr, std::net::UdpSocket::bind(class).unwrap())
+            };
+            let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let edge_addr = if class_offset == 0 {
+                loopback_addr()
+            } else {
+                class_split_addr(class_offset)
+            };
             let edge = CacheMesh::new(
                 Arc::new(ChunkCache::new(demand_options())),
                 // Not same-region-only: a parent that has not said hello
@@ -6181,28 +6234,78 @@ mod tests {
                 CacheMeshConfig::new("edge", "uk", edge_addr)
                     .with_role(CacheMeshRole::Edge)
                     .with_peer(parent_addr)
+                    .with_class_port_offset(class_offset)
+                    .with_stream_classifier(video_streams(&[9]))
                     .with_liveness_on_receipt(liveness_on_receipt),
             )
             .start()
             .await
             .unwrap();
+            let to = if class_offset == 0 {
+                edge_addr
+            } else {
+                edge.class_local_addr().expect("a class socket")
+            };
+            assert_eq!(to.port(), edge_addr.port() + class_offset);
             assert!(edge.parents_silent_for().await.is_none());
             // Bytes that no FEC block ever decodes: only receipt hears them.
             for _ in 0..5 {
-                parent.send_to(b"not a fec datagram", edge_addr).unwrap();
+                parent.send_to(b"not a fec datagram", to).unwrap();
+                stranger.send_to(b"not a fec datagram", to).unwrap();
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
             let silent = edge.parents_silent_for().await;
+            let stamped = lock(&edge.peer_seen).keys().copied().collect();
             edge.shutdown();
-            silent
+            (silent, stamped)
         }
-        let silent = heard_after_undecodable_datagrams(true)
-            .await
-            .expect("the parent was heard on receipt");
-        assert!(silent < Duration::from_millis(200), "{silent:?}");
-        // The behaviour from before: only a decoded frame is heard.
-        assert!(heard_after_undecodable_datagrams(false).await.is_none());
+        for class_offset in [0, TEST_CLASS_OFFSET] {
+            let (silent, stamped) = heard_after_undecodable_datagrams(true, class_offset).await;
+            let silent = silent.expect("the parent was heard on receipt");
+            assert!(
+                silent < Duration::from_millis(200),
+                "{class_offset}: {silent:?}"
+            );
+            // The parent, under its main address, and not the stranger.
+            assert_eq!(stamped.len(), 1, "{class_offset}: {stamped:?}");
+            // The behaviour from before: only a decoded frame is heard.
+            let (silent, stamped) = heard_after_undecodable_datagrams(false, class_offset).await;
+            assert!(silent.is_none(), "{class_offset}: {silent:?}");
+            assert!(stamped.is_empty(), "{class_offset}: {stamped:?}");
+        }
+    }
+
+    /// A node bound to a wildcard address may be told its own address by a
+    /// peer's hello, and then sends hellos to itself. Receipt must not make
+    /// it hear itself, or an edge would rank itself a live parent.
+    #[tokio::test]
+    async fn a_node_that_sends_itself_hellos_is_not_its_own_live_parent() {
+        let own = loopback_addr();
+        let bind = SocketAddr::from(([0, 0, 0, 0], own.port()));
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            CacheMeshConfig::new("edge", "uk", bind)
+                .with_role(CacheMeshRole::Edge)
+                .with_peer(own)
+                .with_announce_interval(Duration::from_millis(10)),
+        )
+        .start()
+        .await
+        .unwrap();
+        // Its own hellos arrive from `own`, which is not the bind address.
+        let mut silent = Vec::new();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            silent.push(edge.parents_silent_for().await);
+        }
+        assert!(
+            edge.fec_stats().rx_decoded_objects > 0,
+            "the node heard its own hellos"
+        );
+        assert!(silent.iter().all(Option::is_none), "{silent:?}");
+        assert!(!lock(&edge.peer_seen).contains_key(&own));
+        edge.shutdown();
     }
 
     #[test]
