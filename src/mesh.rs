@@ -100,7 +100,9 @@ const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheMeshRole {
-    /// Every node both receives and forwards: a flat mesh of equal nodes.
+    /// A flat mesh of equal nodes: a node sends the parts written on it to
+    /// every peer and receives theirs. It does not relay a part that it
+    /// received: a part reaches only the peers of the node that wrote it.
     #[default]
     Peer,
     /// A regional cache distributor may serve child replicas.
@@ -2118,7 +2120,10 @@ impl CacheMeshHandle {
     }
 
     async fn send_control(&self, peers: &[SocketAddr], frame: &[u8]) -> Result<usize, MeshError> {
-        let block_id = self.request_block_id.fetch_add(1, Ordering::Relaxed);
+        // The sender numbers one block per peer: reserve them all, so the
+        // next call does not send a peer a block id it has already taken.
+        let blocks = u32::try_from(peers.len()).unwrap_or(u32::MAX);
+        let block_id = self.request_block_id.fetch_add(blocks, Ordering::Relaxed);
         let mut sender = FecSender::with_policy_and_initial_block_id(
             self.repair_symbols,
             self.repair_ratio,
@@ -3003,8 +3008,55 @@ struct DecodedBlock {
     first_seen_us: u64,
 }
 
+/// The ranges of block ids that a peer numbers on their own counters:
+/// announcements, control requests, replica replies and parts.
+const BLOCK_ID_LANES: usize = 4;
+
+/// The range of block ids that `block_id` belongs to.
+fn block_id_lane(block_id: u32) -> usize {
+    if block_id >= CHUNK_BLOCK_ID_BASE {
+        3
+    } else if block_id >= REPLY_BLOCK_ID_BASE {
+        2
+    } else if block_id >= REQUEST_BLOCK_ID_BASE {
+        1
+    } else {
+        0
+    }
+}
+
+/// The decoders of one peer: one for each range of block ids.
+///
+/// A decoder that completes a block drops every incomplete block more than
+/// `COMPLETED_WINDOW` (64) ids below it. Each range of a peer counts from
+/// its own base, so with one decoder a completed part (ids from 2^31) would
+/// drop a replica reply (ids from 1.5 x 2^30) that is still arriving, and
+/// every symbol of it already received.
+#[derive(Default)]
+struct PeerDecoders {
+    lanes: [DatagramFecDecoder; BLOCK_ID_LANES],
+}
+
+impl PeerDecoders {
+    fn lane_mut(&mut self, block_id: u32) -> &mut DatagramFecDecoder {
+        &mut self.lanes[block_id_lane(block_id)]
+    }
+
+    fn expire_block(&mut self, block_id: u32) {
+        self.lane_mut(block_id).expire_block(block_id);
+    }
+
+    #[cfg(test)]
+    fn in_flight_block_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(DatagramFecDecoder::in_flight_block_count)
+            .sum()
+    }
+}
+
 struct FecReceiver {
-    decoders: HashMap<SocketAddr, DatagramFecDecoder>,
+    decoders: HashMap<SocketAddr, PeerDecoders>,
     /// The peers in the order in which they were given a decoder.
     decoder_order: VecDeque<SocketAddr>,
     observations: HashMap<(SocketAddr, u32), FecBlockObservation>,
@@ -3206,7 +3258,8 @@ impl FecReceiver {
         let decoder = self
             .decoders
             .get_mut(&peer)
-            .expect("admitted decoder peer must exist");
+            .expect("admitted decoder peer must exist")
+            .lane_mut(header.block_id);
         let decoded = match decoder.push_datagram(bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
@@ -3349,7 +3402,7 @@ impl FecReceiver {
                 Ordering::Relaxed,
             );
         }
-        self.decoders.insert(peer, DatagramFecDecoder::default());
+        self.decoders.insert(peer, PeerDecoders::default());
         self.decoder_order.push_back(peer);
     }
 
@@ -3817,7 +3870,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             };
-            if let Err(err) = handler.cache.validate_payload(&payload) {
+            if let Err(err) = handler.cache.validate_write(slot_id, &payload) {
                 warn!(
                     node_id,
                     stream_id,
@@ -6206,11 +6259,129 @@ mod tests {
             receiver
                 .decoders
                 .values()
-                .map(DatagramFecDecoder::in_flight_block_count)
+                .map(PeerDecoders::in_flight_block_count)
                 .sum::<usize>()
                 <= 3
         );
         assert!(stats.snapshot().rx_evicted_objects > 0);
+    }
+
+    /// A peer numbers its parts, replica replies, requests and announcements
+    /// on counters of their own. A part that completes while a reply of the
+    /// same peer is arriving does not drop what the reply has received.
+    #[test]
+    fn a_completed_part_keeps_a_reply_of_the_same_peer_that_is_arriving() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::new(Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9930".parse().unwrap();
+        let mut replies = DatagramFecEncoder::new()
+            .with_symbol_size(100)
+            .with_repair_symbols(1)
+            .with_initial_block_id(REPLY_BLOCK_ID_BASE);
+        let mut parts = DatagramFecEncoder::new()
+            .with_symbol_size(100)
+            .with_repair_symbols(0)
+            .with_initial_block_id(CHUNK_BLOCK_ID_BASE);
+        let mut requests = DatagramFecEncoder::new()
+            .with_symbol_size(100)
+            .with_repair_symbols(0)
+            .with_initial_block_id(REQUEST_BLOCK_ID_BASE);
+        let reply_payload = (0..1_000).map(|i| i as u8).collect::<Vec<_>>();
+        let reply = replies.encode_object(&reply_payload).unwrap();
+        let request = requests.encode_object(&[3_u8; 300]).unwrap();
+        // 10 source symbols and 1 repair: the reply needs 10 of its 11.
+        assert_eq!(reply.len(), 11);
+        assert_eq!(request.len(), 3);
+
+        assert!(receiver.push(peer, &request[0]).unwrap().is_none());
+        for datagram in &reply[..5] {
+            assert!(receiver.push(peer, datagram).unwrap().is_none());
+        }
+        for part in 0..3_u8 {
+            let datagrams = parts.encode_object(&[part; 50]).unwrap();
+            assert_eq!(
+                receiver.push(peer, &datagrams[0]).unwrap().as_deref(),
+                Some(&[part; 50][..])
+            );
+        }
+        assert_eq!(receiver.decoders[&peer].in_flight_block_count(), 2);
+        let mut decoded = None;
+        for datagram in &reply[5..] {
+            if let Some(frame) = receiver.push(peer, datagram).unwrap() {
+                decoded = Some(frame);
+            }
+        }
+        assert_eq!(decoded.as_deref(), Some(&reply_payload[..]));
+        assert_eq!(
+            receiver.push(peer, &request[1]).unwrap(),
+            None,
+            "the request still has one symbol to come"
+        );
+        assert_eq!(
+            receiver.push(peer, &request[2]).unwrap().as_deref(),
+            Some(&[3_u8; 300][..])
+        );
+        assert_eq!(receiver.decoders[&peer].in_flight_block_count(), 0);
+    }
+
+    /// Each peer of one control send takes its own block id, and the next
+    /// send starts beyond all of them: a peer that comes first in the next
+    /// send is not given a block id that it has already decoded, which it
+    /// would drop as a duplicate.
+    #[tokio::test]
+    async fn control_sends_to_several_peers_never_reuse_a_block_id() {
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge = CacheMesh::new(
+            cache,
+            CacheMeshConfig::new("edge", "uk", loopback_addr())
+                .with_peers([first_addr, second_addr])
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_secs(60)),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        // The order of the peers changes between sends, as the parents of
+        // two playlists do.
+        edge.send_control(&[first_addr, second_addr], b"one")
+            .await
+            .unwrap();
+        edge.send_control(&[second_addr, first_addr], b"two")
+            .await
+            .unwrap();
+        edge.send_control(&[second_addr], b"three").await.unwrap();
+
+        async fn request_blocks(socket: &UdpSocket, blocks: usize) -> Vec<u32> {
+            let mut ids = Vec::new();
+            let mut buf = vec![0_u8; 65_536];
+            while ids.len() < blocks {
+                let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+                    .await
+                    .expect("a control block did not arrive")
+                    .unwrap();
+                let header = DatagramFecHeader::decode(&buf[..len]).unwrap();
+                if block_id_lane(header.block_id) == 1 && !ids.contains(&header.block_id) {
+                    ids.push(header.block_id);
+                }
+            }
+            ids
+        }
+        let to_first = request_blocks(&first, 2).await;
+        let to_second = request_blocks(&second, 3).await;
+        let mut all = to_first
+            .iter()
+            .chain(&to_second)
+            .copied()
+            .collect::<Vec<_>>();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 5, "first {to_first:?}, second {to_second:?}");
+        edge.shutdown();
     }
 
     /// The receiver prunes on every datagram, so the expiry queue holds no
@@ -7541,6 +7712,55 @@ mod tests {
             .unwrap();
         assert_eq!((event.stream_id, event.slot_id), (7, slot_id));
         event
+    }
+
+    /// A part that the cache refuses whatever its stream (the id `u64::MAX`,
+    /// the cache's empty marker) is refused before its stream is created: on
+    /// a full edge it does not evict a live stream.
+    #[tokio::test]
+    async fn a_refused_part_id_does_not_evict_a_live_stream() {
+        let edge_addr = loopback_addr();
+        let raw_addr = loopback_addr();
+        let edge_cache = Arc::new(ChunkCache::new(Options {
+            num_playlists: 1,
+            ..demand_options()
+        }));
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_allowed_peers([raw_addr])
+                .with_role(CacheMeshRole::Edge)
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        let live = edge_cache.resolve_or_create_stream(7).await;
+        edge_cache
+            .add_for_handle(live, 0, Bytes::from_static(b"live"))
+            .await
+            .unwrap();
+
+        let raw = UdpSocket::bind(raw_addr).await.unwrap();
+        let mut raw_sender = FecSender::new(1, DEFAULT_SYMBOL_SIZE);
+        for (stream_id, slot_id) in [(9, u64::MAX), (7, 1)] {
+            let frame = MeshFrame::chunk("raw", stream_id, slot_id, Bytes::from_static(b"part"))
+                .encode()
+                .unwrap();
+            raw_sender.send(&raw, edge_addr, &frame).await.unwrap();
+        }
+        // One socket's frames are applied in order: part 1 of stream 7
+        // comes after the refused part.
+        next_applied(&mut applied_rx, 1).await;
+        assert_eq!(edge_cache.resolve_stream(7), Some(live));
+        assert!(edge_cache.resolve_stream(9).is_none());
+        assert_eq!(
+            edge_cache.get_for_handle(live, 0).await.unwrap().0,
+            Bytes::from_static(b"live")
+        );
+        assert_eq!(edge.fec_stats().rx_unauthorized_datagrams, 0);
+        edge.shutdown();
     }
 
     /// The readers of an edge, started before anything is published, wake

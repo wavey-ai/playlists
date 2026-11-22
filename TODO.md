@@ -57,24 +57,31 @@ stream. A receiver that sees a new epoch recreates its stream. This changes the
 wire format and the edge's cut-through parser, so it is planned with the
 product (`av-mesh-run`). The low-latency line has the same gap.
 
+The same gap lets a lagging parent overwrite a newer part. With two parents
+(full replication, or a replica window from each), the oldest part of a parent
+that is one part behind lands in the ring slot of the edge's newest part, which
+the other parent delivered: `get` of that part returns nothing until the
+lagging parent forwards it too. The epoch lets the apply path refuse an older
+ID of the same epoch, as `OlderId::Reject` does for local writes.
+
 ### [ ] `max_inflight_frames` under 4K video with loss
 
 The default of 64 incomplete FEC objects is unmeasured with large parts. Run 4K
 video interleaved with 4,000 audio parts/s at `with_receive_loss_ppm(30_000)`.
-Raise the default if `rx_evicted_objects` is above 0 without real loss.
+Raise the default if `rx_evicted_objects` is above 0 without real loss. The
+class lane's receiver of a mesh split by class has the same bound: check its
+`rx_evicted_objects` too.
 
 ### [ ] Product latency bench against the low-latency baseline
 
 Run the product bench (Opus 2.5 ms parts and PCM 1 ms parts, audio only and
 with 4K on the mesh) for p50, p99, and distributor CPU per part, against
-`ff09196`. The in-crate 4,000 parts/s gates show no regression, but they use
+`89964dc`, the low-latency line with the class split. The in-crate 4,000 parts/s gates show no regression, but they use
 72-byte parts only.
 
-### [ ] Merge the low-latency class split
+### [x] Merge the low-latency class split
 
-`origin/low-latency` gained `fe8318c` and `89964dc` after this merge was based:
-video on its own socket and tasks, and audio priority. They need a follow-up
-merge onto the merged mesh.
+`fe8318c` and `89964dc` are merged onto the merged mesh in `7e27ac3`.
 
 ### [ ] Remove the unused `tls-helpers` dependency
 
@@ -97,6 +104,13 @@ These are properties of the merged design that a deployment must satisfy.
   largest part must fit `buffer_size_kb`. Both caches refuse larger writes.
 - [ ] Every mesh node runs this version: version 1 frames and 16-byte replica
   requests are refused.
+- [ ] With the mesh split by class, every node uses the same
+  `class_port_offset`, and nothing between nodes (NAT, proxy) rewrites the
+  source port. A class datagram is taken only from an authorized peer's main
+  port plus the offset; others count in the class lane's
+  `rx_unauthorized_datagrams`.
+- [ ] `ClassLaneRuntime::Caller` is gone. Use
+  `ClassLaneRuntime::Handle(tokio::runtime::Handle::current())` in its place.
 - [ ] Add the downstream HTTP test for missing initialization and its 404
   mapping.
 

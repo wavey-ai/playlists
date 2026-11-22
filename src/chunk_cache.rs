@@ -425,7 +425,7 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<usize, &'static str> {
-        self.validate_payload(&data_bytes)?;
+        self.validate_write(id, &data_bytes)?;
         let handle = self.resolve_or_create_stream_sync(stream_id);
         self.add_for_handle(handle, id, data_bytes).await?;
         Ok(handle.index())
@@ -487,7 +487,7 @@ impl ChunkCache {
         id: usize,
         data_bytes: Bytes,
     ) -> Result<PutIfAbsentResult, &'static str> {
-        self.validate_payload(&data_bytes)?;
+        self.validate_write(id, &data_bytes)?;
         let handle = self.resolve_or_create_stream_sync(stream_id);
         self.put_if_absent_for_handle(handle, id, data_bytes).await
     }
@@ -530,7 +530,7 @@ impl ChunkCache {
         first_expected_id: usize,
         data_bytes: Bytes,
     ) -> Result<PutIfAbsentResult, &'static str> {
-        self.validate_payload(&data_bytes)?;
+        self.validate_write(id, &data_bytes)?;
         let handle = self.resolve_or_create_stream_sync(stream_id);
         self.put_if_absent_contiguous_for_handle(handle, id, first_expected_id, data_bytes)
             .await
@@ -1197,6 +1197,18 @@ impl ChunkCache {
         (data.len() <= max_bytes)
             .then_some(())
             .ok_or("Chunk payload exceeds configured limit")
+    }
+
+    /// Every check of a part write that does not need the stream: the
+    /// payload limit and the id (`usize::MAX` is the empty marker, see
+    /// [`Self::slot_index`]). A write by stream ID runs it before the stream
+    /// is created, so a write that will be refused never evicts a live
+    /// stream.
+    pub(crate) fn validate_write(&self, id: usize, data: &Bytes) -> Result<(), &'static str> {
+        if id == EMPTY_ID {
+            return Err("Chunk id out of range");
+        }
+        self.validate_payload(data)
     }
 
     pub(crate) fn validate_initialization_payload(&self, data: &Bytes) -> Result<(), &'static str> {
@@ -1885,10 +1897,30 @@ mod tests {
             .set_stream_initialization(43, Bytes::from(vec![0_u8; 1025]))
             .await
             .is_err());
+        // `usize::MAX` is the empty marker and is refused as an id.
+        assert_eq!(
+            cache
+                .add_for_stream_id(44, usize::MAX, Bytes::from_static(b"x"))
+                .await,
+            Err("Chunk id out of range")
+        );
+        assert_eq!(
+            cache
+                .put_if_absent_for_stream_id(45, usize::MAX, Bytes::from_static(b"x"))
+                .await,
+            Err("Chunk id out of range")
+        );
+        assert_eq!(
+            cache
+                .put_if_absent_contiguous_for_stream_id(46, usize::MAX, 0, Bytes::from_static(b"x"))
+                .await,
+            Err("Chunk id out of range")
+        );
 
         assert_eq!(cache.resolve_stream(41), Some(live));
-        assert_eq!(cache.resolve_stream(42), None);
-        assert_eq!(cache.resolve_stream(43), None);
+        for refused in 42..=46 {
+            assert_eq!(cache.resolve_stream(refused), None);
+        }
         assert_eq!(
             cache.get_for_handle(live, 0).await.unwrap().0,
             Bytes::from_static(b"live")

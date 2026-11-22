@@ -281,24 +281,22 @@ impl Playlists {
         // An add holds this lock through its cache commit. Once acquired, no
         // add of the old entry can write after the caches are cleared.
         let _commit = entry.commit();
+        // Another fin of the same entry may have ended the stream already,
+        // and a newer entry for the id may hold the caches' stream now: that
+        // stream is not this fin's to clear. While the map holds this entry
+        // it stays there: an add sees it closing, and only a holder of its
+        // commit lock removes it.
+        if !self
+            .entries()
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            return;
+        }
         self.m3u8_cache.zero_stream_id(id);
         self.chunk_cache.zero_stream_id(id);
-
-        let removed = {
-            let mut playlists = self.entries();
-            if playlists
-                .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(current, &entry))
-            {
-                playlists.remove(&id);
-                true
-            } else {
-                false
-            }
-        };
-        if removed {
-            self.active.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.entries().remove(&id);
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Add a part whose duration is `fmp4.duration` milliseconds.
@@ -520,6 +518,56 @@ mod tests {
             assert_eq!(m3u8_cache.memory_stats().occupied_slots, 0, "round {round}");
             assert!(chunk_cache.resolve_stream(7).is_none(), "round {round}");
         }
+    }
+
+    /// Two `fin`s of one entry: the second, which waited for the entry's
+    /// commit lock while the first ended the stream, does not clear the
+    /// stream of a newer entry that an add made in between.
+    #[test]
+    fn a_second_fin_of_an_ended_entry_leaves_a_newer_stream_alone() {
+        let (playlists, chunk_cache, m3u8_cache) = Playlists::new(Options::default());
+        assert!(playlists.add_us(7, part(0), 2_500));
+
+        let old = Arc::clone(playlists.entries().get(&7).expect("live entry"));
+        let commit_guard = old.commit();
+        let second_fin = {
+            let playlists = Arc::clone(&playlists);
+            thread::spawn(move || playlists.fin(7))
+        };
+        // The map, this test and the second fin hold the entry.
+        while Arc::strong_count(&old) < 3 {
+            thread::yield_now();
+        }
+
+        // The first fin, under the commit lock that the second waits for:
+        // clear both caches, then remove the entry.
+        playlists.m3u8_cache.zero_stream_id(7);
+        chunk_cache.zero_stream_id(7);
+        assert!(playlists
+            .entries()
+            .remove(&7)
+            .is_some_and(|removed| Arc::ptr_eq(&removed, &old)));
+        playlists.active.fetch_sub(1, Ordering::AcqRel);
+
+        // A new stream of the same id.
+        assert!(playlists.add_us(7, part(0), 2_500));
+        assert!(playlists.add_us(7, part(0), 2_500));
+        let stream = m3u8_cache.resolve_stream(7).expect("the new stream");
+        let position = m3u8_cache.last_position(7);
+        assert!(position.is_some());
+
+        drop(commit_guard);
+        second_fin.join().unwrap();
+
+        assert!(playlists.entries().contains_key(&7));
+        assert_eq!(playlists.active(), 1);
+        assert_eq!(m3u8_cache.resolve_stream(7), Some(stream));
+        assert_eq!(m3u8_cache.last_position(7), position);
+        assert!(playlists.add_us(7, part(0), 2_500));
+
+        playlists.fin(7);
+        assert_eq!(playlists.active(), 0);
+        assert!(m3u8_cache.resolve_stream(7).is_none());
     }
 
     #[test]

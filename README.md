@@ -64,11 +64,16 @@ streams, and `ChunkCache::handle_at` names the stream at an index, for example
 an index drained from `PublishedStreams`.
 
 The raw-index methods (`set`, `append`, `add`, `get`, `get_last`, `last`,
-`version`, `update_notifier`, `reset_stream_idx`) are for fixed lanes: code
-that owns a physical index which the stream registry never assigns. They
-reject indices that belong to a logical stream. A fixed lane must not use
-`resolve_stream`, `resolve_or_create_stream`, or another registry method. Call
-`reset_stream_idx` before the lane starts a new logical lifetime.
+`version`) are for fixed lanes: code that owns a physical index which the
+stream registry never assigns. They reject indices that belong to a logical
+stream. A fixed lane must not use `resolve_stream`, `resolve_or_create_stream`,
+or another registry method. Two index methods do not check the owner:
+
+- `update_notifier(index)` returns the notifier of any index, a logical
+  stream's (`handle.index()`) included.
+- `reset_stream_idx(index)` ends whatever stream holds the index, a logical
+  stream included, and frees the index. A fixed lane calls it only on its own
+  index, before the lane starts a new logical lifetime.
 
 ## Time and sizes
 
@@ -236,9 +241,11 @@ mesh.shutdown();
 # }
 ```
 
-A node is a `Peer` (the default: it receives and forwards), a `Distributor`
-that serves children, or an `Edge` that receives from parents and never
-forwards. In `ReplicationMode::All` (the default) a distributor pushes every
+A node is a `Peer` (the default: it sends the parts written on it to every
+peer and receives theirs, but does not relay a part that it received), a
+`Distributor` that serves children and forwards received parts to them, or an
+`Edge` that receives from parents and sends no parts. A part written on a
+`Peer` reaches only that node's own peers: a chain of peers does not relay. In `ReplicationMode::All` (the default) a distributor pushes every
 stream to every child. In `ReplicationMode::Demand` it pushes a stream only
 while the child holds a subscription lease for it.
 
