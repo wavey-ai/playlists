@@ -1145,3 +1145,44 @@ All three fail with the fix removed. The control in `an_edge_applies_audio_parts
 - `cargo fmt --check`
 
 **Not confirmed.** The lab bench has not been re-run with this commit, because the lab belongs to another session. That run must show whether the London `edge_committed -> reply` p99 with 4K comes back to the before level or below it. It must also show whether the small after-only difference in the lab is real: none of the three benches could reproduce it.
+
+### Merge of c14d921 (wave 4)
+
+`origin/low-latency` moved to `c14d921`: four commits on `89964dc`. `0f422fb` stamps a peer heard on the receipt of any datagram, before FEC decode, behind `CacheMeshConfig::with_liveness_on_receipt` (default true). `853a33a` adds `ChunkCache::written_unix_us(stream_idx, id)`. `6130443` adds `CacheMeshHandle::served_changed`. `c14d921` stamps only known peers, never the node itself. Merged with `git merge --no-ff origin/low-latency` onto `3cb55d7`: one conflict hunk in `chunk_cache.rs` (the LL test block) and eleven in `mesh.rs` (config, `start`, the handle fields, the receive and sync tasks). The merged mesh is kept, and each feature is ported onto it.
+
+- **Receipt liveness: one rule with the allowlist.**
+  - The stamp is in `receive_task`, which serves both lanes. It comes right after `MeshShared::authorized_sender(lane, from)` and before the receive observer and FEC decode.
+  - An unauthorized datagram is dropped and counted before the stamp, so the stamp needs no peer-set check of its own. LL's `peers.read().await.contains(&peer)` in the receive loop is gone. "Known peers only" and the allowlist are now the same check.
+  - On the class socket, `authorized_sender` returns the peer's main address, so a class datagram stamps the peer under its main address, as LL's test requires.
+  - The bound on the shared map is now the allowlist: only an authorized address is ever stamped. `with_allowed_peers` can authorize a child that is not in `peers`, and such a child can be stamped. That does no harm: `parents_silent_for` reads only parents.
+  - `PeerHeard` is LL's: at most one stamp per peer per 5 ms, never the bind address, and never an address from which one of the node's own frames has decoded. The first own frame also removes the stamp that its first datagram made. Each receive task keeps its own record, as on LL.
+- **`with_liveness_on_receipt` removed** (the field, the builder, and both `if config.liveness_on_receipt` guards). Receipt liveness is the only behaviour. Tests:
+  - `liveness_on_receipt_is_on_by_default_and_can_be_turned_off` is deleted. It tested only the opt-out.
+  - `a_parent_is_heard_on_receipt_before_any_block_decodes` loses its `false` arm, which checked the decode-only behaviour, on both lanes. In its place it now asserts that the stamped set is exactly `[parent_addr]` (LL asserted a length of 1), and that the stranger's 5 datagrams were refused (`rx_unauthorized_datagrams == 5`). That shows the allowlist dropped them before any stamp.
+  - Mutation check: stamping before `authorized_sender` fails this test on the stranger's stamp.
+  - `a_node_that_sends_itself_hellos_is_not_its_own_live_parent` is unchanged apart from `edge.shared.peer_seen`. Its `with_peer(own)` authorizes the node's own address, so only the own-frame exclusion keeps it from hearing itself.
+- **Write times (853a33a).**
+  - The raw-index `written_unix_us(stream_idx, id)` is not ported. On the merged cache a raw-index read of a registry-owned lane is not generation-safe and returns `None` (C2). The auto-merged copy also read LL's three slot arrays, which the merged `SlotTag` replaces.
+  - The fast form is `written_unix_us_for_handle(handle, id)`: resolve the stream once, then each slot costs no map lookup and no lock.
+  - It now checks the handle once, with `is_current_fast`, before the tag. Step 6 had a second `is_current_fast` after the time load. That check is dropped. The tag's generation already binds the time to the handle's lifetime, because generations only grow on an index. A release that lands during the read is ordered after it. LL's raw read also checked the generation once, at the start.
+  - The LL test additions go into the merged `a_reader_woken_by_a_write_finds_when_the_slot_was_written`. By handle it gives the same answers as by stream ID, `None` for ids 3 and 4, `None` from a raw `get` on the owned lane, and `None` after `zero_stream_id`. `a_write_time_is_bound_to_the_generation_that_wrote_it` still covers reuse and release.
+  - Microbench (scratch crates `/tmp/claude-1000/plmerge-wave4/wb-{ll,merged}`): 12,000 slots of one stream, best of 7 sweeps of 400, five alternating runs. LL `written_unix_us(idx, id)` 7.05–7.24 ns per slot. Merged `written_unix_us_for_handle` 5.80–6.20 ns. With step 6's second check it was 7.8 ns. By stream ID: LL 29.7–31.0, merged 34.3–36.4 ns (the registry resolve, as in step 5).
+- **`served_changed`** is kept as LL wrote it. The sender is a `watch::Sender<u64>` in `MeshShared`, not an `Arc` passed to each task. Each lane's sync task compares its own `served_of(lane)` list and bumps the one shared count, so a lease change on either lane is seen. `the_served_leases_watch_changes_when_a_lease_comes_or_goes` is unchanged.
+- **Gates.** `nice cargo test --all-features` three times (218 passed, 2 ignored, each time); `nice cargo test --release --all-features mesh::` (91 passed); `cargo clippy --all-features --all-targets -- -D warnings`; `cargo fmt --check`.
+- **Performance.** Release. `origin/low-latency` `c14d921` in `/tmp/claude-1000/plmerge-baseline` against the merge. Each test ran in its own process, alternating which side ran first each round, on a host shared with other sessions (load average 4–8). Medians [range] of the first batch of 10 rounds of both gates:
+
+  | Test | Side | p50 µs | p99 µs | CPU µs/part |
+  |---|---|---|---|---|
+  | `sends_four_thousand_parts_a_second` | LL | 60.5 [57–62] | 248.5 [198–259] | 24.5 [23.3–25.4] |
+  | | merged | 61.0 [57–70] | 250.5 [173–267] | 24.7 [22.8–27.1] |
+  | `keeps_two_edges_at_four_thousand_parts_a_second` | LL | 79.0 [68–88] | 275.5 [236–318] | 24.3 [21.9–29.7] |
+  | | merged | 78.0 [69–82] | 278.5 [247–407] | 23.5 [22.3–26.6] |
+
+  - The edges p99 was worse in 7 of 10 paired rounds. A second batch of 10 edges rounds gave the same split: 271.5 against 275.5 µs, worse in 7 of 10.
+  - A third batch of 12 rounds added the pre-wave-4 merge (`3cb55d7`) and rotated the order of the three. Edges p99 medians: LL 287.5, `3cb55d7` 279.5, merged 283.0 µs. Merged was worse than LL in 4 of 12 rounds and worse than `3cb55d7` in 5 of 12.
+  - Over all 32 paired rounds the merge was worse in 18. No regression is found beyond noise, and no hot-path change is made for it. On the receive path the merge does less than LL: no peer-set read lock per due stamp.
+  - These runs used the binary from before the single-check change to `written_unix_us_for_handle`, which the mesh does not call.
+- **For the product session (av-mesh API changes).** Found on av-mesh `compare-low-latency-4` (`cad68c1`, worktree `av-mesh-cmpll`):
+  - `CacheMeshConfig::with_liveness_on_receipt` is gone (`main.rs:2470`). Drop `--mesh-liveness-on-receipt`, the `mesh_liveness_on_receipt` argument and its two parser tests (`main.rs:1586`, `:32470`–`:32491`).
+  - `ChunkCache::written_unix_us(stream_idx, id)` does not exist (`main.rs:6856`, the playlist scan memo). Resolve the stream once (`resolve_stream(stream_id)`) and call `written_unix_us_for_handle(handle, seq)` per slot. The same scan's `chunk_cache.get(stream_idx, seq)` is the C2 raw-index pattern, which returns `None` for an owned lane; use `get_for_handle`.
+  - `served_changed()` (`fast_control.rs:115`) is unchanged.

@@ -715,7 +715,17 @@ impl ChunkCache {
         self.written_unix_us_for_handle(handle, id)
     }
 
-    /// [`Self::written_unix_us_for_stream_id`] for a resolved stream.
+    /// [`Self::written_unix_us_for_stream_id`] for a resolved stream. A
+    /// caller that walks many slots of one stream (a playlist render that
+    /// checks its window for writes) resolves it once and calls this per
+    /// slot: no map lookup and no lock, only the registry's lock-free check
+    /// and the slot tag.
+    ///
+    /// The handle is checked once, before the tag. The tag's generation then
+    /// binds the time to the handle's lifetime: generations only grow on an
+    /// index, so a tag that holds `(id, generation)` was written by that
+    /// lifetime and by no other. A release that lands during the read is
+    /// ordered after it.
     pub fn written_unix_us_for_handle(&self, handle: StreamHandle, id: usize) -> Option<u64> {
         if !self.registry.is_current_fast(handle.0) {
             return None;
@@ -727,10 +737,7 @@ impl ChunkCache {
         let written_us = tag.written_us.load(Ordering::Acquire);
         // A concurrent write of another identity into the slot replaces the
         // time; report nothing rather than its time.
-        (written_us != 0
-            && tag.holds(id, handle.generation())
-            && self.registry.is_current_fast(handle.0))
-        .then_some(written_us)
+        (written_us != 0 && tag.holds(id, handle.generation())).then_some(written_us)
     }
 
     /// Read a contiguous retained range for one logical stream identity.
@@ -2582,6 +2589,21 @@ mod tests {
             .await
             .unwrap();
         assert!(cache.written_unix_us_for_stream_id(9, 5).unwrap() >= written);
+
+        // By the stream's handle, resolved once for many slots, the same
+        // answers.
+        let handle = cache.resolve_stream(9).unwrap();
+        assert_eq!(
+            cache.written_unix_us_for_handle(handle, 5),
+            cache.written_unix_us_for_stream_id(9, 5)
+        );
+        assert_eq!(cache.written_unix_us_for_handle(handle, 3), None);
+        assert_eq!(cache.written_unix_us_for_handle(handle, 4), None);
+        // The lane is owned by the registry: a raw-index read sees nothing.
+        assert_eq!(cache.get(handle.index(), 5).await, None);
+        // A stream that leaves its index takes its times with it.
+        cache.zero_stream_id(9);
+        assert_eq!(cache.written_unix_us_for_handle(handle, 5), None);
     }
 
     /// The write time of a part never outlives its generation: a reused

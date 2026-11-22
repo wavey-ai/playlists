@@ -114,7 +114,11 @@ under its owner write lock, so no value crosses a generation.
 Each slot also has a lock-free tag: its ID, generation, and write time.
 `written_unix_us_for_handle` and `written_unix_us_for_stream_id` read the write
 time without a lock or an await. The time is stored before any reader that the
-write wakes can run.
+write wakes can run. A caller that walks many slots of one stream (a playlist
+render that checks every slot of its window) resolves the stream once and uses
+`written_unix_us_for_handle`, which costs one lock-free registry check and the
+slot tag per slot, with no map lookup. There is no raw-index form: a raw index of a
+registry-owned lane is not generation-safe.
 
 `ChunkCache` has three notification sources. None of them stores a permit:
 enable a notification, recheck the cache, and then await it.
@@ -248,6 +252,19 @@ peer and receives theirs, but does not relay a part that it received), a
 `Peer` reaches only that node's own peers: a chain of peers does not relay. In `ReplicationMode::All` (the default) a distributor pushes every
 stream to every child. In `ReplicationMode::Demand` it pushes a stream only
 while the child holds a subscription lease for it.
+`CacheMeshHandle::served_subscriptions` lists the leases that a distributor
+serves on either lane, and `served_changed` returns a watch whose count goes
+up when a (child, playlist) pair comes or goes: a new lease, an Unsubscribe or
+an expiry, seen within one `sync_interval`. Renewing a lease is not a change.
+
+A node hears a peer when any datagram from it is read off either socket, before
+the FEC decode: a parent whose blocks are slow to complete (a 4K part waiting
+for its repair, a decode behind a burst) is still alive. The stamp is written
+after the allowlist check below, so only an authorized peer is ever stamped,
+at most once per peer per 5 ms. A node never hears itself: not at its bind
+address, and not at an address from which one of its own frames has decoded
+(a node bound to a wildcard address that was told its own address sends itself
+hellos). `parents_silent_for` tells an edge how long it has heard no parent.
 
 ### Peer allowlist
 

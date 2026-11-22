@@ -1535,6 +1535,7 @@ impl CacheMesh {
             counters: Arc::new(CacheMeshFecCounters::default()),
             leases: Arc::new(StdMutex::new(HashMap::new())),
             served: Arc::new(StdMutex::new(Vec::new())),
+            served_changed: watch::channel(0).0,
             peer_seen: Arc::new(StdMutex::new(HashMap::new())),
             wanted: Arc::new(StdMutex::new(HashSet::new())),
             link_loss: Arc::new(StdMutex::new(HashMap::new())),
@@ -1729,6 +1730,10 @@ struct MeshShared {
     counters: Arc<CacheMeshFecCounters>,
     leases: LeaseTable,
     served: ServedTable,
+    /// A count that goes up whenever the leases that either lane serves
+    /// change (a child or a playlist comes or goes), so that a consumer of
+    /// the served leases need not poll them.
+    served_changed: watch::Sender<u64>,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
     link_loss: LinkLossTable,
@@ -2060,6 +2065,15 @@ impl CacheMeshHandle {
             }
         }
         served
+    }
+
+    /// A watch that changes whenever the leases of
+    /// [`Self::served_subscriptions`] change: a child or a playlist comes or
+    /// goes, by a new lease, an Unsubscribe or an expiry. The leases are
+    /// looked at once a sync tick, so a change is seen within one
+    /// `sync_interval`. The value is a count with no other meaning.
+    pub fn served_changed(&self) -> watch::Receiver<u64> {
+        self.shared.served_changed.subscribe()
     }
 
     pub fn replication(&self) -> ReplicationMode {
@@ -3528,6 +3542,63 @@ impl FecReceiver {
     }
 }
 
+/// How often a receive task writes that a peer was heard into the shared
+/// map: every datagram would take the map's lock thousands of times a
+/// second for a 4K part, and liveness is read in hundreds of milliseconds.
+const PEER_HEARD_STAMP_INTERVAL: Duration = Duration::from_millis(5);
+
+/// A receive task's own record of when it last stamped each peer heard, and
+/// of the addresses at which this node hears itself.
+#[derive(Default)]
+struct PeerHeard {
+    /// When each peer was last stamped.
+    considered: HashMap<SocketAddr, Instant>,
+    /// Addresses from which this node's own frames arrived: a node whose
+    /// own address is among its peers (gossiped to it while it binds a
+    /// wildcard address) sends itself hellos, and is never its own parent.
+    own: HashSet<SocketAddr>,
+}
+
+impl PeerHeard {
+    /// Whether a datagram from `peer` is due to stamp it heard: not this
+    /// node, and not stamped within [`PEER_HEARD_STAMP_INTERVAL`]. The
+    /// caller asks only for an authorized peer (the allowlist check that
+    /// drops every other datagram comes first), so a datagram from anywhere
+    /// else never grows the shared map. The record of peers is replaced
+    /// when it holds many more than a node has peers.
+    fn due(&mut self, peer: SocketAddr, bind_addr: SocketAddr) -> bool {
+        if peer == bind_addr || self.own.contains(&peer) {
+            return false;
+        }
+        let now = Instant::now();
+        if self
+            .considered
+            .get(&peer)
+            .is_some_and(|last| now.duration_since(*last) < PEER_HEARD_STAMP_INTERVAL)
+        {
+            return false;
+        }
+        if self.considered.len() >= 4_096 {
+            self.considered.clear();
+        }
+        self.considered.insert(peer, now);
+        true
+    }
+
+    /// Stamp `peer` heard now.
+    fn stamp(peer_seen: &PeerSeen, peer: SocketAddr) {
+        lock(peer_seen).insert(peer, Instant::now());
+    }
+
+    /// A frame of this node's own arrived from `peer`: it is never heard on
+    /// receipt again, and a stamp that its first datagram made is undone.
+    fn own_address(&mut self, peer_seen: &PeerSeen, peer: SocketAddr) {
+        if self.own.insert(peer) {
+            lock(peer_seen).remove(&peer);
+        }
+    }
+}
+
 /// Receives the datagrams of one socket of the mesh: the main socket, or the
 /// class socket of a mesh split by class, which takes parts and
 /// initializations only. `replica_tx` and `class_replicas` take the replica
@@ -3560,6 +3631,7 @@ async fn receive_task(
     )
     .with_measured_loss(Arc::clone(shared.measured_loss_of(lane)));
     let mut buf = vec![0u8; 65_536];
+    let mut heard = PeerHeard::default();
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3600,6 +3672,11 @@ async fn receive_task(
                     continue;
                 };
 
+                // Heard on receipt, before FEC decode: a peer whose blocks
+                // are slow to complete is still alive.
+                if heard.due(peer, config.bind_addr) {
+                    PeerHeard::stamp(&shared.peer_seen, peer);
+                }
                 if let Some(observer) = &observer.0 {
                     observer.datagram(peer, &buf[..len]);
                 }
@@ -3625,6 +3702,7 @@ async fn receive_task(
                 match MeshFrame::decode(decoded) {
                     Ok(frame) => {
                         if frame.node_id() == config.node_id {
+                            heard.own_address(&shared.peer_seen, peer);
                             continue;
                         }
                         if class_socket
@@ -4553,6 +4631,20 @@ impl ChildBatch {
     }
 }
 
+/// Whether two lists of served leases differ in their (child, playlist)
+/// pairs. The warm-up count of a lease is not a change.
+fn served_keys_differ(old: &[ServedSubscription], new: &[ServedSubscription]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    let keys: HashSet<(SocketAddr, u64)> = old
+        .iter()
+        .map(|served| (served.child, served.stream_id))
+        .collect();
+    new.iter()
+        .any(|served| !keys.contains(&(served.child, served.stream_id)))
+}
+
 /// Sends the parts of the cache to the children. A part leaves as soon as
 /// the local watermark reaches it: the publication wakes this task, which
 /// visits only the streams that moved. Each child's datagrams go to the
@@ -4697,7 +4789,7 @@ async fn sync_task(
                         *tokens = (*tokens + rate * elapsed.as_secs_f64()).min(burst);
                     }
                 }
-                *lock(shared.served_of(lane)) = active
+                let now_served: Vec<ServedSubscription> = active
                     .iter()
                     .filter(|(_, stream_id)| lane.carries(&config, *stream_id))
                     .map(|(child, stream_id)| ServedSubscription {
@@ -4716,6 +4808,17 @@ async fn sync_task(
                             .unwrap_or(0),
                     })
                     .collect();
+                let changed = {
+                    let mut served = lock(shared.served_of(lane));
+                    let changed = served_keys_differ(&served, &now_served);
+                    *served = now_served;
+                    changed
+                };
+                if changed {
+                    shared
+                        .served_changed
+                        .send_modify(|version| *version = version.wrapping_add(1));
+                }
             }
             children = {
                 let regions = shared.peer_regions.read().await;
@@ -6913,6 +7016,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_served_leases_watch_changes_when_a_lease_comes_or_goes() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        let mut changed = parent.served_changed();
+        changed.mark_unchanged();
+        let wait_change = |changed: &mut watch::Receiver<u64>| {
+            let mut changed = changed.clone();
+            async move {
+                timeout(Duration::from_secs(2), changed.changed())
+                    .await
+                    .expect("the served leases watch changes")
+                    .unwrap();
+            }
+        };
+
+        // A new lease is a change.
+        edge.subscribe(7, 0, 0).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(
+            parent
+                .served_subscriptions()
+                .iter()
+                .map(|served| (served.child, served.stream_id))
+                .collect::<Vec<_>>(),
+            vec![(edge_addr, 7)]
+        );
+
+        // Renewing it is not.
+        edge.subscribe(7, 0, 0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!changed.has_changed().unwrap(), "a renewal is no change");
+
+        // A second playlist is, and so is the release of the first.
+        edge.subscribe(8, 0, 0).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(parent.served_subscriptions().len(), 2);
+        edge.unsubscribe(7).await.unwrap();
+        wait_change(&mut changed).await;
+        changed.mark_unchanged();
+        assert_eq!(
+            parent
+                .served_subscriptions()
+                .iter()
+                .map(|served| served.stream_id)
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+
+        // A lease that lapses is a change too.
+        wait_change(&mut changed).await;
+        assert!(parent.served_subscriptions().is_empty());
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn demand_replication_stops_when_the_lease_lapses_or_is_released() {
         let parent_addr = loopback_addr();
         let edge_addr = loopback_addr();
@@ -7308,6 +7487,117 @@ mod tests {
             .await
             .expect("the parent was heard");
         assert!(silent >= Duration::from_millis(300), "{silent:?}");
+        edge.shutdown();
+    }
+
+    /// Datagrams of a parent that never complete a block (a 4K part waiting
+    /// for repair, a decode behind a burst) still say that the parent is
+    /// alive: liveness is stamped on receipt, before FEC decode.
+    ///
+    /// On a mesh split by class the datagrams go only to the class socket,
+    /// from the parent's class socket (its main port plus the offset): a 4K
+    /// parent whose video is all on the class lane is heard there. Junk from
+    /// a source that is not a peer is refused by the allowlist before it can
+    /// be stamped, on either lane.
+    #[tokio::test]
+    async fn a_parent_is_heard_on_receipt_before_any_block_decodes() {
+        /// The parent's main address, how long the edge's parents have been
+        /// silent, every address that the edge has stamped heard, and how
+        /// many datagrams it refused.
+        async fn heard_after_undecodable_datagrams(
+            class_offset: u16,
+        ) -> (SocketAddr, Option<Duration>, Vec<SocketAddr>, u64) {
+            let (parent_addr, parent) = if class_offset == 0 {
+                let parent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                (parent.local_addr().unwrap(), parent)
+            } else {
+                let parent_addr = class_split_addr(class_offset);
+                let class = SocketAddr::from(([127, 0, 0, 1], parent_addr.port() + class_offset));
+                (parent_addr, std::net::UdpSocket::bind(class).unwrap())
+            };
+            let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let edge_addr = if class_offset == 0 {
+                loopback_addr()
+            } else {
+                class_split_addr(class_offset)
+            };
+            let edge = CacheMesh::new(
+                Arc::new(ChunkCache::new(demand_options())),
+                // Not same-region-only: a parent that has not said hello
+                // yet is one of the edge's parents.
+                CacheMeshConfig::new("edge", "uk", edge_addr)
+                    .with_role(CacheMeshRole::Edge)
+                    .with_peer(parent_addr)
+                    .with_class_port_offset(class_offset)
+                    .with_stream_classifier(video_streams(&[9])),
+            )
+            .start()
+            .await
+            .unwrap();
+            let to = if class_offset == 0 {
+                edge_addr
+            } else {
+                edge.class_local_addr().expect("a class socket")
+            };
+            assert_eq!(to.port(), edge_addr.port() + class_offset);
+            assert!(edge.parents_silent_for().await.is_none());
+            // Bytes that no FEC block ever decodes: only receipt hears them.
+            for _ in 0..5 {
+                parent.send_to(b"not a fec datagram", to).unwrap();
+                stranger.send_to(b"not a fec datagram", to).unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let silent = edge.parents_silent_for().await;
+            let stamped = lock(&edge.shared.peer_seen).keys().copied().collect();
+            let refused = edge.fec_stats().rx_unauthorized_datagrams;
+            edge.shutdown();
+            (parent_addr, silent, stamped, refused)
+        }
+        for class_offset in [0, TEST_CLASS_OFFSET] {
+            let (parent_addr, silent, stamped, refused) =
+                heard_after_undecodable_datagrams(class_offset).await;
+            let silent = silent.expect("the parent was heard on receipt");
+            assert!(
+                silent < Duration::from_millis(200),
+                "{class_offset}: {silent:?}"
+            );
+            // The parent, under its main address, and not the stranger,
+            // whose five datagrams the allowlist refused.
+            assert_eq!(stamped, vec![parent_addr], "{class_offset}");
+            assert_eq!(refused, 5, "{class_offset}");
+        }
+    }
+
+    /// A node bound to a wildcard address may be told its own address by a
+    /// peer's hello, and then sends hellos to itself. Receipt must not make
+    /// it hear itself, or an edge would rank itself a live parent.
+    #[tokio::test]
+    async fn a_node_that_sends_itself_hellos_is_not_its_own_live_parent() {
+        let own = loopback_addr();
+        let bind = SocketAddr::from(([0, 0, 0, 0], own.port()));
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            CacheMeshConfig::new("edge", "uk", bind)
+                .with_role(CacheMeshRole::Edge)
+                .with_peer(own)
+                .with_announce_interval(Duration::from_millis(10)),
+        )
+        .start()
+        .await
+        .unwrap();
+        // Its own hellos arrive from `own`, which is not the bind address.
+        let mut silent = Vec::new();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            silent.push(edge.parents_silent_for().await);
+        }
+        assert!(
+            edge.fec_stats().rx_decoded_objects > 0,
+            "the node heard its own hellos"
+        );
+        assert!(silent.iter().all(Option::is_none), "{silent:?}");
+        assert!(!lock(&edge.shared.peer_seen).contains_key(&own));
         edge.shutdown();
     }
 
