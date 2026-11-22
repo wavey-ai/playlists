@@ -447,6 +447,23 @@ impl ChunkCache {
         (matches() && written_us != 0).then_some(written_us)
     }
 
+    /// [`Self::written_unix_us_for_stream_id`] by the stream's index, for a
+    /// caller that walks many slots of one stream: it looks the stream up
+    /// once, not once for each slot. Takes no lock and does not wait.
+    pub fn written_unix_us(&self, stream_idx: usize, id: usize) -> Option<u64> {
+        let generation = self.generation(stream_idx)?;
+        let idx = self.offset(stream_idx, id)?;
+        let matches = || {
+            self.slot_ids[idx].load(Ordering::Acquire) == id
+                && self.slot_generations[idx].load(Ordering::Acquire) == generation
+        };
+        if !matches() {
+            return None;
+        }
+        let written_us = self.slot_written_us[idx].load(Ordering::Acquire);
+        (matches() && written_us != 0).then_some(written_us)
+    }
+
     /// Read a contiguous retained range for one logical stream identity.
     ///
     /// The stream mapping and generation are resolved once for the whole
@@ -1088,6 +1105,18 @@ mod tests {
             .await
             .unwrap();
         assert!(cache.written_unix_us_for_stream_id(9, 5).unwrap() >= written);
+
+        // By the stream's index, the same answers.
+        let stream_idx = cache.stream_idx(9).unwrap();
+        assert_eq!(
+            cache.written_unix_us(stream_idx, 5),
+            cache.written_unix_us_for_stream_id(9, 5)
+        );
+        assert_eq!(cache.written_unix_us(stream_idx, 3), None);
+        assert_eq!(cache.written_unix_us(stream_idx, 4), None);
+        // A stream that leaves its index takes its times with it.
+        cache.zero_stream_id(9).await;
+        assert_eq!(cache.written_unix_us(stream_idx, 5), None);
     }
 
     #[tokio::test]
