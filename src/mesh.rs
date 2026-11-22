@@ -7,7 +7,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(test)]
 use raptorq_datagram_fec::DatagramFecEncoder;
 use raptorq_datagram_fec::{
-    source_symbol_count, DatagramFecDecoder, DatagramFecError, DatagramFecHeader, HEADER_LEN,
+    source_symbol_count, DatagramFecDecoder, DatagramFecError, DatagramFecHeader, COMPLETED_WINDOW,
+    HEADER_LEN,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
@@ -3034,11 +3035,11 @@ fn block_id_lane(block_id: u32) -> usize {
 /// every symbol of it already received.
 #[derive(Default)]
 struct PeerDecoders {
-    lanes: [DatagramFecDecoder; BLOCK_ID_LANES],
+    lanes: [LaneDecoder; BLOCK_ID_LANES],
 }
 
 impl PeerDecoders {
-    fn lane_mut(&mut self, block_id: u32) -> &mut DatagramFecDecoder {
+    fn lane_mut(&mut self, block_id: u32) -> &mut LaneDecoder {
         &mut self.lanes[block_id_lane(block_id)]
     }
 
@@ -3050,8 +3051,111 @@ impl PeerDecoders {
     fn in_flight_block_count(&self) -> usize {
         self.lanes
             .iter()
-            .map(DatagramFecDecoder::in_flight_block_count)
+            .map(|lane| lane.decoder.in_flight_block_count())
             .sum()
+    }
+}
+
+/// The decoder of one range of a peer's block ids, kept cheap to run.
+///
+/// `DatagramFecDecoder` (raptorq-datagram-fec 0.1.6) tracks the packet
+/// sequence of every datagram it is given, and nothing here reads that
+/// tracking. Its tracker waits on the first sequence that it never sees, and
+/// from then on inserts up to 4,096 entries into a hash set on every
+/// datagram. A receiver does not give it the datagrams of a block that has
+/// already decoded (the repair symbols behind a complete block), so on a
+/// clean link the tracker stalled after the first block and cost about
+/// 65 µs per datagram: some 100 ms of receive-thread CPU for each 2 MiB
+/// part, and 65 µs for each audio part, on both lines before the merge.
+///
+/// Two things keep the tracker in step:
+///
+/// - The datagrams of a block that the decoder holds as finished are shown
+///   to it (`observe_finished`). It records their sequence and returns at
+///   once. `finished` mirrors the decoder's own window of finished ids, so a
+///   datagram is shown only when the decoder will not take it as a new
+///   block.
+/// - When the decoder has no block in flight and a datagram of a new block
+///   leaves a gap in the sequence, which a lost datagram, a block outside the
+///   window or a part sent only to other children does, the decoder is
+///   replaced by a fresh one that is told the same finished ids. Nothing in
+///   flight is lost, and a late datagram of a finished block is still
+///   refused.
+#[derive(Default)]
+struct LaneDecoder {
+    decoder: DatagramFecDecoder,
+    /// The block ids that `decoder` holds as finished (decoded or expired):
+    /// the ids it has finished, less those its window has dropped, by the
+    /// same rule as `DatagramFecDecoder::prune`.
+    finished: HashSet<u32>,
+}
+
+impl LaneDecoder {
+    /// Push a datagram of a block that this receiver has not finished.
+    fn push_datagram(
+        &mut self,
+        header: &DatagramFecHeader,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, DatagramFecError> {
+        if !self.finished.contains(&header.block_id) {
+            self.restart_on_sequence_gap(header.packet_sequence);
+        }
+        let decoded = self.decoder.push_datagram(bytes)?;
+        if decoded.is_some() {
+            self.note_finished(header.block_id);
+        }
+        Ok(decoded)
+    }
+
+    /// Show the decoder a datagram of a block that this receiver has
+    /// finished, so that its sequence tracking sees no gap. Only a block the
+    /// decoder also holds as finished is shown: it returns at once without
+    /// taking the datagram.
+    fn observe_finished(&mut self, header: &DatagramFecHeader, bytes: &[u8]) {
+        if self.finished.contains(&header.block_id) {
+            let observed = self.decoder.push_datagram(bytes);
+            debug_assert!(matches!(observed, Ok(None) | Err(_)));
+        }
+    }
+
+    fn expire_block(&mut self, block_id: u32) {
+        self.decoder.expire_block(block_id);
+        self.note_finished(block_id);
+    }
+
+    /// Follow the decoder's window of finished ids: it inserts the id and
+    /// drops every id more than `COMPLETED_WINDOW` below it.
+    fn note_finished(&mut self, block_id: u32) {
+        self.finished.insert(block_id);
+        if block_id >= COMPLETED_WINDOW {
+            let cutoff = block_id - COMPLETED_WINDOW;
+            self.finished.retain(|finished| *finished >= cutoff);
+        }
+    }
+
+    /// Start the sequence tracking again before a datagram of a new block
+    /// that would leave a gap, when no block is in flight. The fresh decoder
+    /// is told every finished id, from the highest down so that none is
+    /// dropped again by the window, and so holds what the old one held.
+    fn restart_on_sequence_gap(&mut self, packet_sequence: u32) {
+        if self.decoder.in_flight_block_count() != 0 {
+            return;
+        }
+        let stats = self.decoder.sequence_stats();
+        let gap = stats.missing > 0
+            || stats
+                .highest_seen
+                .is_some_and(|highest| packet_sequence != highest.wrapping_add(1));
+        if !gap {
+            return;
+        }
+        let mut decoder = DatagramFecDecoder::new();
+        let mut finished: Vec<u32> = self.finished.iter().copied().collect();
+        finished.sort_unstable_by(|a, b| b.cmp(a));
+        for block_id in finished {
+            decoder.expire_block(block_id);
+        }
+        self.decoder = decoder;
     }
 }
 
@@ -3244,6 +3348,11 @@ impl FecReceiver {
                     self.finalize_recovery(key);
                 }
             }
+            if let Some(decoders) = self.decoders.get_mut(&peer) {
+                decoders
+                    .lane_mut(header.block_id)
+                    .observe_finished(&header, bytes);
+            }
             self.prune_observations();
             self.stats
                 .rx_inflight_objects
@@ -3260,7 +3369,7 @@ impl FecReceiver {
             .get_mut(&peer)
             .expect("admitted decoder peer must exist")
             .lane_mut(header.block_id);
-        let decoded = match decoder.push_datagram(bytes) {
+        let decoded = match decoder.push_datagram(&header, bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
                 // A block that cannot be decoded takes no more state.
@@ -5913,6 +6022,122 @@ mod tests {
         assert_eq!(sender.stats.snapshot().tx_repair_datagrams, 2);
         assert_eq!(receiver_stats.snapshot().rx_decoded_objects, 1);
         assert_eq!(receiver_stats.snapshot().rx_repaired_objects, 0);
+    }
+
+    fn chunk_lane(receiver: &FecReceiver, peer: SocketAddr) -> &LaneDecoder {
+        &receiver.decoders[&peer].lanes[block_id_lane(CHUNK_BLOCK_ID_BASE)]
+    }
+
+    /// The repair symbols behind a decoded block still reach the decoder's
+    /// sequence tracking, so on a clean link it never waits on a sequence
+    /// and costs nothing per datagram. Before, it stalled after the first
+    /// block and inserted thousands of entries on every later datagram:
+    /// some 100 ms of CPU for each 2 MiB part.
+    #[test]
+    fn fec_receiver_keeps_sequence_tracking_in_step_on_a_clean_link() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(3)
+            .with_initial_block_id(CHUNK_BLOCK_ID_BASE);
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let peer: SocketAddr = "127.0.0.1:9931".parse().unwrap();
+        let mut pushed = 0_u64;
+        for object in 0..300_u32 {
+            // One-symbol parts (audio) and four-symbol parts.
+            let len = if object % 3 == 0 { 30 } else { 6 };
+            let payload = vec![object as u8; len];
+            let mut decoded = 0;
+            for datagram in encoder.encode_object(&payload).unwrap() {
+                if let Some(frame) = receiver.push(peer, &datagram).unwrap() {
+                    assert_eq!(frame, payload);
+                    decoded += 1;
+                }
+                pushed += 1;
+                let stats = chunk_lane(&receiver, peer).decoder.sequence_stats();
+                assert_eq!(stats.missing, 0, "object {object}");
+            }
+            assert_eq!(decoded, 1);
+        }
+        // Every datagram was seen, and the tracking never had to restart.
+        let lane = chunk_lane(&receiver, peer);
+        assert_eq!(lane.decoder.sequence_stats().received, pushed);
+        assert_eq!(lane.decoder.in_flight_block_count(), 0);
+        assert!(lane.finished.len() <= COMPLETED_WINDOW as usize + 1);
+    }
+
+    /// A lost datagram leaves a gap that the tracking would wait on for
+    /// good. It starts again at the next block that begins with no block in
+    /// flight, and a late datagram of a finished block still takes no
+    /// decoder state.
+    #[test]
+    fn fec_receiver_restarts_sequence_tracking_after_a_lost_datagram() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(2)
+            .with_initial_block_id(CHUNK_BLOCK_ID_BASE);
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let peer: SocketAddr = "127.0.0.1:9932".parse().unwrap();
+        let mut lost = None;
+        for object in 0..40_u32 {
+            let payload = vec![object as u8; 30];
+            let mut decoded = 0;
+            for (index, datagram) in encoder.encode_object(&payload).unwrap().iter().enumerate() {
+                if object == 10 && index == 1 {
+                    lost = Some(datagram.clone());
+                    continue;
+                }
+                if receiver.push(peer, datagram).unwrap().is_some() {
+                    decoded += 1;
+                }
+            }
+            assert_eq!(decoded, 1, "object {object}");
+            let missing = chunk_lane(&receiver, peer).decoder.sequence_stats().missing;
+            if object == 10 {
+                // The tracker counts every sequence after the gap too.
+                assert!(missing > 0);
+            } else {
+                assert_eq!(missing, 0, "object {object}");
+            }
+        }
+        assert!(receiver.push(peer, &lost.unwrap()).unwrap().is_none());
+        assert_eq!(
+            chunk_lane(&receiver, peer).decoder.in_flight_block_count(),
+            0
+        );
+    }
+
+    /// A restarted decoder holds the finished ids of the one it replaces,
+    /// expired blocks among them, so a late datagram of one starts no block.
+    #[test]
+    fn a_restarted_lane_decoder_still_refuses_a_finished_block() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(1)
+            .with_initial_block_id(CHUNK_BLOCK_ID_BASE);
+        let expired = encoder.encode_object(&[1_u8; 30]).unwrap();
+        let skipped = encoder.encode_object(&[2_u8; 6]).unwrap();
+        let next = encoder.encode_object(&[3_u8; 6]).unwrap();
+        let header = |datagram: &[u8]| DatagramFecHeader::decode(datagram).unwrap();
+        let mut lane = LaneDecoder::default();
+        assert!(lane
+            .push_datagram(&header(&expired[0]), &expired[0])
+            .unwrap()
+            .is_none());
+        lane.expire_block(header(&expired[0]).block_id);
+        assert_eq!(lane.decoder.in_flight_block_count(), 0);
+        // `skipped` never arrives: `next` leaves a gap and restarts the
+        // tracking.
+        assert!(lane
+            .push_datagram(&header(&next[0]), &next[0])
+            .unwrap()
+            .is_some());
+        assert_eq!(lane.decoder.sequence_stats().received, 1);
+        assert!(skipped.len() > 1);
+        assert!(lane
+            .push_datagram(&header(&expired[1]), &expired[1])
+            .unwrap()
+            .is_none());
+        assert_eq!(lane.decoder.in_flight_block_count(), 0);
     }
 
     /// A restarted publication numbers its slots from the start again. A
@@ -10217,11 +10442,10 @@ mod tests {
             "split {split:?}"
         );
         // On one socket the first of them waits behind the window's
-        // datagrams, which the one receive task decodes first.
-        assert!(
-            one_max >= Duration::from_millis(10) && one_max > split_max,
-            "split {split:?}, one socket {one:?}"
-        );
+        // datagrams, which the one receive task decodes first. That wait
+        // was over 10 ms while the FEC decoder's sequence tracking cost
+        // some 65 µs per datagram (see `LaneDecoder`); it is about 1 ms now.
+        assert!(one_max > split_max, "split {split:?}, one socket {one:?}");
     }
 
     /// The edge's side of the split: its video receive task decodes the
