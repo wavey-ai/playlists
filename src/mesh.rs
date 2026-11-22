@@ -217,6 +217,25 @@ pub struct AppliedSlot {
 /// It runs inline on the sync task and must be cheap: record and return.
 pub type CacheMeshSendObserver = Arc<dyn Fn(u64, u64, SocketAddr, u64) + Send + Sync>;
 
+/// Decides, for a (child, stream id) pair that the sync task is about to
+/// push live parts to, whether to skip the push: the child gets the stream's
+/// parts another way (a distributor's fast plane hands its lease children
+/// the contributor's symbols as they arrive). A skipped pair keeps its
+/// lease, its warm-up window, its cursor (it moves on with the stream, so a
+/// later push starts at the next part) and every replica request the child
+/// sends (its hole repair). It runs inline on the sync task, once per pair
+/// per pass, and must be cheap.
+pub type CacheMeshLivePushFilter = Arc<dyn Fn(SocketAddr, u64) -> bool + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct LivePushFilterSlot(Option<CacheMeshLivePushFilter>);
+
+impl fmt::Debug for LivePushFilterSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
 /// Told of every datagram that the cache mesh receives, before it is decoded,
 /// and of every block once it is decoded. A node uses it to forward the
 /// source symbols of a part on as they arrive (cut-through), without waiting
@@ -417,6 +436,8 @@ pub struct CacheMeshConfig {
     block_id_offset: u32,
     /// Told when the first datagram of each part leaves for a child.
     send_observer: SendObserverSlot,
+    /// Pairs whose live parts are not pushed (see `with_live_push_filter`).
+    live_push_filter: LivePushFilterSlot,
     /// Told of every received datagram and decoded block.
     receive_observer: ReceiveObserverSlot,
     /// Tests turn generic segmentation offload off to take the path of a
@@ -507,6 +528,7 @@ impl CacheMeshConfig {
             receive_loss_ppm: 0,
             block_id_offset: 0,
             send_observer: SendObserverSlot(None),
+            live_push_filter: LivePushFilterSlot(None),
             receive_observer: ReceiveObserverSlot(None),
             #[cfg(test)]
             gso: true,
@@ -644,6 +666,14 @@ impl CacheMeshConfig {
 
     /// Be told `(stream_id, slot_id, child, sent_unix_us)` each time the sync
     /// task hands the first datagram of a part to the kernel for a child.
+    /// Skip the live push of the (child, stream) pairs that `filter` names
+    /// (see [`CacheMeshLivePushFilter`]). None (the default) pushes every
+    /// leased pair.
+    pub fn with_live_push_filter(mut self, filter: CacheMeshLivePushFilter) -> Self {
+        self.live_push_filter = LivePushFilterSlot(Some(filter));
+        self
+    }
+
     pub fn with_send_observer(mut self, observer: CacheMeshSendObserver) -> Self {
         self.send_observer = SendObserverSlot(Some(observer));
         self
@@ -5096,6 +5126,18 @@ async fn sync_task(
                 if next > last {
                     continue;
                 }
+                // A pair whose parts reach the child another way (the
+                // fast plane) is not pushed; its cursor moves on with the
+                // stream, so a push that resumes starts at the next part.
+                if config
+                    .live_push_filter
+                    .0
+                    .as_ref()
+                    .is_some_and(|filter| filter(*peer, stream_id))
+                {
+                    lane_children.sent.insert((handle, *peer), last);
+                    continue;
+                }
                 // A child without a cursor is new, in full replication: the
                 // parts that were there before this pass are its catch-up,
                 // not live parts, and the send observer does not see them.
@@ -7151,6 +7193,76 @@ mod tests {
         edge.shutdown();
     }
 
+    /// A distributor's live push filter (wave 7 item 4): a pair it names
+    /// keeps its lease and its hole repair but gets no live part; when the
+    /// filter lets it go again the push starts at the next part.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filtered_pair_keeps_its_lease_and_repair_but_gets_no_live_push() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let filtered = Arc::new(AtomicBool::new(true));
+        let filter_flag = Arc::clone(&filtered);
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_live_push_filter(Arc::new(move |peer, stream_id| {
+                    peer == edge_addr && stream_id == 7 && filter_flag.load(Ordering::Relaxed)
+                })),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+
+        parent_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"part-0"))
+            .await
+            .unwrap();
+        // The warm-up window still comes.
+        edge.subscribe(7, 0, 16).await.unwrap();
+        wait_for_slot(&edge_cache, 7, 0).await;
+        for slot in 1..=3 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(format!("part-{slot}")))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(edge_cache.get_for_stream_id(7, 1).await.is_none());
+        assert!(edge_cache.get_for_stream_id(7, 3).await.is_none());
+        // The lease is served all along.
+        assert_eq!(parent.served_subscriptions().len(), 1);
+        // A hole is repaired on request.
+        edge.request_parts(7, 2, 1, 1).await.unwrap();
+        wait_for_slot(&edge_cache, 7, 2).await;
+
+        // Pushed again from the next part on, not the parts it skipped.
+        filtered.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        parent_cache
+            .add_for_stream_id(7, 4, Bytes::from_static(b"part-4"))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(edge_cache.get_for_stream_id(7, 1).await.is_none());
+        assert!(edge_cache.get_for_stream_id(7, 3).await.is_none());
+
+        parent.shutdown();
+        edge.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warm_up_window_is_bounded_paced_and_newest_first() {
         let parent_addr = loopback_addr();
@@ -8692,6 +8804,8 @@ mod tests {
         assert!(config.send_observer.0.is_some());
         // The configuration stays printable with an observer in it.
         assert!(format!("{config:?}").contains("send_observer: Some(..)"));
+        let config = config.with_live_push_filter(Arc::new(|_, _| false));
+        assert!(format!("{config:?}").contains("live_push_filter: Some(..)"));
     }
 
     type SentRecord = (u64, u64, SocketAddr, u64);
