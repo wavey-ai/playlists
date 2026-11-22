@@ -1,10 +1,24 @@
 use crate::Options;
 
 use bytes::Bytes;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Arc;
+
+/// At most this many rendition reports are kept.
+const MAX_RENDITION_REPORTS: usize = 256;
+/// A rendition report with a longer URI is dropped.
+const MAX_RENDITION_URI_BYTES: usize = 2_048;
+/// Room for one EXT-X-PROGRAM-DATE-TIME line, extended years included.
+const PROGRAM_DATE_TIME_LINE_BYTES: usize = 56;
+/// Room for the PROGRAM-DATE-TIME line and the PRELOAD-HINT of the open
+/// segment, whatever their numbers.
+const OPEN_SEGMENT_TAG_BYTES: usize = 160;
+/// CAN-SKIP-UNTIL is six target durations (RFC 8216bis 4.4.3.8).
+const CAN_SKIP_TARGET_DURATIONS: u64 = 6;
+const MEDIA_SEQUENCE_TAG: &str = "#EXT-X-MEDIA-SEQUENCE:";
+const MAP_LINE: &str = "\n#EXT-X-MAP:URI=\"init.mp4\"\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaByteRange {
@@ -142,21 +156,33 @@ pub struct M3u8Manifest {
     open: OpenSegment,
     start_time: DateTime<Utc>,
     options: Options,
-    rendition_reports: Vec<RenditionReport>,
+    /// The EXT-X-RENDITION-REPORT lines, rendered when they are set.
+    rendition_report_lines: String,
     version: u64,
+    /// The tags up to PART-INF, which depend only on the options: without
+    /// and with CAN-SKIP-UNTIL. Built once, shared by every rendering.
+    head_without_skip: Arc<str>,
+    head_with_skip: Arc<str>,
 }
 
 /// A playlist taken apart: the pieces are shared with the manifest, so that
 /// the copy is cheap and the text can be put together without a lock.
 pub struct RenderedPieces {
-    head: String,
+    /// The tags up to PART-INF, shared with the manifest.
+    head: Arc<str>,
+    /// EXT-X-MEDIA-SEQUENCE, written straight into the playlist.
+    media_sequence: u32,
     segments: Vec<Arc<str>>,
     tail: String,
 }
 
 impl RenderedPieces {
+    /// The exact length of the playlist in bytes.
     pub fn len(&self) -> usize {
         self.head.len()
+            + MEDIA_SEQUENCE_TAG.len()
+            + decimal_digits(self.media_sequence)
+            + MAP_LINE.len()
             + self
                 .segments
                 .iter()
@@ -169,13 +195,19 @@ impl RenderedPieces {
         self.len() == 0
     }
 
+    /// The playlist, in one allocation of exactly its length.
     pub fn into_bytes(self) -> Bytes {
-        let mut text = String::with_capacity(self.len());
+        let len = self.len();
+        let mut text = String::with_capacity(len);
         text.push_str(&self.head);
+        text.push_str(MEDIA_SEQUENCE_TAG);
+        let _ = write!(text, "{}", self.media_sequence);
+        text.push_str(MAP_LINE);
         for segment in &self.segments {
             text.push_str(segment);
         }
         text.push_str(&self.tail);
+        debug_assert_eq!(text.len(), len);
         Bytes::from(text)
     }
 }
@@ -189,8 +221,10 @@ impl M3u8Manifest {
             open: OpenSegment::new(1, 0),
             start_time: Utc::now(),
             options,
-            rendition_reports: Vec::new(),
+            rendition_report_lines: String::new(),
             version: 0,
+            head_without_skip: render_head(&options, false),
+            head_with_skip: render_head(&options, true),
         }
     }
 
@@ -220,8 +254,21 @@ impl M3u8Manifest {
             || self.open.duration_us.saturating_add(duration_us) >= self.options.segment_limit_us()
     }
 
+    /// Set the EXT-X-RENDITION-REPORT lines. A report whose URI cannot be a
+    /// quoted string or is longer than 2,048 bytes is dropped, and at most
+    /// 256 reports are kept.
     pub fn set_rendition_reports(&mut self, reports: Vec<RenditionReport>) {
-        self.rendition_reports = reports;
+        self.rendition_report_lines.clear();
+        for report in reports
+            .iter()
+            .filter(|report| {
+                report.uri.len() <= MAX_RENDITION_URI_BYTES
+                    && valid_quoted_string_value(&report.uri)
+            })
+            .take(MAX_RENDITION_REPORTS)
+        {
+            append_rendition_report(&mut self.rendition_report_lines, report);
+        }
         self.version += 1;
     }
 
@@ -249,15 +296,13 @@ impl M3u8Manifest {
     }
 
     fn time_at(&self, offset_us: u64) -> DateTime<Utc> {
-        self.start_time + Duration::microseconds(i64::try_from(offset_us).unwrap_or(i64::MAX))
-    }
-
-    fn program_date_time_line(&self, offset_us: u64) -> String {
-        format!(
-            "#EXT-X-PROGRAM-DATE-TIME:{}\n",
-            self.time_at(offset_us)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        )
+        i64::try_from(offset_us)
+            .ok()
+            .and_then(|offset_us| {
+                self.start_time
+                    .checked_add_signed(Duration::microseconds(offset_us))
+            })
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 
     fn close_segment(&mut self) {
@@ -269,7 +314,9 @@ impl M3u8Manifest {
             return;
         }
 
-        let mut tail = String::with_capacity(64);
+        let mut date = String::with_capacity(PROGRAM_DATE_TIME_LINE_BYTES);
+        append_program_date_time(&mut date, self.time_at(open.start_us));
+        let mut tail = String::with_capacity(96);
         tail.push_str("#EXTINF:");
         push_seconds(&mut tail, open.duration_us);
         tail.push_str(",\n");
@@ -279,8 +326,9 @@ impl M3u8Manifest {
             }
         }
         let _ = writeln!(tail, "s{}.mp4", open.id);
-        let date = self.program_date_time_line(open.start_us);
-        let plain: Arc<str> = format!("{date}{tail}").into();
+        let mut plain = String::with_capacity(date.len() + tail.len());
+        plain.push_str(&date);
+        plain.push_str(&tail);
         let mut parted = String::with_capacity(date.len() + open.part_lines.len() + tail.len());
         parted.push_str(&date);
         parted.push_str(&open.part_lines);
@@ -291,7 +339,7 @@ impl M3u8Manifest {
             start_us: open.start_us,
             duration_us: open.duration_us,
             parted: Some(parted.into()),
-            plain,
+            plain: plain.into(),
         });
         while self.closed.len() > limit {
             self.closed.pop_front();
@@ -370,56 +418,6 @@ impl M3u8Manifest {
         self.push_part_us(duration_us, key, None, Some(byte_len as u64))
     }
 
-    fn rendered(&self, position: PartPosition) -> (Bytes, usize, usize, usize, bool) {
-        (
-            self.m3u8(),
-            position.segment_id,
-            position.sequence,
-            position.index,
-            position.new_segment,
-        )
-    }
-
-    /// Add a part of `duration` milliseconds and render the playlist.
-    pub fn add_part(&mut self, duration: u32, key: bool) -> (Bytes, usize, usize, usize, bool) {
-        self.add_part_with_byte_range(duration, key, None)
-    }
-
-    pub fn add_part_with_byte_len(
-        &mut self,
-        duration: u32,
-        key: bool,
-        byte_len: usize,
-    ) -> (Bytes, usize, usize, usize, bool) {
-        let position = self.push_part_us(
-            u64::from(duration) * 1_000,
-            key,
-            None,
-            Some(byte_len as u64),
-        );
-        self.rendered(position)
-    }
-
-    pub fn add_part_with_byte_range(
-        &mut self,
-        duration: u32,
-        key: bool,
-        byte_range: Option<MediaByteRange>,
-    ) -> (Bytes, usize, usize, usize, bool) {
-        let position = self.push_part_us(u64::from(duration) * 1_000, key, byte_range, None);
-        self.rendered(position)
-    }
-
-    /// Add a part of `duration_us` microseconds and render the playlist.
-    pub fn add_part_us(
-        &mut self,
-        duration_us: u64,
-        key: bool,
-    ) -> (Bytes, usize, usize, usize, bool) {
-        let position = self.push_part_us(duration_us, key, None, None);
-        self.rendered(position)
-    }
-
     /// The playlist as it is now.
     pub fn m3u8(&self) -> Bytes {
         self.pieces().into_bytes()
@@ -442,9 +440,11 @@ impl M3u8Manifest {
             retained_us += segment.duration_us;
         }
 
-        let mut tail = String::with_capacity(self.open.part_lines.len() + 128);
+        let mut tail = String::with_capacity(
+            self.open.part_lines.len() + self.rendition_report_lines.len() + OPEN_SEGMENT_TAG_BYTES,
+        );
         if self.open.parts > 0 {
-            tail.push_str(&self.program_date_time_line(self.open.start_us));
+            append_program_date_time(&mut tail, self.time_at(self.open.start_us));
             tail.push_str(&self.open.part_lines);
             if let Some((offset, length)) = self.open.byte_range() {
                 let _ = writeln!(
@@ -461,42 +461,87 @@ impl M3u8Manifest {
                 );
             }
         }
-        append_rendition_reports(&mut tail, &self.rendition_reports);
+        tail.push_str(&self.rendition_report_lines);
 
-        let target_duration = self.options.target_duration_secs();
-        let target_duration_us = u64::from(target_duration) * 1_000_000;
-        let can_skip_until_us = target_duration_us * 6;
+        let can_skip_until_us = self.target_duration_us() * CAN_SKIP_TARGET_DURATIONS;
         let can_skip = self
             .closed
             .front()
             .is_some_and(|first| retained_us.saturating_sub(first.duration_us) > can_skip_until_us);
-
-        let mut head = String::with_capacity(320);
-        head.push_str("#EXTM3U\n#EXT-X-VERSION:9\n");
-        let _ = writeln!(head, "#EXT-X-TARGETDURATION:{target_duration}");
-        head.push_str("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=");
-        push_seconds(&mut head, target_duration_us * 3);
-        head.push_str(",PART-HOLD-BACK=");
-        push_seconds(&mut head, self.options.part_hold_back_us());
-        if can_skip {
-            head.push_str(",CAN-SKIP-UNTIL=");
-            push_seconds(&mut head, can_skip_until_us);
-        }
-        head.push_str("\n#EXT-X-PART-INF:PART-TARGET=");
-        push_seconds(&mut head, u64::from(self.options.part_target_us()));
+        let head = if can_skip {
+            &self.head_with_skip
+        } else {
+            &self.head_without_skip
+        };
         let media_sequence = self
             .closed
             .front()
             .map_or(self.open.id, |segment| segment.id);
-        let _ = writeln!(head, "\n#EXT-X-MEDIA-SEQUENCE:{media_sequence}");
-        head.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
 
         RenderedPieces {
-            head,
+            head: Arc::clone(head),
+            media_sequence,
             segments,
             tail,
         }
     }
+}
+
+/// The tags from EXTM3U to PART-INF, which depend only on the (normalized)
+/// options.
+fn render_head(options: &Options, can_skip: bool) -> Arc<str> {
+    let target_duration = options.target_duration_secs();
+    let target_duration_us = u64::from(target_duration) * 1_000_000;
+    let mut head = String::with_capacity(256);
+    head.push_str("#EXTM3U\n#EXT-X-VERSION:9\n");
+    let _ = writeln!(head, "#EXT-X-TARGETDURATION:{target_duration}");
+    head.push_str("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=");
+    push_seconds(&mut head, target_duration_us * 3);
+    head.push_str(",PART-HOLD-BACK=");
+    push_seconds(&mut head, options.part_hold_back_us());
+    if can_skip {
+        head.push_str(",CAN-SKIP-UNTIL=");
+        push_seconds(&mut head, target_duration_us * CAN_SKIP_TARGET_DURATIONS);
+    }
+    head.push_str("\n#EXT-X-PART-INF:PART-TARGET=");
+    push_seconds(&mut head, u64::from(options.part_target_us()));
+    head.push('\n');
+    head.into()
+}
+
+fn decimal_digits(value: u32) -> usize {
+    value
+        .checked_ilog10()
+        .map_or(1, |digits| digits as usize + 1)
+}
+
+/// Append an EXT-X-PROGRAM-DATE-TIME line: RFC 3339 with milliseconds and
+/// `Z`, as chrono's `to_rfc3339_opts(SecondsFormat::Millis, true)` writes
+/// it (extended years and leap seconds included), without allocating.
+fn append_program_date_time(playlist: &mut String, date_time: DateTime<Utc>) {
+    playlist.push_str("#EXT-X-PROGRAM-DATE-TIME:");
+    let year = date_time.year();
+    if (0..=9_999).contains(&year) {
+        let _ = write!(playlist, "{year:04}");
+    } else {
+        let _ = write!(playlist, "{year:+05}");
+    }
+
+    let mut second = date_time.second();
+    let mut nanosecond = date_time.nanosecond();
+    if nanosecond >= 1_000_000_000 {
+        second += 1;
+        nanosecond -= 1_000_000_000;
+    }
+    let _ = writeln!(
+        playlist,
+        "-{:02}-{:02}T{:02}:{:02}:{second:02}.{:03}Z",
+        date_time.month(),
+        date_time.day(),
+        date_time.hour(),
+        date_time.minute(),
+        nanosecond / 1_000_000
+    );
 }
 
 /// Append `us` microseconds as decimal seconds: up to six decimals, trailing
@@ -506,7 +551,7 @@ pub fn push_seconds(out: &mut String, us: u64) {
     let _ = write!(out, "{}.", us / 1_000_000);
     let mut fraction = us % 1_000_000;
     let mut digits = 6;
-    while digits > 3 && fraction % 10 == 0 {
+    while digits > 3 && fraction.is_multiple_of(10) {
         fraction /= 10;
         digits -= 1;
     }
@@ -578,24 +623,18 @@ fn append_part_line(playlist: &mut String, segment_id: u32, part: &PartInfo) {
     playlist.push('\n');
 }
 
-fn append_rendition_reports(playlist: &mut String, reports: &[RenditionReport]) {
-    for report in reports {
-        if !valid_quoted_string_value(&report.uri) {
-            continue;
-        }
+fn append_rendition_report(playlist: &mut String, report: &RenditionReport) {
+    playlist.push_str("#EXT-X-RENDITION-REPORT:URI=\"");
+    playlist.push_str(&report.uri);
+    playlist.push('"');
 
-        playlist.push_str("#EXT-X-RENDITION-REPORT:URI=\"");
-        playlist.push_str(&report.uri);
-        playlist.push('"');
-
-        if let Some(last_msn) = report.last_msn {
-            let _ = write!(playlist, ",LAST-MSN={last_msn}");
-        }
-        if let Some(last_part) = report.last_part {
-            let _ = write!(playlist, ",LAST-PART={last_part}");
-        }
-        playlist.push('\n');
+    if let Some(last_msn) = report.last_msn {
+        let _ = write!(playlist, ",LAST-MSN={last_msn}");
     }
+    if let Some(last_part) = report.last_part {
+        let _ = write!(playlist, ",LAST-PART={last_part}");
+    }
+    playlist.push('\n');
 }
 
 fn valid_quoted_string_value(value: &str) -> bool {
@@ -607,6 +646,7 @@ fn valid_quoted_string_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{NaiveDate, SecondsFormat, TimeZone};
 
     fn tag_line<'a>(playlist: &'a str, prefix: &str) -> &'a str {
         playlist
@@ -647,12 +687,12 @@ mod tests {
             max_segments: 10,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
-            part_target_ms: 1000,
+            part_target_us: 1_000_000,
             ..Options::default()
         });
 
         for _ in 0..16 {
-            manifest.add_part(1000, true);
+            manifest.push_part_us(1_000_000, true, None, None);
         }
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
@@ -665,12 +705,12 @@ mod tests {
             max_segments: 7,
             segment_min_ms: 1000,
             target_duration_ms: 1000,
-            part_target_ms: 1000,
+            part_target_us: 1_000_000,
             ..Options::default()
         });
 
         for _ in 0..16 {
-            manifest.add_part(1000, true);
+            manifest.push_part_us(1_000_000, true, None, None);
         }
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
@@ -682,12 +722,12 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 64,
             segment_min_ms: 1000,
-            part_target_ms: 1000,
+            part_target_us: 1_000_000,
             ..Options::default()
         });
 
         for _ in 0..48 {
-            manifest.add_part(1000, true);
+            manifest.push_part_us(1_000_000, true, None, None);
         }
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
@@ -730,12 +770,13 @@ mod tests {
             max_segments: 16,
             segment_min_ms: 200,
             target_duration_ms: 6000,
-            part_target_ms: 500,
+            part_target_us: 500_000,
             ..Options::default()
         });
 
-        for duration in [200, 300, 100, 400, 250, 150] {
-            let playlist = String::from_utf8(manifest.add_part(duration, true).0.to_vec()).unwrap();
+        for duration_ms in [200_u64, 300, 100, 400, 250, 150] {
+            manifest.push_part_us(duration_ms * 1_000, true, None, None);
+            let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
             assert!(playlist.contains("#EXT-X-TARGETDURATION:6"));
         }
     }
@@ -745,12 +786,13 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 16,
             segment_min_ms: 200,
-            part_target_ms: 500,
+            part_target_us: 500_000,
             ..Options::default()
         });
 
-        for duration in [200, 300, 100, 400, 250, 150] {
-            let playlist = String::from_utf8(manifest.add_part(duration, true).0.to_vec()).unwrap();
+        for duration_ms in [200_u64, 300, 100, 400, 250, 150] {
+            manifest.push_part_us(duration_ms * 1_000, true, None, None);
+            let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
             assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.500\n"));
             assert!(playlist.contains("PART-HOLD-BACK=1.500"));
         }
@@ -765,7 +807,7 @@ mod tests {
                 .with_last_part(3),
             RenditionReport::new("audio/stream.m3u8").with_last_msn(41),
         ]);
-        manifest.add_part(500, true);
+        manifest.push_part_us(500_000, true, None, None);
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
 
@@ -779,12 +821,12 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 10,
             segment_min_ms: 1000,
-            part_target_ms: 250,
+            part_target_us: 250_000,
             ..Options::default()
         });
 
-        manifest.add_part(250, true);
-        manifest.add_part(250, false);
+        manifest.push_part_us(250_000, true, None, None);
+        manifest.push_part_us(250_000, false, None, None);
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
 
@@ -798,13 +840,13 @@ mod tests {
         let mut manifest = M3u8Manifest::new(Options {
             max_segments: 10,
             segment_min_ms: 200,
-            part_target_ms: 100,
+            part_target_us: 100_000,
             ..Options::default()
         });
 
-        manifest.add_part_with_byte_len(100, true, 120);
-        manifest.add_part_with_byte_len(100, false, 80);
-        manifest.add_part_with_byte_len(100, true, 40);
+        manifest.push_part_with_byte_len_us(100_000, true, 120);
+        manifest.push_part_with_byte_len_us(100_000, false, 80);
+        manifest.push_part_with_byte_len_us(100_000, true, 40);
 
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).expect("manifest utf8");
 
@@ -934,21 +976,14 @@ mod tests {
         assert_eq!(long_segments.target_duration_secs(), 2);
         assert_eq!(long_segments.normalized().target_duration_ms, 1_500);
 
-        // The millisecond field still works, and wins when set.
-        let legacy = Options {
-            part_target_ms: 500,
-            part_target_us: 2_500,
+        // Counts that are given are kept.
+        let given = Options {
             max_segments: 32,
             max_parts_per_segment: 128,
             ..Options::default()
         }
         .normalized();
-        assert_eq!(legacy.part_target_us(), 500_000);
-        assert_eq!(legacy.normalized().part_target_us(), 500_000);
-        assert_eq!(
-            (legacy.max_segments, legacy.max_parts_per_segment),
-            (32, 128)
-        );
+        assert_eq!((given.max_segments, given.max_parts_per_segment), (32, 128));
 
         // PART-HOLD-BACK is three part targets or the configured floor.
         assert_eq!(Options::default().part_hold_back_us(), 7_500);
@@ -1155,5 +1190,191 @@ mod tests {
         let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
         assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:88\n"));
         assert_valid_ll_hls(&playlist);
+    }
+
+    #[test]
+    fn render_bytes_are_exact() {
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 10,
+            segment_min_ms: 200,
+            target_duration_ms: 1_000,
+            part_target_us: 100_000,
+            ..Options::default()
+        });
+        manifest.start_time = Utc
+            .with_ymd_and_hms(2026, 8, 22, 12, 34, 56)
+            .single()
+            .expect("valid timestamp")
+            + Duration::milliseconds(789);
+        manifest.set_rendition_reports(vec![RenditionReport::new("peer/stream.m3u8")
+            .with_last_msn(8)
+            .with_last_part(2)]);
+
+        manifest.push_part_with_byte_len_us(100_000, true, 120);
+        let first = manifest.m3u8();
+        let first_bytes = first.to_vec();
+        manifest.push_part_with_byte_len_us(100_000, false, 80);
+        manifest.push_part_with_byte_len_us(100_000, true, 40);
+        let pieces = manifest.pieces();
+        let len = pieces.len();
+        let rendered = pieces.into_bytes();
+        let again = manifest.m3u8();
+
+        assert_eq!(first.as_ref(), first_bytes);
+        assert_eq!(rendered.len(), len);
+        assert_eq!(rendered, again);
+        assert_eq!(
+            rendered.as_ref(),
+            b"#EXTM3U\n\
+#EXT-X-VERSION:9\n\
+#EXT-X-TARGETDURATION:1\n\
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=3.000,PART-HOLD-BACK=0.300\n\
+#EXT-X-PART-INF:PART-TARGET=0.100\n\
+#EXT-X-MEDIA-SEQUENCE:1\n\
+#EXT-X-MAP:URI=\"init.mp4\"\n\
+#EXT-X-PROGRAM-DATE-TIME:2026-08-22T12:34:56.789Z\n\
+#EXT-X-PART:DURATION=0.100,URI=\"s1.mp4\",BYTERANGE=\"120@0\",INDEPENDENT=YES\n\
+#EXT-X-PART:DURATION=0.100,URI=\"s1.mp4\",BYTERANGE=\"80@120\"\n\
+#EXTINF:0.200,\n\
+#EXT-X-BYTERANGE:200@0\n\
+s1.mp4\n\
+#EXT-X-PROGRAM-DATE-TIME:2026-08-22T12:34:56.989Z\n\
+#EXT-X-PART:DURATION=0.100,URI=\"s2.mp4\",BYTERANGE=\"40@0\",INDEPENDENT=YES\n\
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"s2.mp4\",BYTERANGE-START=40\n\
+#EXT-X-RENDITION-REPORT:URI=\"peer/stream.m3u8\",LAST-MSN=8,LAST-PART=2\n"
+        );
+    }
+
+    #[test]
+    fn rendered_pieces_know_their_exact_length() {
+        // One-second segments of one part, so that the media sequence
+        // crosses digit boundaries and CAN-SKIP-UNTIL comes and stays.
+        let mut manifest = M3u8Manifest::new(Options {
+            max_segments: 8,
+            segment_min_ms: 1_000,
+            part_target_us: 1_000_000,
+            ..Options::default()
+        });
+        let empty = manifest.pieces();
+        assert_eq!(empty.len(), manifest.m3u8().len());
+        let mut skipped = false;
+        for _ in 0..1_005 {
+            manifest.push_part_us(1_000_000, true, None, None);
+            let pieces = manifest.pieces();
+            let len = pieces.len();
+            let playlist = pieces.into_bytes();
+            assert_eq!(playlist.len(), len);
+            skipped |= playlist
+                .windows(b"CAN-SKIP-UNTIL".len())
+                .any(|window| window == b"CAN-SKIP-UNTIL");
+        }
+        assert!(skipped);
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:998\n#EXT-X-MAP:URI=\"init.mp4\"\n"));
+        assert!(playlist.contains("CAN-SKIP-UNTIL=6.000\n#EXT-X-PART-INF:PART-TARGET=1.000\n"));
+    }
+
+    #[test]
+    fn rendition_reports_are_capped_in_count_and_uri_length() {
+        let mut manifest = M3u8Manifest::new(Options::default());
+        let mut reports = vec![
+            RenditionReport::new("a".repeat(MAX_RENDITION_URI_BYTES + 1)),
+            RenditionReport::new("bad\"uri.m3u8"),
+            RenditionReport::new("b".repeat(MAX_RENDITION_URI_BYTES)),
+        ];
+        reports.extend((0..300).map(|index| RenditionReport::new(format!("r{index}.m3u8"))));
+        let version = manifest.version();
+        manifest.set_rendition_reports(reports);
+        assert_eq!(manifest.version(), version + 1);
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        let lines: Vec<_> = playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-RENDITION-REPORT:"))
+            .collect();
+        assert_eq!(lines.len(), MAX_RENDITION_REPORTS);
+        assert_eq!(
+            lines[0],
+            format!(
+                "#EXT-X-RENDITION-REPORT:URI=\"{}\"",
+                "b".repeat(MAX_RENDITION_URI_BYTES)
+            )
+        );
+        assert_eq!(lines[1], "#EXT-X-RENDITION-REPORT:URI=\"r0.m3u8\"");
+        assert_eq!(
+            lines[MAX_RENDITION_REPORTS - 1],
+            "#EXT-X-RENDITION-REPORT:URI=\"r254.m3u8\""
+        );
+        assert!(!playlist.contains("bad"));
+        assert!(!playlist.contains(&"a".repeat(MAX_RENDITION_URI_BYTES)));
+
+        manifest.set_rendition_reports(Vec::new());
+        assert!(!String::from_utf8(manifest.m3u8().to_vec())
+            .unwrap()
+            .contains("#EXT-X-RENDITION-REPORT"));
+    }
+
+    #[test]
+    fn direct_program_date_time_format_matches_chrono_rfc3339() {
+        let regular = Utc
+            .with_ymd_and_hms(2026, 8, 22, 12, 34, 56)
+            .single()
+            .expect("valid timestamp")
+            + Duration::nanoseconds(789_654_321);
+        let extended_year = NaiveDate::from_ymd_opt(10_000, 1, 2)
+            .expect("valid extended year")
+            .and_hms_milli_opt(3, 4, 5, 6)
+            .expect("valid time")
+            .and_utc();
+        let leap_second = NaiveDate::from_ymd_opt(2016, 12, 31)
+            .expect("valid leap-second date")
+            .and_hms_nano_opt(23, 59, 59, 1_500_000_000)
+            .expect("valid leap second")
+            .and_utc();
+
+        for date_time in [regular, extended_year, leap_second] {
+            let mut actual = String::new();
+            append_program_date_time(&mut actual, date_time);
+            assert_eq!(
+                actual,
+                format!(
+                    "#EXT-X-PROGRAM-DATE-TIME:{}\n",
+                    date_time.to_rfc3339_opts(SecondsFormat::Millis, true)
+                )
+            );
+            assert!(actual.len() <= PROGRAM_DATE_TIME_LINE_BYTES);
+        }
+    }
+
+    #[test]
+    fn long_running_manifest_keeps_only_the_retained_timeline() {
+        let options = Options {
+            max_segments: 4,
+            segment_min_ms: 1000,
+            target_duration_ms: 1000,
+            part_target_us: 1_000_000,
+            ..Options::default()
+        };
+        let mut manifest = M3u8Manifest::new(options);
+
+        for _ in 0..20_000 {
+            manifest.push_part_us(1_000_000, true, None, None);
+        }
+
+        assert_eq!(manifest.closed.len(), 3);
+        assert_eq!(manifest.closed.front().unwrap().id, 19_997);
+        assert_eq!(manifest.closed.back().unwrap().id, 19_999);
+        assert_eq!(manifest.open.start_us, 19_999_000_000);
+
+        let playlist = String::from_utf8(manifest.m3u8().to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:19997"));
+        assert!(playlist.contains("s19997.mp4"));
+        assert!(!playlist.contains("s19996.mp4"));
+        let open_date = manifest.start_time + Duration::seconds(19_999);
+        assert!(playlist.contains(&format!(
+            "#EXT-X-PROGRAM-DATE-TIME:{}\n#EXT-X-PART:DURATION=1.000,URI=\"p20000.mp4\"",
+            open_date.to_rfc3339_opts(SecondsFormat::Millis, true)
+        )));
+        assert!(playlist.len() < 16 * 1024);
     }
 }

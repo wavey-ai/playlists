@@ -6,14 +6,15 @@ pub mod mesh;
 #[cfg(feature = "mesh")]
 mod mesh_send;
 pub mod multivariant;
+mod stream_registry;
 pub mod tail_bundle;
 
 use access_unit::Fmp4;
 use chunk_cache::ChunkCache;
 use m3u8_cache::M3u8Cache;
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 use tracing::info;
 
@@ -41,7 +42,7 @@ pub enum CacheError {
 /// when they are zero, which is the default: the window is `window_ms` and a
 /// segment holds as many parts as `segment_min_ms` (or the target duration)
 /// needs at `part_target_us`, with a margin. A non-zero count is kept as
-/// given, so callers that size the rings themselves are unchanged.
+/// given, for callers that size the rings themselves.
 #[derive(Copy, Clone, Debug)]
 pub struct Options {
     /// Segments in the ring, the open one included. Zero derives it from
@@ -64,13 +65,10 @@ pub struct Options {
     /// duration therefore gets segments that do not all start with a key
     /// frame: set the target to the GOP to keep them aligned.
     pub target_duration_ms: u32,
-    /// PART-TARGET in whole milliseconds. Kept for compatibility: a non-zero
-    /// value wins over `part_target_us`. Zero (the default) uses
-    /// `part_target_us`.
-    pub part_target_ms: u32,
     pub buffer_size_kb: usize,
     pub init_size_kb: usize,
-    /// PART-TARGET in microseconds. Default 2500 (2.5 ms).
+    /// PART-TARGET in microseconds. Default 2500 (2.5 ms). Zero uses the
+    /// default.
     pub part_target_us: u32,
     /// A floor for PART-HOLD-BACK in milliseconds. PART-HOLD-BACK is three
     /// part targets, or this floor when it is larger. Zero (the default)
@@ -84,10 +82,6 @@ pub struct Options {
     /// be removed once they are more than three target durations from the
     /// end). Default 3. Zero keeps the parts of every retained segment.
     pub parted_target_durations: u32,
-    /// Render and compress a playlist for every part as it is added (true),
-    /// or only when a reader asks for it, once for each new part (false, the
-    /// default).
-    pub eager_render: bool,
 }
 
 /// Default PART-TARGET: one 2.5 ms Opus frame (120 samples at 48 kHz).
@@ -106,25 +100,21 @@ impl Default for Options {
             max_parted_segments: 0,
             segment_min_ms: DEFAULT_SEGMENT_MIN_MS,
             target_duration_ms: 1_000,
-            part_target_ms: 0,
             buffer_size_kb: 800,
             init_size_kb: 5,
             part_target_us: DEFAULT_PART_TARGET_US,
             part_hold_back_ms: 0,
             window_ms: DEFAULT_WINDOW_MS,
             parted_target_durations: 3,
-            eager_render: false,
         }
     }
 }
 
 impl Options {
-    /// PART-TARGET in microseconds: `part_target_ms` when it is set, else
-    /// `part_target_us`, at least 1 µs.
+    /// PART-TARGET in microseconds: `part_target_us`, or the default when it
+    /// is zero.
     pub fn part_target_us(&self) -> u32 {
-        if self.part_target_ms > 0 {
-            self.part_target_ms.saturating_mul(1_000)
-        } else if self.part_target_us > 0 {
+        if self.part_target_us > 0 {
             self.part_target_us
         } else {
             DEFAULT_PART_TARGET_US
@@ -152,23 +142,13 @@ impl Options {
 
     /// The options with every derived value filled in. Idempotent.
     pub fn normalized(mut self) -> Self {
-        let part_us = self.part_target_us().max(1);
+        let part_us = self.part_target_us();
         self.part_target_us = part_us;
-        // Keep the millisecond field only when it is exact, so that a second
-        // normalization reads the same part target.
-        self.part_target_ms = if part_us % 1_000 == 0 {
-            part_us / 1_000
-        } else {
-            0
-        };
         self.num_playlists = self.num_playlists.max(1);
         self.segment_min_ms = self.segment_min_ms.max(1);
         // A segment is at least `segment_min_ms` long, and its EXTINF must
         // not round above TARGETDURATION.
-        self.target_duration_ms = self
-            .target_duration_ms
-            .max(self.segment_min_ms)
-            .max(1000);
+        self.target_duration_ms = self.target_duration_ms.max(self.segment_min_ms).max(1000);
         if self.window_ms == 0 {
             self.window_ms = DEFAULT_WINDOW_MS;
         }
@@ -196,42 +176,129 @@ impl Options {
 pub struct Playlists {
     pub chunk_cache: Arc<ChunkCache>,
     m3u8_cache: Arc<M3u8Cache>,
-    streams: Mutex<BTreeSet<u64>>,
+    playlists: Mutex<BTreeMap<u64, Arc<PlaylistEntry>>>,
     active: AtomicUsize,
+    options: Options,
+}
+
+/// One live stream of [`Playlists`]. Its manifest lives in the playlist
+/// cache; the entry only orders the writes of the stream against its `fin`.
+struct PlaylistEntry {
+    /// Set by `fin` before it waits for `commit`. An add that sees it adds
+    /// nothing.
+    closing: AtomicBool,
+    /// Held by an add across its cache writes, and by `fin` across the
+    /// teardown of the caches, so that no add of a closed entry can create
+    /// the stream again after `fin` removed it.
+    commit: Mutex<()>,
+}
+
+pub type PlaylistCacheBundle = (Arc<Playlists>, Arc<ChunkCache>, Arc<M3u8Cache>);
+
+impl PlaylistEntry {
+    fn new() -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            commit: Mutex::new(()),
+        }
+    }
+
+    fn commit(&self) -> MutexGuard<'_, ()> {
+        self.commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl Playlists {
-    pub fn new(options: Options) -> (Arc<Self>, Arc<ChunkCache>, Arc<M3u8Cache>) {
-        let options = options.normalized();
-        let chunk_cache = Arc::new(ChunkCache::new(options));
-        let m3u8_cache = Arc::new(M3u8Cache::new(options));
+    pub fn new(options: Options) -> PlaylistCacheBundle {
+        Self::try_new(options).expect("valid playlist capacities")
+    }
 
-        (
+    pub fn try_new(options: Options) -> Result<PlaylistCacheBundle, CacheError> {
+        Self::try_new_with_latest_read_replicas(options, 1)
+    }
+
+    /// Build playlist caches whose playlist readers share `replicas` copies
+    /// of each compressed playlist (see
+    /// [`M3u8Cache::new_with_latest_read_replicas`]).
+    ///
+    /// Use more than one replica only for read-heavy streams with measured
+    /// payload reference-count contention.
+    pub fn new_with_latest_read_replicas(options: Options, replicas: usize) -> PlaylistCacheBundle {
+        Self::try_new_with_latest_read_replicas(options, replicas)
+            .expect("valid playlist capacities")
+    }
+
+    pub fn try_new_with_latest_read_replicas(
+        options: Options,
+        replicas: usize,
+    ) -> Result<PlaylistCacheBundle, CacheError> {
+        let options = options.normalized();
+        let chunk_cache = Arc::new(ChunkCache::try_new(options)?);
+        let m3u8_cache = Arc::new(M3u8Cache::try_new_with_latest_read_replicas(
+            options, replicas,
+        )?);
+
+        Ok((
             Arc::new(Self {
                 chunk_cache: Arc::clone(&chunk_cache),
                 m3u8_cache: Arc::clone(&m3u8_cache),
-                streams: Mutex::new(BTreeSet::new()),
+                playlists: Mutex::new(BTreeMap::new()),
                 active: AtomicUsize::new(0),
+                options,
             }),
             Arc::clone(&chunk_cache),
             Arc::clone(&m3u8_cache),
-        )
+        ))
     }
 
     pub fn active(&self) -> usize {
-        self.active.load(Ordering::SeqCst)
+        self.active.load(Ordering::Acquire)
     }
 
+    fn entries(&self) -> MutexGuard<'_, BTreeMap<u64, Arc<PlaylistEntry>>> {
+        self.playlists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// End the stream: remove it and its parts from both caches. An add that
+    /// races with `fin` either commits before the caches are cleared or adds
+    /// nothing.
     pub fn fin(&self, id: u64) {
+        let entry = {
+            let playlists = self.entries();
+            let Some(entry) = playlists.get(&id) else {
+                self.m3u8_cache.zero_stream_id(id);
+                self.chunk_cache.zero_stream_id(id);
+                return;
+            };
+            entry.closing.store(true, Ordering::Release);
+            Arc::clone(entry)
+        };
+
+        // An add holds this lock through its cache commit. Once acquired, no
+        // add of the old entry can write after the caches are cleared.
+        let _commit = entry.commit();
+        self.m3u8_cache.zero_stream_id(id);
+        self.chunk_cache.zero_stream_id(id);
+
         let removed = {
-            let mut streams = self.streams.lock().unwrap();
-            streams.remove(&id)
+            let mut playlists = self.entries();
+            if playlists
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                playlists.remove(&id);
+                true
+            } else {
+                false
+            }
         };
         if removed {
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.active.fetch_sub(1, Ordering::AcqRel);
         }
-        self.m3u8_cache.zero_stream_id(id);
-        self.chunk_cache.zero_stream_id_sync(id);
     }
 
     /// Add a part whose duration is `fmp4.duration` milliseconds.
@@ -243,30 +310,61 @@ impl Playlists {
     /// Add a part of `duration_us` microseconds (`fmp4.duration` is not
     /// read). The playlist is not rendered here: a reader of the playlist
     /// cache renders it.
+    ///
+    /// Returns false, and adds nothing, when the stream is closing, when
+    /// `num_playlists` streams are already live, when the initialization is
+    /// larger than `init_size_kb`, or when the playlist cache refuses the
+    /// part.
     pub fn add_us(&self, stream_id: u64, fmp4: Fmp4, duration_us: u64) -> bool {
+        let max_init_bytes = self.options.init_size_kb.saturating_mul(1024);
+        if fmp4
+            .init
+            .as_ref()
+            .is_some_and(|init| init.len() > max_init_bytes)
         {
-            let mut streams = self.streams.lock().unwrap();
-            if !streams.contains(&stream_id) {
-                if self.active.load(Ordering::SeqCst) >= self.chunk_cache.options.num_playlists {
+            return false;
+        }
+        let entry = {
+            let mut playlists = self.entries();
+            if let Some(entry) = playlists.get(&stream_id) {
+                if entry.closing.load(Ordering::Acquire) {
                     return false;
                 }
-                streams.insert(stream_id);
-                let n = self.active.fetch_add(1, Ordering::SeqCst);
-                info!("PLAY:NEW active={}", n + 1);
+                Arc::clone(entry)
+            } else {
+                if playlists.len() >= self.options.num_playlists {
+                    return false;
+                }
+                let entry = Arc::new(PlaylistEntry::new());
+                playlists.insert(stream_id, Arc::clone(&entry));
+                let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+                info!("PLAY:NEW active={active}");
+                entry
+            }
+        };
+
+        let _commit = entry.commit();
+        if entry.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let handle = match self.m3u8_cache.resolve_stream(stream_id) {
+            Some(handle) => handle,
+            None => match self.m3u8_cache.resolve_or_create_stream(stream_id) {
+                Ok(handle) => handle,
+                Err(_) => return false,
+            },
+        };
+        if let Some(init) = fmp4.init {
+            if self.m3u8_cache.set_init_for_handle(handle, init).is_err() {
+                return false;
             }
         }
-
-        if fmp4.init.is_some() {
-            let _ = self.m3u8_cache.ensure_stream_id(stream_id);
-        }
-        if let Some(init) = fmp4.init {
-            let _ = self.m3u8_cache.set_init(stream_id, init);
-        }
-
-        match self
-            .m3u8_cache
-            .add_part_us(stream_id, duration_us, fmp4.key, Some(fmp4.data.len()))
-        {
+        match self.m3u8_cache.add_part_us_for_handle(
+            handle,
+            duration_us,
+            fmp4.key,
+            Some(fmp4.data.len()),
+        ) {
             Ok(position) => {
                 if position.new_segment {
                     info!("PLAY:UP active={}", self.active());
@@ -282,7 +380,16 @@ impl Playlists {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use tokio::time::{timeout, Duration};
+    use std::thread;
+
+    fn part(duration: u32) -> Fmp4 {
+        Fmp4 {
+            init: None,
+            key: true,
+            data: Bytes::from_static(b"part"),
+            duration,
+        }
+    }
 
     #[tokio::test]
     async fn test_fin_clears_chunk_cache_entry() {
@@ -290,32 +397,15 @@ mod tests {
         let (playlists, chunk_cache, _m3u8_cache) = Playlists::new(options);
         let stream_id = 101;
 
-        let fmp4 = Fmp4 {
-            init: None,
-            key: true,
-            data: Bytes::from_static(b"test"),
-            duration: 500,
-        };
-        assert!(playlists.add(stream_id, fmp4));
+        assert!(playlists.add(stream_id, part(500)));
         assert_eq!(playlists.active(), 1);
 
-        let _ = chunk_cache.add_stream_id(stream_id).await;
-        assert!(chunk_cache.get_stream_idx(stream_id).await.is_some());
+        let handle = chunk_cache.resolve_or_create_stream(stream_id).await;
+        assert_eq!(chunk_cache.resolve_stream(stream_id), Some(handle));
 
         playlists.fin(stream_id);
         assert_eq!(playlists.active(), 0);
-
-        let cleared = timeout(Duration::from_millis(200), async {
-            loop {
-                if chunk_cache.get_stream_idx(stream_id).await.is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-
-        assert!(cleared.is_ok());
+        assert_eq!(chunk_cache.resolve_stream(stream_id), None);
     }
 
     #[test]
@@ -334,5 +424,157 @@ mod tests {
         let playlist = std::str::from_utf8(&playlist).unwrap();
         assert_eq!(playlist.matches("#EXT-X-PART:DURATION=0.0025,").count(), 3);
         assert!(playlist.contains("BYTERANGE=\"4@8\""));
+    }
+
+    #[test]
+    fn an_initialization_is_stored_with_its_part() {
+        let (playlists, _chunk_cache, m3u8_cache) = Playlists::new(Options::default());
+        let init = Bytes::from_static(b"init");
+        assert!(playlists.add_us(
+            3,
+            Fmp4 {
+                init: Some(init.clone()),
+                ..part(0)
+            },
+            2_500,
+        ));
+        assert_eq!(m3u8_cache.get_init(3).unwrap(), init);
+        assert_eq!(m3u8_cache.last_position(3), Some((1, 0)));
+    }
+
+    #[test]
+    fn closing_entry_rejects_add_and_cannot_resurrect_cache_state() {
+        let options = Options {
+            num_playlists: 1,
+            ..Options::default()
+        };
+        let (playlists, _chunk_cache, m3u8_cache) = Playlists::new(options);
+        assert!(playlists.add(7, part(500)));
+
+        let entry = Arc::clone(playlists.entries().get(&7).expect("live entry"));
+        let commit_guard = entry.commit();
+        let finisher = {
+            let playlists = Arc::clone(&playlists);
+            thread::spawn(move || playlists.fin(7))
+        };
+        while !entry.closing.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        assert!(!playlists.add(7, part(500)));
+        drop(commit_guard);
+        finisher.join().unwrap();
+
+        assert_eq!(playlists.active(), 0);
+        assert_eq!(m3u8_cache.last_position(7), None);
+        assert!(m3u8_cache.resolve_stream(7).is_none());
+    }
+
+    #[test]
+    fn playlists_fin_racing_add_us_leaves_no_ghost_slot() {
+        let options = Options {
+            num_playlists: 2,
+            ..Options::default()
+        };
+        let (playlists, chunk_cache, m3u8_cache) = Playlists::new(options);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for round in 0..2_000 {
+            // A live stream, with a chunk stream of the same id that `fin`
+            // must clear too.
+            assert!(playlists.add_us(7, part(0), 2_500), "round {round}");
+            runtime.block_on(chunk_cache.resolve_or_create_stream(7));
+
+            // One add against one `fin`: a later add would make a new entry
+            // and hide a ghost.
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let adder = {
+                let playlists = Arc::clone(&playlists);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    playlists.add_us(7, part(0), 2_500)
+                })
+            };
+            start.wait();
+            playlists.fin(7);
+            adder.join().unwrap();
+
+            // The add either committed before `fin` cleared the caches, was
+            // refused by the closing entry, or came after `fin` and made a
+            // new entry. A stream in the playlist cache without an entry is
+            // a ghost that no `fin` of an entry would remove.
+            let live = playlists.entries().contains_key(&7);
+            assert_eq!(
+                m3u8_cache.resolve_stream(7).is_some(),
+                live,
+                "round {round}: playlist stream without its entry"
+            );
+            assert_eq!(playlists.active(), usize::from(live), "round {round}");
+
+            playlists.fin(7);
+            assert_eq!(playlists.active(), 0, "round {round}");
+            assert!(playlists.entries().is_empty(), "round {round}");
+            assert_eq!(m3u8_cache.position(7), None, "round {round}");
+            assert_eq!(m3u8_cache.memory_stats().occupied_slots, 0, "round {round}");
+            assert!(chunk_cache.resolve_stream(7).is_none(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn playlist_add_reports_an_initialization_budget_failure() {
+        let options = Options {
+            init_size_kb: 1,
+            ..Options::default()
+        };
+        let (playlists, _chunk_cache, m3u8_cache) = Playlists::new(options);
+        let added = playlists.add(
+            8,
+            Fmp4 {
+                init: Some(Bytes::from(vec![0_u8; 1025])),
+                key: true,
+                data: Bytes::from_static(b"part"),
+                duration: 500,
+            },
+        );
+
+        assert!(!added);
+        assert!(matches!(
+            m3u8_cache.get_init(8),
+            Err(CacheError::StreamNotFound)
+        ));
+        assert_eq!(m3u8_cache.last_position(8), None);
+        assert_eq!(playlists.active(), 0);
+    }
+
+    #[test]
+    fn playlists_constructor_rejects_capacity_arithmetic_overflow() {
+        assert!(matches!(
+            Playlists::try_new(Options {
+                num_playlists: usize::MAX,
+                max_segments: 2,
+                ..Options::default()
+            }),
+            Err(CacheError::ArithmeticOverflow)
+        ));
+    }
+
+    #[test]
+    fn options_normalize_the_part_target_in_microseconds() {
+        let options = Options {
+            part_target_us: 0,
+            ..Options::default()
+        }
+        .normalized();
+        assert_eq!(options.part_target_us, DEFAULT_PART_TARGET_US);
+        let options = Options {
+            part_target_us: 250,
+            ..Options::default()
+        }
+        .normalized();
+        assert_eq!(options.part_target_us, 250);
+        assert_eq!(options.normalized().part_target_us, 250);
+        assert_eq!(options.part_hold_back_us(), 750);
     }
 }

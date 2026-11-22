@@ -1,7 +1,8 @@
-use crate::chunk_cache::ChunkCache;
+use crate::chunk_cache::{ChunkCache, StreamHandle};
 use crate::mesh_send::{
     call_time, BatchSender, Message, ObjectDatagrams, ObjectEncoder, MESSAGES_PER_CALL,
 };
+use arc_swap::ArcSwap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(test)]
 use raptorq_datagram_fec::DatagramFecEncoder;
@@ -22,7 +23,6 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const FRAME_MAGIC: &[u8; 8] = b"PLMESH1\0";
 const FRAME_VERSION: u8 = 2;
-const FRAME_VERSION_LEGACY: u8 = 1;
 const FRAME_HELLO: u8 = 1;
 const FRAME_CHUNK: u8 = 2;
 const FRAME_REPLICA_REQUEST: u8 = 3;
@@ -82,21 +82,27 @@ const BLOCK_ID_START_SPAN: u32 = 1 << 28;
 const MAX_GOSSIP_PEERS: usize = 256;
 const FEC_OBSERVATION_DATAGRAM_WINDOW: u64 = 8_192;
 const FEC_COMPLETED_BLOCK_WINDOW: usize = 4_096;
+const DEFAULT_MAX_PEERS: usize = 256;
+const DEFAULT_MAX_INFLIGHT_FRAMES: usize = 64;
+const DEFAULT_REPLICA_QUEUE_CAPACITY: usize = 64;
+/// Room in a frame beyond its payload: the head of a chunk or
+/// initialization frame with any node id, and the largest hello (256 gossip
+/// peers). `max_frame_bytes` follows the cache's payload limits plus this.
+const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
+/// `max_frame_bytes` when there is no cache to follow (`FecReceiver::new`
+/// in tests).
+#[cfg(test)]
+const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheMeshRole {
-    /// Compatibility mode for existing local mesh fixtures.
+    /// Every node both receives and forwards: a flat mesh of equal nodes.
+    #[default]
     Peer,
     /// A regional cache distributor may serve child replicas.
     Distributor,
     /// A leaf playback cache receives from parents and never forwards cache data.
     Edge,
-}
-
-impl Default for CacheMeshRole {
-    fn default() -> Self {
-        Self::Peer
-    }
 }
 
 impl CacheMeshRole {
@@ -162,7 +168,7 @@ impl From<std::str::Utf8Error> for MeshError {
 /// How a node that serves children decides which playlists to push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplicationMode {
-    /// Push every playlist to every child. This is the original behavior.
+    /// Push every playlist to every child.
     #[default]
     All,
     /// Push a playlist to a child only while the child holds a subscription
@@ -239,11 +245,7 @@ pub fn chunk_frame_slot(prefix: &[u8]) -> Option<(u64, u64)> {
     if prefix.len() < header + 2 || &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
         return None;
     }
-    let version = prefix[FRAME_MAGIC.len()];
-    if version != FRAME_VERSION && version != FRAME_VERSION_LEGACY {
-        return None;
-    }
-    if prefix[FRAME_MAGIC.len() + 1] != FRAME_CHUNK {
+    if prefix[FRAME_MAGIC.len()] != FRAME_VERSION || prefix[FRAME_MAGIC.len() + 1] != FRAME_CHUNK {
         return None;
     }
     let node_len = usize::from(u16::from_be_bytes([prefix[header], prefix[header + 1]]));
@@ -256,9 +258,9 @@ pub fn chunk_frame_slot(prefix: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// The slot payload of a decoded chunk frame: what the cache stores for the
-/// slot.
+/// slot. The payload is copied out of `frame`.
 pub fn chunk_frame_payload(frame: &[u8]) -> Option<(u64, u64, Bytes)> {
-    match MeshFrame::decode(frame).ok()? {
+    match MeshFrame::decode(Bytes::copy_from_slice(frame)).ok()? {
         MeshFrame::Chunk {
             stream_id,
             slot_id,
@@ -302,11 +304,10 @@ pub struct CacheMeshConfig {
     pub bind_addr: SocketAddr,
     pub peers: Vec<SocketAddr>,
     pub announce_interval: Duration,
+    /// How often the sync task runs a whole pass: it picks up new leases and
+    /// children and paces warm-up windows. A part leaves for the children as
+    /// soon as the local watermark reaches it, without waiting for the tick.
     pub sync_interval: Duration,
-    /// Send a part to the children as soon as the local watermark reaches it,
-    /// not at the next `sync_interval` tick. The tick still runs: it picks up
-    /// new leases and children and paces warm-up windows. Default true.
-    pub sync_on_publish: bool,
     pub repair_symbols: u32,
     pub repair_ratio: f32,
     pub max_repair_symbols: u32,
@@ -323,6 +324,24 @@ pub struct CacheMeshConfig {
     pub max_parents: usize,
     /// Maximum number of child edges served by one distributor tick.
     pub max_children: usize,
+    /// Addresses authorized to send frames or join through gossip. A
+    /// datagram from any other address is dropped before it is decoded.
+    /// `with_peer` and `with_peers` authorize the peers they add.
+    pub allowed_peers: HashSet<SocketAddr>,
+    /// Hard limit on known peer addresses and per-peer decoder state.
+    pub max_peers: usize,
+    /// Hard limit on incomplete FEC objects retained across all peers.
+    pub max_inflight_frames: usize,
+    /// Largest decoded mesh frame accepted or sent. Zero follows the cache:
+    /// its largest part or initialization (`buffer_size_kb`,
+    /// `init_size_kb`) plus room for a frame head.
+    pub max_frame_bytes: usize,
+    /// Hard limit on remembered remote-origin slots. Zero follows the cache:
+    /// every slot that it retains, plus the parts of one prune interval.
+    pub max_remote_slots: usize,
+    /// Replica requests waiting to be served. A request that finds the
+    /// queue full is dropped; the requester asks again.
+    pub replica_queue_capacity: usize,
     /// Whether children receive every playlist or only subscribed playlists.
     pub replication: ReplicationMode,
     /// How long a parent keeps pushing a playlist after the last subscribe.
@@ -347,24 +366,10 @@ pub struct CacheMeshConfig {
     send_observer: SendObserverSlot,
     /// Told of every received datagram and decoded block.
     receive_observer: ReceiveObserverSlot,
-    /// Hand the datagrams of a sync pass to the kernel in batches, one
-    /// `sendmmsg` call for up to 64 messages to a child (Linux; one call
-    /// for each datagram elsewhere). False sends each datagram with its own
-    /// awaited call, as before. Default true.
-    pub batched_send: bool,
-    /// With batched sends, let the kernel cut the equal-sized datagrams of
-    /// an object from one buffer (UDP generic segmentation offload), where
-    /// the kernel has it. While it is in use, symbols do not grow past
-    /// `symbol_size` (`max_symbol_size` is not used), so that no datagram is
-    /// fragmented. Default true.
-    pub gso: bool,
-    /// An object smaller than `symbol_size`, and of at most 1200 bytes (the
-    /// symbol of an edge's UDP cut-through), goes in one symbol of its own
-    /// length, not padded to `symbol_size`: a 2.5 ms Opus part is one
-    /// datagram of about 100 bytes and one repair datagram of the same size,
-    /// not two of 1352. Receivers take the symbol size from each block's
-    /// header. False pads every object to `symbol_size`. Default true.
-    pub fitted_symbols: bool,
+    /// Tests turn generic segmentation offload off to take the path of a
+    /// kernel without it.
+    #[cfg(test)]
+    gso: bool,
 }
 
 impl CacheMeshConfig {
@@ -380,7 +385,6 @@ impl CacheMeshConfig {
             peers: Vec::new(),
             announce_interval: DEFAULT_ANNOUNCE_INTERVAL,
             sync_interval: DEFAULT_SYNC_INTERVAL,
-            sync_on_publish: true,
             repair_symbols: DEFAULT_REPAIR_SYMBOLS,
             repair_ratio: DEFAULT_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
@@ -390,6 +394,12 @@ impl CacheMeshConfig {
             role: CacheMeshRole::Peer,
             max_parents: 2,
             max_children: 8,
+            allowed_peers: HashSet::new(),
+            max_peers: DEFAULT_MAX_PEERS,
+            max_inflight_frames: DEFAULT_MAX_INFLIGHT_FRAMES,
+            max_frame_bytes: 0,
+            max_remote_slots: 0,
+            replica_queue_capacity: DEFAULT_REPLICA_QUEUE_CAPACITY,
             replication: ReplicationMode::All,
             subscription_lease: DEFAULT_SUBSCRIPTION_LEASE,
             backfill_bytes_per_sec: 0,
@@ -400,19 +410,56 @@ impl CacheMeshConfig {
             block_id_offset: 0,
             send_observer: SendObserverSlot(None),
             receive_observer: ReceiveObserverSlot(None),
-            batched_send: true,
+            #[cfg(test)]
             gso: true,
-            fitted_symbols: true,
         }
     }
 
+    /// Add a peer and authorize it.
     pub fn with_peer(mut self, peer: SocketAddr) -> Self {
         self.peers.push(peer);
+        self.allowed_peers.insert(peer);
         self
     }
 
+    /// Add peers and authorize them.
     pub fn with_peers(mut self, peers: impl IntoIterator<Item = SocketAddr>) -> Self {
-        self.peers.extend(peers);
+        for peer in peers {
+            self.peers.push(peer);
+            self.allowed_peers.insert(peer);
+        }
+        self
+    }
+
+    /// Authorize peers that are not configured: children that a distributor
+    /// learns from their hello, and peers learned through a trusted seed.
+    pub fn with_allowed_peers(mut self, peers: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.allowed_peers.extend(peers);
+        self
+    }
+
+    pub fn with_max_peers(mut self, max_peers: usize) -> Self {
+        self.max_peers = max_peers.max(1);
+        self
+    }
+
+    pub fn with_max_inflight_frames(mut self, max_inflight_frames: usize) -> Self {
+        self.max_inflight_frames = max_inflight_frames.max(1);
+        self
+    }
+
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes.max(1);
+        self
+    }
+
+    pub fn with_max_remote_slots(mut self, max_remote_slots: usize) -> Self {
+        self.max_remote_slots = max_remote_slots.max(1);
+        self
+    }
+
+    pub fn with_replica_queue_capacity(mut self, capacity: usize) -> Self {
+        self.replica_queue_capacity = capacity.max(1);
         self
     }
 
@@ -490,13 +537,6 @@ impl CacheMeshConfig {
         self
     }
 
-    /// Whether a part leaves for the children as soon as the local watermark
-    /// reaches it (true, the default) or only at the next sync tick (false).
-    pub fn with_sync_on_publish(mut self, sync_on_publish: bool) -> Self {
-        self.sync_on_publish = sync_on_publish;
-        self
-    }
-
     /// Be told `(stream_id, slot_id, child, sent_unix_us)` each time the sync
     /// task hands the first datagram of a part to the kernel for a child.
     pub fn with_send_observer(mut self, observer: CacheMeshSendObserver) -> Self {
@@ -504,24 +544,11 @@ impl CacheMeshConfig {
         self
     }
 
-    /// Whether a sync pass hands its datagrams to the kernel in batches
-    /// (true, the default) or one awaited call per datagram (false).
-    pub fn with_batched_send(mut self, batched_send: bool) -> Self {
-        self.batched_send = batched_send;
-        self
-    }
-
-    /// Whether batched sends use UDP generic segmentation offload where the
-    /// kernel has it (true, the default).
-    pub fn with_gso(mut self, gso: bool) -> Self {
-        self.gso = gso;
-        self
-    }
-
-    /// Whether an object smaller than `symbol_size` goes in one symbol of its
-    /// own length (true, the default) or is padded to `symbol_size` (false).
-    pub fn with_fitted_symbols(mut self, fitted_symbols: bool) -> Self {
-        self.fitted_symbols = fitted_symbols;
+    /// Send without generic segmentation offload, as on a kernel that does
+    /// not have it.
+    #[cfg(test)]
+    fn without_gso(mut self) -> Self {
+        self.gso = false;
         self
     }
 
@@ -647,8 +674,8 @@ pub struct CacheMeshFecStats {
     pub tx_repair_datagrams: u64,
     pub tx_wire_bytes: u64,
     pub tx_errors: u64,
-    /// Calls that handed datagrams to the kernel: one per datagram without
-    /// batched sends, one per `sendmmsg` with them.
+    /// Calls that handed datagrams to the kernel: one per `sendmmsg` on the
+    /// sync path, one per datagram for control frames and replicas.
     pub tx_send_calls: u64,
     pub rx_wire_datagrams: u64,
     pub rx_wire_bytes: u64,
@@ -663,6 +690,18 @@ pub struct CacheMeshFecStats {
     pub rx_decode_errors: u64,
     pub rx_expired_objects: u64,
     pub rx_inflight_objects: u64,
+    pub rx_evicted_objects: u64,
+    pub rx_oversized_objects: u64,
+    pub rx_unauthorized_datagrams: u64,
+    pub peer_limit_drops: u64,
+    pub remote_slot_evictions: u64,
+    pub replica_queue_depth: u64,
+    pub replica_queue_max_depth: u64,
+    pub replica_queue_drops: u64,
+    pub decode_nanoseconds: u64,
+    pub replica_requests_serviced: u64,
+    pub replica_service_errors: u64,
+    pub replica_service_nanoseconds: u64,
 }
 
 #[derive(Debug, Default)]
@@ -687,6 +726,18 @@ struct CacheMeshFecCounters {
     rx_decode_errors: AtomicU64,
     rx_expired_objects: AtomicU64,
     rx_inflight_objects: AtomicU64,
+    rx_evicted_objects: AtomicU64,
+    rx_oversized_objects: AtomicU64,
+    rx_unauthorized_datagrams: AtomicU64,
+    peer_limit_drops: AtomicU64,
+    remote_slot_evictions: AtomicU64,
+    replica_queue_depth: AtomicU64,
+    replica_queue_max_depth: AtomicU64,
+    replica_queue_drops: AtomicU64,
+    decode_nanoseconds: AtomicU64,
+    replica_requests_serviced: AtomicU64,
+    replica_service_errors: AtomicU64,
+    replica_service_nanoseconds: AtomicU64,
 }
 
 impl CacheMeshFecCounters {
@@ -714,6 +765,18 @@ impl CacheMeshFecCounters {
             rx_decode_errors: self.rx_decode_errors.load(Ordering::Relaxed),
             rx_expired_objects: self.rx_expired_objects.load(Ordering::Relaxed),
             rx_inflight_objects: self.rx_inflight_objects.load(Ordering::Relaxed),
+            rx_evicted_objects: self.rx_evicted_objects.load(Ordering::Relaxed),
+            rx_oversized_objects: self.rx_oversized_objects.load(Ordering::Relaxed),
+            rx_unauthorized_datagrams: self.rx_unauthorized_datagrams.load(Ordering::Relaxed),
+            peer_limit_drops: self.peer_limit_drops.load(Ordering::Relaxed),
+            remote_slot_evictions: self.remote_slot_evictions.load(Ordering::Relaxed),
+            replica_queue_depth: self.replica_queue_depth.load(Ordering::Relaxed),
+            replica_queue_max_depth: self.replica_queue_max_depth.load(Ordering::Relaxed),
+            replica_queue_drops: self.replica_queue_drops.load(Ordering::Relaxed),
+            decode_nanoseconds: self.decode_nanoseconds.load(Ordering::Relaxed),
+            replica_requests_serviced: self.replica_requests_serviced.load(Ordering::Relaxed),
+            replica_service_errors: self.replica_service_errors.load(Ordering::Relaxed),
+            replica_service_nanoseconds: self.replica_service_nanoseconds.load(Ordering::Relaxed),
         }
     }
 }
@@ -731,63 +794,68 @@ impl CacheMesh {
 
     pub async fn start(mut self) -> Result<CacheMeshHandle, MeshError> {
         self.config.block_id_offset = block_id_start_offset(&self.config);
+        if self.config.max_frame_bytes == 0 {
+            self.config.max_frame_bytes = frame_bytes_for(&self.cache);
+        }
+        if self.config.max_remote_slots == 0 {
+            self.config.max_remote_slots = remote_slots_for(&self.cache);
+        }
         let socket = Arc::new(bind_socket(&self.config)?);
         let local_addr = socket.local_addr()?;
-        let peers = Arc::new(RwLock::new(
-            self.config.peers.iter().copied().collect::<HashSet<_>>(),
-        ));
-        let peer_regions = Arc::new(RwLock::new(HashMap::new()));
-        let peer_roles = Arc::new(RwLock::new(HashMap::new()));
-        let remote_slots = Arc::new(RwLock::new(HashSet::new()));
-        let fec_counters = Arc::new(CacheMeshFecCounters::default());
-        let leases: LeaseTable = Arc::new(StdMutex::new(HashMap::new()));
-        let served: ServedTable = Arc::new(StdMutex::new(Vec::new()));
-        let peer_seen: PeerSeen = Arc::new(StdMutex::new(HashMap::new()));
-        let wanted: WantedStreams = Arc::new(StdMutex::new(HashSet::new()));
-        let link_loss: LinkLossTable = Arc::new(StdMutex::new(HashMap::new()));
-        let measured_loss: MeasuredLossTable = Arc::new(StdMutex::new(HashMap::new()));
+        let max_peers = self.config.max_peers.max(1);
+        let initial_peers = self
+            .config
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| self.config.allowed_peers.contains(peer))
+            .take(max_peers)
+            .collect::<HashSet<_>>();
+        let shared = Arc::new(MeshShared {
+            peers: RwLock::new(initial_peers),
+            allowed_peers: ArcSwap::from_pointee(self.config.allowed_peers.clone()),
+            peer_regions: RwLock::new(HashMap::new()),
+            peer_roles: RwLock::new(HashMap::new()),
+            remote_slots: RwLock::new(HashSet::new()),
+            counters: Arc::new(CacheMeshFecCounters::default()),
+            leases: Arc::new(StdMutex::new(HashMap::new())),
+            served: Arc::new(StdMutex::new(Vec::new())),
+            peer_seen: Arc::new(StdMutex::new(HashMap::new())),
+            wanted: Arc::new(StdMutex::new(HashSet::new())),
+            link_loss: Arc::new(StdMutex::new(HashMap::new())),
+            measured_loss: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            cursor_streams: StdMutex::new(HashSet::new()),
+        });
         let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (replica_tx, replica_rx) = mpsc::channel(self.config.replica_queue_capacity.max(1));
 
         tokio::spawn(receive_task(
             Arc::clone(&socket),
             Arc::clone(&self.cache),
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            Arc::clone(&remote_slots),
-            Arc::clone(&fec_counters),
-            MeshShared {
-                leases: Arc::clone(&leases),
-                peer_seen: Arc::clone(&peer_seen),
-                wanted: Arc::clone(&wanted),
-                link_loss: Arc::clone(&link_loss),
-                measured_loss: Arc::clone(&measured_loss),
-            },
+            Arc::clone(&shared),
             self.config.clone(),
+            replica_tx,
+            shutdown_rx.clone(),
+        ));
+        tokio::spawn(replica_task(
+            Arc::clone(&socket),
+            Arc::clone(&self.cache),
+            Arc::clone(&shared),
+            self.config.clone(),
+            replica_rx,
             shutdown_rx.clone(),
         ));
         tokio::spawn(announce_task(
             Arc::clone(&socket),
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            Arc::clone(&fec_counters),
-            Arc::clone(&link_loss),
-            Arc::clone(&measured_loss),
+            Arc::clone(&shared),
             self.config.clone(),
             shutdown_rx.clone(),
         ));
         tokio::spawn(sync_task(
             Arc::clone(&socket),
             self.cache,
-            Arc::clone(&peers),
-            Arc::clone(&peer_regions),
-            Arc::clone(&peer_roles),
-            Arc::clone(&remote_slots),
-            Arc::clone(&fec_counters),
-            Arc::clone(&leases),
-            Arc::clone(&served),
-            Arc::clone(&link_loss),
+            Arc::clone(&shared),
             self.config.clone(),
             shutdown_rx,
         ));
@@ -801,16 +869,13 @@ impl CacheMesh {
 
         Ok(CacheMeshHandle {
             shutdown_tx,
-            peers,
-            peer_regions,
-            peer_roles,
+            shared,
             socket,
             node_id: self.config.node_id,
             repair_symbols: self.config.repair_symbols,
             repair_ratio: self.config.repair_ratio,
             max_repair_symbols: self.config.max_repair_symbols,
             symbol_size: self.config.symbol_size,
-            fec_counters,
             request_block_id: Arc::new(AtomicU32::new(
                 REQUEST_BLOCK_ID_BASE + self.config.block_id_offset,
             )),
@@ -819,55 +884,101 @@ impl CacheMesh {
             same_region_only: self.config.same_region_only,
             role: self.config.role,
             max_parents: self.config.max_parents.max(1),
+            max_peers,
+            max_frame_bytes: self.config.max_frame_bytes,
             replication: self.config.replication,
             subscription_lease: self.config.subscription_lease,
             peer_timeout: self.config.peer_timeout,
-            served,
-            peer_seen,
-            wanted,
-            link_loss,
-            measured_loss,
-            remote_slots,
         })
     }
 }
 
-#[derive(Clone)]
+/// The largest frame that a node with this cache sends or accepts: its
+/// largest part or initialization, and the head of the frame.
+fn frame_bytes_for(cache: &ChunkCache) -> usize {
+    cache
+        .options
+        .buffer_size_kb
+        .max(cache.options.init_size_kb)
+        .saturating_mul(1024)
+        .saturating_add(FRAME_OVERHEAD_BYTES)
+}
+
+/// The remote slots that a node with this cache remembers at most: every
+/// slot that the cache retains, and one prune interval of parts at
+/// 4,000 parts a second per stream on top.
+fn remote_slots_for(cache: &ChunkCache) -> usize {
+    let streams = cache.options.num_playlists.max(1);
+    let retained = streams
+        .saturating_mul(cache.options.max_segments)
+        .saturating_mul(cache.options.max_parts_per_segment);
+    let per_interval = REMOTE_SLOT_PRUNE_INTERVAL.as_millis() as usize * 4;
+    retained
+        .saturating_add(streams.saturating_mul(per_interval))
+        .max(1)
+}
+
+/// State that the tasks of one mesh node and its handle share.
 struct MeshShared {
+    peers: RwLock<HashSet<SocketAddr>>,
+    /// Read once for every datagram, so without a lock.
+    allowed_peers: ArcSwap<HashSet<SocketAddr>>,
+    peer_regions: RwLock<HashMap<SocketAddr, String>>,
+    peer_roles: RwLock<HashMap<SocketAddr, CacheMeshRole>>,
+    /// Slots that came from a peer, by stream lifetime (the handle: stream,
+    /// index and generation; a generation alone is per index) and slot.
+    remote_slots: RwLock<HashSet<(StreamHandle, usize)>>,
+    counters: Arc<CacheMeshFecCounters>,
     leases: LeaseTable,
+    served: ServedTable,
     peer_seen: PeerSeen,
     wanted: WantedStreams,
     link_loss: LinkLossTable,
     measured_loss: MeasuredLossTable,
+    /// The streams that the sync task kept cursors or initializations for
+    /// at its last prune.
+    #[cfg(test)]
+    cursor_streams: StdMutex<HashSet<StreamHandle>>,
+}
+
+impl MeshShared {
+    fn is_allowed(&self, peer: &SocketAddr) -> bool {
+        self.allowed_peers.load().contains(peer)
+    }
+
+    /// Authorize a peer. The allowlist only grows.
+    fn allow(&self, peer: SocketAddr) {
+        if self.is_allowed(&peer) {
+            return;
+        }
+        self.allowed_peers.rcu(|allowed| {
+            let mut allowed = HashSet::clone(allowed);
+            allowed.insert(peer);
+            allowed
+        });
+    }
 }
 
 pub struct CacheMeshHandle {
     shutdown_tx: watch::Sender<()>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
+    shared: Arc<MeshShared>,
     socket: Arc<UdpSocket>,
     node_id: String,
     repair_symbols: u32,
     repair_ratio: f32,
     max_repair_symbols: u32,
     symbol_size: u16,
-    fec_counters: Arc<CacheMeshFecCounters>,
     request_block_id: Arc<AtomicU32>,
     local_addr: SocketAddr,
     region: String,
     same_region_only: bool,
     role: CacheMeshRole,
     max_parents: usize,
+    max_peers: usize,
+    max_frame_bytes: usize,
     replication: ReplicationMode,
     subscription_lease: Duration,
     peer_timeout: Duration,
-    served: ServedTable,
-    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    peer_seen: PeerSeen,
-    wanted: WantedStreams,
-    link_loss: LinkLossTable,
-    measured_loss: MeasuredLossTable,
 }
 
 /// Packet loss on the links of this node to one peer, in parts per million.
@@ -885,8 +996,8 @@ impl CacheMeshHandle {
     /// with. A node sends more repair symbols, in datagrams that fit one
     /// packet, to a peer that reports loss.
     pub fn link_loss(&self) -> Vec<LinkLoss> {
-        let measured = lock(&self.measured_loss).clone();
-        let reported = lock(&self.link_loss).clone();
+        let measured = lock(&self.shared.measured_loss).clone();
+        let reported = lock(&self.shared.link_loss).clone();
         let now = Instant::now();
         let mut peers = measured
             .keys()
@@ -938,18 +1049,29 @@ impl CacheMeshHandle {
     }
 
     pub async fn peers(&self) -> Vec<SocketAddr> {
-        self.peers.read().await.iter().copied().collect()
+        self.shared.peers.read().await.iter().copied().collect()
     }
 
+    /// Add and authorize a peer. Refused when the peer table is full; a
+    /// refused peer is not authorized.
     pub async fn add_peer(&self, peer: SocketAddr) -> bool {
         if peer == self.local_addr {
             return false;
         }
-        self.peers.write().await.insert(peer)
+        let mut peers = self.shared.peers.write().await;
+        if !peers.contains(&peer) && peers.len() >= self.max_peers {
+            self.shared
+                .counters
+                .peer_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.shared.allow(peer);
+        peers.insert(peer)
     }
 
     pub fn fec_stats(&self) -> CacheMeshFecStats {
-        self.fec_counters.snapshot()
+        self.shared.counters.snapshot()
     }
 
     pub async fn request_replica(
@@ -979,7 +1101,7 @@ impl CacheMeshHandle {
         from_slot: usize,
         backfill_parts: usize,
     ) -> Result<Vec<SocketAddr>, MeshError> {
-        lock(&self.wanted).insert(stream_id);
+        lock(&self.shared.wanted).insert(stream_id);
         let peers = self.parents_for(stream_id).await;
         if peers.is_empty() {
             return Ok(peers);
@@ -1006,7 +1128,7 @@ impl CacheMeshHandle {
     /// End the subscription to one playlist. Parents stop pushing it, and
     /// this node no longer accepts its parts.
     pub async fn unsubscribe(&self, stream_id: u64) -> Result<usize, MeshError> {
-        if !lock(&self.wanted).remove(&stream_id) {
+        if !lock(&self.shared.wanted).remove(&stream_id) {
             return Ok(0);
         }
         // Every allowed parent is told, because the parents of the playlist
@@ -1025,14 +1147,17 @@ impl CacheMeshHandle {
 
     /// Playlists that this node currently subscribes to.
     pub fn subscribed_streams(&self) -> Vec<u64> {
-        let mut streams = lock(&self.wanted).iter().copied().collect::<Vec<_>>();
+        let mut streams = lock(&self.shared.wanted)
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
         streams.sort_unstable();
         streams
     }
 
     /// Subscription leases that this node currently serves to children.
     pub fn served_subscriptions(&self) -> Vec<ServedSubscription> {
-        lock(&self.served).clone()
+        lock(&self.shared.served).clone()
     }
 
     pub fn replication(&self) -> ReplicationMode {
@@ -1043,21 +1168,21 @@ impl CacheMeshHandle {
         self.subscription_lease
     }
 
+    /// Slots that this node took from a peer and still remembers. It is at
+    /// most the slots that its cache retains.
+    pub async fn remote_slot_count(&self) -> usize {
+        self.shared.remote_slots.read().await.len()
+    }
+
     /// How long ago this node last heard from any peer that it may take
     /// playlists from. `None` before the first frame of such a peer.
     ///
     /// An edge that has heard no parent for a few hello intervals has lost
     /// its network, or every parent: it cannot say when the next part will
     /// come, and should send its readers to another cache.
-    /// Slots that this node took from a peer and still remembers. It is at
-    /// most the slots that its cache retains.
-    pub async fn remote_slot_count(&self) -> usize {
-        self.remote_slots.read().await.len()
-    }
-
     pub async fn parents_silent_for(&self) -> Option<Duration> {
         let peers = self.allowed_peers().await;
-        let seen = lock(&self.peer_seen);
+        let seen = lock(&self.shared.peer_seen);
         let now = Instant::now();
         peers
             .iter()
@@ -1071,7 +1196,7 @@ impl CacheMeshHandle {
     pub async fn parents_for(&self, stream_id: u64) -> Vec<SocketAddr> {
         let mut peers = self.allowed_peers().await;
         let alive = {
-            let seen = lock(&self.peer_seen);
+            let seen = lock(&self.shared.peer_seen);
             let now = Instant::now();
             peers
                 .iter()
@@ -1100,9 +1225,10 @@ impl CacheMeshHandle {
             self.max_repair_symbols,
             self.symbol_size,
             block_id,
-            Arc::clone(&self.fec_counters),
+            Arc::clone(&self.shared.counters),
         )
-        .with_link_loss(Arc::clone(&self.link_loss));
+        .with_link_loss(Arc::clone(&self.shared.link_loss))
+        .with_max_frame_bytes(self.max_frame_bytes);
         let mut sent = 0usize;
         for peer in peers {
             sender.send(&self.socket, *peer, frame).await?;
@@ -1116,9 +1242,16 @@ impl CacheMeshHandle {
     }
 
     async fn allowed_peers(&self) -> Vec<SocketAddr> {
-        let peers = self.peers.read().await.iter().copied().collect::<Vec<_>>();
-        let regions = self.peer_regions.read().await;
-        let roles = self.peer_roles.read().await;
+        let peers = self
+            .shared
+            .peers
+            .read()
+            .await
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let regions = self.shared.peer_regions.read().await;
+        let roles = self.shared.peer_roles.read().await;
         let mut peers = peers
             .into_iter()
             .filter(|peer| {
@@ -1347,11 +1480,7 @@ impl MeshFrame {
                 out.put_slice(node_id);
                 out.put_u64(*stream_id);
                 out.put_u64(*from_slot);
-                // A request without a count is the frame of an older node,
-                // which reads exactly 16 bytes here.
-                if *count > 0 {
-                    out.put_u32(*count);
-                }
+                out.put_u32(*count);
             }
             Self::LinkReport { loss_ppm, .. } => {
                 out.put_u8(FRAME_LINK_REPORT);
@@ -1384,7 +1513,9 @@ impl MeshFrame {
         Ok(out.freeze())
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, MeshError> {
+    /// Decode a frame. The payload of a chunk or initialization frame is a
+    /// slice of `bytes`, not a copy.
+    fn decode(bytes: Bytes) -> Result<Self, MeshError> {
         if bytes.len() < FRAME_MAGIC.len() + 4 {
             return Err(MeshError::InvalidFrame("frame too short"));
         }
@@ -1393,8 +1524,7 @@ impl MeshFrame {
             return Err(MeshError::InvalidFrame("bad magic"));
         }
         buf.advance(FRAME_MAGIC.len());
-        let version = buf.get_u8();
-        if version != FRAME_VERSION && version != FRAME_VERSION_LEGACY {
+        if buf.get_u8() != FRAME_VERSION {
             return Err(MeshError::InvalidFrame("unsupported version"));
         }
         let kind = buf.get_u8();
@@ -1402,41 +1532,28 @@ impl MeshFrame {
         match kind {
             FRAME_HELLO => {
                 let region = read_string(&mut buf)?;
-                let mut peers = Vec::new();
-                if buf.has_remaining() {
-                    if buf.remaining() < 2 {
-                        return Err(MeshError::InvalidFrame("truncated hello peer count"));
-                    }
-                    let peer_count = buf.get_u16() as usize;
-                    if peer_count > MAX_GOSSIP_PEERS {
-                        return Err(MeshError::InvalidFrame("too many gossip peers"));
-                    }
-                    peers.reserve(peer_count);
-                    for _ in 0..peer_count {
-                        let peer = read_string(&mut buf)?
-                            .parse::<SocketAddr>()
-                            .map_err(|_| MeshError::InvalidFrame("invalid gossip peer addr"))?;
-                        peers.push(peer);
-                    }
-                    let role = if version == FRAME_VERSION && buf.has_remaining() {
-                        CacheMeshRole::from_wire(buf.get_u8())?
-                    } else {
-                        CacheMeshRole::Peer
-                    };
-                    if buf.has_remaining() {
-                        return Err(MeshError::InvalidFrame("trailing hello bytes"));
-                    }
-                    return Ok(Self::Hello {
-                        node_id,
-                        region,
-                        role,
-                        peers,
-                    });
+                if buf.remaining() < 2 {
+                    return Err(MeshError::InvalidFrame("truncated hello peer count"));
                 }
+                let peer_count = buf.get_u16() as usize;
+                if peer_count > MAX_GOSSIP_PEERS {
+                    return Err(MeshError::InvalidFrame("too many gossip peers"));
+                }
+                let mut peers = Vec::with_capacity(peer_count);
+                for _ in 0..peer_count {
+                    let peer = read_string(&mut buf)?
+                        .parse::<SocketAddr>()
+                        .map_err(|_| MeshError::InvalidFrame("invalid gossip peer addr"))?;
+                    peers.push(peer);
+                }
+                if buf.remaining() != 1 {
+                    return Err(MeshError::InvalidFrame("hello role mismatch"));
+                }
+                let role = CacheMeshRole::from_wire(buf.get_u8())?;
                 Ok(Self::Hello {
                     node_id,
                     region,
-                    role: CacheMeshRole::Peer,
+                    role,
                     peers,
                 })
             }
@@ -1450,7 +1567,7 @@ impl MeshFrame {
                 if buf.remaining() != payload_len {
                     return Err(MeshError::InvalidFrame("chunk payload length mismatch"));
                 }
-                let payload = Bytes::copy_from_slice(&buf[..payload_len]);
+                let payload = buf.split_to(payload_len);
                 Ok(Self::Chunk {
                     node_id,
                     stream_id,
@@ -1459,16 +1576,12 @@ impl MeshFrame {
                 })
             }
             FRAME_REPLICA_REQUEST => {
-                if buf.remaining() != 16 && buf.remaining() != 20 {
+                if buf.remaining() != 20 {
                     return Err(MeshError::InvalidFrame("replica request header mismatch"));
                 }
                 let stream_id = buf.get_u64();
                 let from_slot = buf.get_u64();
-                let count = if buf.remaining() == 4 {
-                    buf.get_u32()
-                } else {
-                    0
-                };
+                let count = buf.get_u32();
                 Ok(Self::ReplicaRequest {
                     node_id,
                     stream_id,
@@ -1496,7 +1609,7 @@ impl MeshFrame {
                         "initialization payload length mismatch",
                     ));
                 }
-                let payload = Bytes::copy_from_slice(&buf[..payload_len]);
+                let payload = buf.split_to(payload_len);
                 Ok(Self::Initialization {
                     node_id,
                     stream_id,
@@ -1531,7 +1644,7 @@ impl MeshFrame {
     }
 }
 
-fn read_string(buf: &mut &[u8]) -> Result<String, MeshError> {
+fn read_string(buf: &mut Bytes) -> Result<String, MeshError> {
     if buf.remaining() < 2 {
         return Err(MeshError::InvalidFrame("missing string length"));
     }
@@ -1551,8 +1664,8 @@ struct FecSender {
     max_repair_symbols: u32,
     symbol_size: u16,
     max_symbol_size: u16,
-    /// An object smaller than a symbol is one symbol of its own length.
-    fitted_symbols: bool,
+    /// Largest frame that this sender encodes.
+    max_frame_bytes: usize,
     stats: Arc<CacheMeshFecCounters>,
     /// Loss that the peers report on the paths from this node.
     link_loss: Option<LinkLossTable>,
@@ -1623,26 +1736,25 @@ impl FecSender {
         )
     }
 
-    fn from_config(config: &CacheMeshConfig, stats: Arc<CacheMeshFecCounters>) -> Self {
-        Self::with_policy_and_initial_block_id(
-            config.repair_symbols,
-            config.repair_ratio,
-            config.max_repair_symbols,
-            config.symbol_size,
-            0,
-            stats,
-        )
-        .with_max_symbol_size(config.max_symbol_size)
-    }
-
     fn with_max_symbol_size(mut self, max_symbol_size: u16) -> Self {
         self.max_symbol_size = max_symbol_size;
         self
     }
 
-    fn with_fitted_symbols(mut self, fitted_symbols: bool) -> Self {
-        self.fitted_symbols = fitted_symbols;
+    fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes.max(1);
         self
+    }
+
+    /// Refuse a frame larger than the configured limit.
+    fn check_frame_len(&self, frame_len: usize) -> Result<(), MeshError> {
+        if frame_len > self.max_frame_bytes {
+            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(MeshError::InvalidFrame(
+                "mesh frame exceeds configured limit",
+            ));
+        }
+        Ok(())
     }
 
     /// Symbol size for one object: the configured size, or a multiple of it
@@ -1652,9 +1764,16 @@ impl FecSender {
     }
 
     /// Symbol size that keeps an object within about `source_symbols`.
+    ///
+    /// An object smaller than `symbol_size`, and of at most 1200 bytes (the
+    /// symbol of an edge's UDP cut-through), goes in one symbol of its own
+    /// length, not padded to `symbol_size`: a 2.5 ms Opus part is one
+    /// datagram of about 100 bytes and one repair datagram of the same size,
+    /// not two of 1352. Receivers take the symbol size from each block's
+    /// header.
     fn symbol_size_within(&self, frame_len: usize, source_symbols: usize) -> u16 {
         let base = usize::from(self.symbol_size.max(1));
-        if self.fitted_symbols && frame_len < base && frame_len <= FITTED_SYMBOL_MAX {
+        if frame_len < base && frame_len <= FITTED_SYMBOL_MAX {
             return frame_len.max(1) as u16;
         }
         let limit = usize::from(self.max_symbol_size);
@@ -1683,7 +1802,7 @@ impl FecSender {
             stats,
         )
         .with_max_symbol_size(config.max_symbol_size)
-        .with_fitted_symbols(config.fitted_symbols)
+        .with_max_frame_bytes(config.max_frame_bytes)
     }
 
     fn with_policy_and_initial_block_id(
@@ -1703,7 +1822,7 @@ impl FecSender {
             max_repair_symbols,
             symbol_size: symbol_size.max(1),
             max_symbol_size: 0,
-            fitted_symbols: false,
+            max_frame_bytes: usize::MAX,
             stats,
             link_loss: None,
             encoded: HashMap::new(),
@@ -1801,6 +1920,7 @@ impl FecSender {
         frame: &[&[u8]],
     ) -> Result<(ObjectDatagrams, usize), MeshError> {
         let frame_len = frame.iter().map(|piece| piece.len()).sum::<usize>();
+        self.check_frame_len(frame_len)?;
         let (symbol_size, repair_symbols) = self.plan(frame_len, self.loss_ppm_to(peer));
         let encoded_key = (key.0, key.1, symbol_size, content);
         let reusable = self.encoded.get(&encoded_key).is_some_and(|object| {
@@ -1878,38 +1998,6 @@ impl FecSender {
             .fetch_add((count * object.datagram_len) as u64, Ordering::Relaxed);
     }
 
-    /// Send one stored part to a child, a datagram at a time (see
-    /// [`Self::prepare_object`]).
-    ///
-    /// Returns when the first datagram was handed to the kernel, in wall-clock
-    /// microseconds since the Unix epoch.
-    async fn send_object(
-        &mut self,
-        socket: &UdpSocket,
-        peer: SocketAddr,
-        key: (u64, u64),
-        content: u64,
-        frame: &[u8],
-    ) -> Result<u64, MeshError> {
-        let (object, count) = self.prepare_object(peer, key, content, &[frame])?;
-        let mut first_sent_us = 0;
-        for position in 0..count {
-            // Read the clock as the first datagram is handed to the kernel,
-            // so that the time cannot be later than its arrival at the child.
-            if position == 0 {
-                first_sent_us = unix_micros();
-            }
-            self.stats.tx_send_calls.fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = socket.send_to(&object.datagram(position), peer).await {
-                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-                self.count_sent(&object, position);
-                return Err(err.into());
-            }
-        }
-        self.count_sent(&object, count);
-        Ok(first_sent_us)
-    }
-
     fn repair_symbols_for(&self, frame_len: usize) -> u32 {
         let source_symbols = source_symbol_count(frame_len, self.symbol_size_for(frame_len));
         let proportional = (f32::from(source_symbols) * self.repair_ratio).ceil() as u32;
@@ -1924,6 +2012,7 @@ impl FecSender {
         peer: SocketAddr,
         frame: &[u8],
     ) -> Result<(), MeshError> {
+        self.check_frame_len(frame.len())?;
         let (symbol_size, repair_symbols) = self.plan(frame.len(), self.loss_ppm_to(peer));
         let object = match self.encoder.encode(&[frame], symbol_size, repair_symbols) {
             Ok(object) => object,
@@ -2004,11 +2093,24 @@ struct DecodedBlock {
 
 struct FecReceiver {
     decoders: HashMap<SocketAddr, DatagramFecDecoder>,
+    /// The peers in the order in which they were given a decoder.
+    decoder_order: VecDeque<SocketAddr>,
     observations: HashMap<(SocketAddr, u32), FecBlockObservation>,
+    /// Incomplete blocks in the order in which they were first seen.
+    observation_order: VecDeque<(SocketAddr, u32)>,
+    /// Every datagram's block, with the datagram count when it was seen: an
+    /// entry is current while the block was last seen then.
+    observation_expiries: VecDeque<(u64, (SocketAddr, u32))>,
     completed: HashSet<(SocketAddr, u32)>,
     completed_order: VecDeque<(SocketAddr, u32)>,
     recoveries: HashMap<(SocketAddr, u32), FecRecoveryObservation>,
+    /// Decoded blocks with missing source symbols, in the order in which
+    /// they decoded, with the datagram count then.
+    recovery_expiries: VecDeque<(u64, (SocketAddr, u32))>,
     observed_datagrams: u64,
+    max_decoder_peers: usize,
+    max_inflight_frames: usize,
+    max_frame_bytes: usize,
     stats: Arc<CacheMeshFecCounters>,
     loss: HashMap<SocketAddr, LossWindow>,
     /// Where the loss from each peer is published for the task that reports
@@ -2017,14 +2119,36 @@ struct FecReceiver {
 }
 
 impl FecReceiver {
+    #[cfg(test)]
     fn new(stats: Arc<CacheMeshFecCounters>) -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_PEERS,
+            DEFAULT_MAX_INFLIGHT_FRAMES,
+            DEFAULT_MAX_FRAME_BYTES,
+            stats,
+        )
+    }
+
+    fn with_limits(
+        max_decoder_peers: usize,
+        max_inflight_frames: usize,
+        max_frame_bytes: usize,
+        stats: Arc<CacheMeshFecCounters>,
+    ) -> Self {
         Self {
             decoders: HashMap::new(),
+            decoder_order: VecDeque::new(),
             observations: HashMap::new(),
+            observation_order: VecDeque::new(),
+            observation_expiries: VecDeque::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
             recoveries: HashMap::new(),
+            recovery_expiries: VecDeque::new(),
             observed_datagrams: 0,
+            max_decoder_peers: max_decoder_peers.max(1),
+            max_inflight_frames: max_inflight_frames.max(1),
+            max_frame_bytes: max_frame_bytes.max(1),
             stats,
             loss: HashMap::new(),
             measured_loss: None,
@@ -2097,6 +2221,18 @@ impl FecReceiver {
                 return Err(err);
             }
         };
+        // An object larger than any frame that this node accepts takes no
+        // decoder state.
+        if header.transfer_length as usize > self.max_frame_bytes {
+            self.stats
+                .rx_oversized_objects
+                .fetch_add(1, Ordering::Relaxed);
+            self.record_decode_error();
+            return Err(DatagramFecError::PayloadTooLargeForBlock {
+                actual: header.transfer_length as usize,
+                max: self.max_frame_bytes,
+            });
+        }
         if bytes.len() < HEADER_LEN + 4 {
             let err = DatagramFecError::PacketTooShort {
                 actual: bytes.len(),
@@ -2151,26 +2287,41 @@ impl FecReceiver {
             return Ok(None);
         }
 
-        let decoder = self.decoders.entry(peer).or_default();
+        self.admit_decoder_peer(peer);
+        if !self.observations.contains_key(&key) {
+            self.make_observation_room();
+        }
+        let decoder = self
+            .decoders
+            .get_mut(&peer)
+            .expect("admitted decoder peer must exist");
         let decoded = match decoder.push_datagram(bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
+                // A block that cannot be decoded takes no more state.
+                decoder.expire_block(header.block_id);
+                self.observations.remove(&key);
+                self.stats
+                    .rx_inflight_objects
+                    .store(self.observations.len() as u64, Ordering::Relaxed);
                 self.record_decode_error();
                 return Err(err);
             }
         };
 
-        let observation = self
-            .observations
-            .entry(key)
-            .or_insert_with(|| FecBlockObservation {
+        let observation = self.observations.entry(key).or_insert_with(|| {
+            self.observation_order.push_back(key);
+            FecBlockObservation {
                 source_symbols: header.source_symbols,
                 received_source_symbols: HashSet::new(),
                 last_seen_datagram: self.observed_datagrams,
                 first_seen_us: received_us,
                 fragments: datagram_fragments(bytes.len()) as u32,
-            });
+            }
+        });
         observation.last_seen_datagram = self.observed_datagrams;
+        self.observation_expiries
+            .push_back((self.observed_datagrams, key));
         if is_source {
             observation
                 .received_source_symbols
@@ -2224,8 +2375,14 @@ impl FecReceiver {
                         fragments,
                     },
                 );
+                self.recovery_expiries
+                    .push_back((self.observed_datagrams, key));
             }
             self.remember_completed(key);
+            if self.observation_order.len() > self.max_inflight_frames.saturating_mul(2) {
+                self.observation_order
+                    .retain(|candidate| self.observations.contains_key(candidate));
+            }
         }
 
         self.prune_observations();
@@ -2254,6 +2411,70 @@ impl FecReceiver {
         }
     }
 
+    /// Give a peer a decoder, first taking the decoder and blocks of the peer
+    /// that has had one longest when the table is full.
+    fn admit_decoder_peer(&mut self, peer: SocketAddr) {
+        if self.decoders.contains_key(&peer) {
+            return;
+        }
+        while self.decoders.len() >= self.max_decoder_peers {
+            let Some(expired_peer) = self.decoder_order.pop_front() else {
+                break;
+            };
+            if self.decoders.remove(&expired_peer).is_none() {
+                continue;
+            }
+            let before = self.observations.len();
+            self.observations
+                .retain(|(candidate, _), _| *candidate != expired_peer);
+            self.completed
+                .retain(|(candidate, _)| *candidate != expired_peer);
+            self.recoveries
+                .retain(|(candidate, _), _| *candidate != expired_peer);
+            self.loss.remove(&expired_peer);
+            self.stats.rx_evicted_objects.fetch_add(
+                before.saturating_sub(self.observations.len()) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        self.decoders.insert(peer, DatagramFecDecoder::default());
+        self.decoder_order.push_back(peer);
+    }
+
+    /// Make room for one more incomplete block: drop the oldest ones beyond
+    /// `max_inflight_frames`. A dropped block did not decode in time, so its
+    /// missing source symbols count as lost.
+    fn make_observation_room(&mut self) {
+        while self.observations.len() >= self.max_inflight_frames {
+            let Some(key) = self.observation_order.pop_front() else {
+                break;
+            };
+            let Some(observation) = self.observations.remove(&key) else {
+                continue;
+            };
+            if let Some(decoder) = self.decoders.get_mut(&key.0) {
+                decoder.expire_block(key.1);
+            }
+            self.record_unfinished_block(key.0, &observation);
+            self.stats
+                .rx_evicted_objects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count the loss of a block that never decoded: it lost more symbols
+    /// than it had repair for.
+    fn record_unfinished_block(&mut self, peer: SocketAddr, observation: &FecBlockObservation) {
+        let source = u32::from(observation.source_symbols);
+        let received = observation.received_source_symbols.len() as u32;
+        self.record_block(
+            peer,
+            source,
+            observation.fragments,
+            source.saturating_sub(received),
+        );
+    }
+
     fn finalize_recovery(&mut self, key: (SocketAddr, u32)) {
         let Some(recovery) = self.recoveries.remove(&key) else {
             return;
@@ -2271,48 +2492,72 @@ impl FecReceiver {
         );
     }
 
+    /// Expire what the receiver no longer waits for, on every datagram. Both
+    /// queues are in order, so this costs only the entries that expire.
+    ///
+    /// An incomplete block expires when no datagram of it has come in the
+    /// last `FEC_OBSERVATION_DATAGRAM_WINDOW` datagrams. A decoded block
+    /// that misses source symbols is finalized, and what is still missing
+    /// counted as lost, once it falls out of that window or once its late
+    /// sources have had `LATE_SOURCE_GRACE` to arrive, whichever is first.
     fn prune_observations(&mut self) {
         let cutoff = self
             .observed_datagrams
             .saturating_sub(FEC_OBSERVATION_DATAGRAM_WINDOW);
-        let before = self.observations.len();
-        // A block that never decoded lost more symbols than it had repair
-        // for. Count the source symbols that did not arrive.
-        let expired = self
-            .observations
-            .iter()
-            .filter(|(_, observation)| observation.last_seen_datagram < cutoff)
-            .map(|((peer, _), observation)| {
-                let source = u32::from(observation.source_symbols);
-                let received = observation.received_source_symbols.len() as u32;
-                (
-                    *peer,
-                    source,
-                    observation.fragments,
-                    source.saturating_sub(received),
-                )
-            })
-            .collect::<Vec<_>>();
-        self.observations
-            .retain(|_, observation| observation.last_seen_datagram >= cutoff);
-        for (peer, source, fragments, lost) in expired {
-            self.record_block(peer, source, fragments, lost);
+        let mut expired = 0_u64;
+        while let Some(&(seen_at, key)) = self.observation_expiries.front() {
+            if seen_at >= cutoff {
+                break;
+            }
+            self.observation_expiries.pop_front();
+            // The block was seen again since, or is no longer incomplete.
+            if self
+                .observations
+                .get(&key)
+                .is_none_or(|observation| observation.last_seen_datagram != seen_at)
+            {
+                continue;
+            }
+            let Some(observation) = self.observations.remove(&key) else {
+                continue;
+            };
+            if let Some(decoder) = self.decoders.get_mut(&key.0) {
+                decoder.expire_block(key.1);
+            }
+            self.record_unfinished_block(key.0, &observation);
+            expired += 1;
         }
-        self.stats.rx_expired_objects.fetch_add(
-            before.saturating_sub(self.observations.len()) as u64,
-            Ordering::Relaxed,
-        );
+        if expired > 0 {
+            self.stats
+                .rx_expired_objects
+                .fetch_add(expired, Ordering::Relaxed);
+        }
 
-        let expired_recoveries = self
-            .recoveries
-            .iter()
-            .filter(|(_, recovery)| {
-                recovery.completed_at_datagram < cutoff
-                    || recovery.completed_at.elapsed() >= LATE_SOURCE_GRACE
-            })
-            .map(|(key, _)| *key)
-            .collect::<Vec<_>>();
-        for key in expired_recoveries {
+        if self.recovery_expiries.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        while let Some(&(completed_at_datagram, key)) = self.recovery_expiries.front() {
+            let due = match self.recoveries.get(&key) {
+                // Finalized already: every late source came, or the block
+                // left the completed window.
+                None => {
+                    self.recovery_expiries.pop_front();
+                    continue;
+                }
+                Some(recovery) if recovery.completed_at_datagram != completed_at_datagram => {
+                    self.recovery_expiries.pop_front();
+                    continue;
+                }
+                Some(recovery) => {
+                    completed_at_datagram < cutoff
+                        || now.saturating_duration_since(recovery.completed_at) >= LATE_SOURCE_GRACE
+                }
+            };
+            if !due {
+                break;
+            }
+            self.recovery_expiries.pop_front();
             self.finalize_recovery(key);
         }
     }
@@ -2321,23 +2566,18 @@ impl FecReceiver {
 async fn receive_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    stats: Arc<CacheMeshFecCounters>,
-    shared: MeshShared,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
+    replica_tx: mpsc::Sender<ReplicaWork>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut receiver =
-        FecReceiver::new(Arc::clone(&stats)).with_measured_loss(Arc::clone(&shared.measured_loss));
-    let mut reply_sender = FecSender::from_config_with_initial_block_id(
-        &config,
-        REPLY_BLOCK_ID_BASE + config.block_id_offset,
-        stats,
+    let mut receiver = FecReceiver::with_limits(
+        config.max_peers,
+        config.max_inflight_frames,
+        config.max_frame_bytes,
+        Arc::clone(&shared.counters),
     )
-    .with_link_loss(Arc::clone(&shared.link_loss));
+    .with_measured_loss(Arc::clone(&shared.measured_loss));
     let mut buf = vec![0u8; 65_536];
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
@@ -2368,26 +2608,39 @@ async fn receive_task(
                         continue;
                     }
                 }
+                // Before anything else reads the datagram: an observer that
+                // cuts it through to clients must never see it either.
+                if !shared.is_allowed(&peer) {
+                    shared
+                        .counters
+                        .rx_unauthorized_datagrams
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
                 if let Some(observer) = &config.receive_observer.0 {
                     observer.datagram(peer, &buf[..len]);
                 }
-                let DecodedBlock { frame: decoded, first_seen_us } =
-                    match receiver.push_at(peer, &buf[..len], received_us) {
-                        Ok(Some(decoded)) => {
-                            if let Some(observer) = &config.receive_observer.0 {
-                                observer.decoded(peer, &buf[..len], &decoded.frame);
-                            }
-                            decoded
-                        }
-                        Ok(None) => continue,
-                        Err(err) => {
-                            warn!(peer = %peer, error = %err, "cache mesh FEC decode failed");
-                            continue;
-                        }
-                    };
+                let pushed = receiver.push_at(peer, &buf[..len], received_us);
                 let decoded_us = unix_micros();
-                match MeshFrame::decode(&decoded) {
+                shared.counters.decode_nanoseconds.fetch_add(
+                    decoded_us.saturating_sub(received_us).saturating_mul(1_000),
+                    Ordering::Relaxed,
+                );
+                let DecodedBlock { frame: decoded, first_seen_us } = match pushed {
+                    Ok(Some(decoded)) => {
+                        if let Some(observer) = &config.receive_observer.0 {
+                            observer.decoded(peer, &buf[..len], &decoded.frame);
+                        }
+                        decoded
+                    }
+                    Ok(None) => continue,
+                    Err(err) => {
+                        warn!(peer = %peer, error = %err, "cache mesh FEC decode failed");
+                        continue;
+                    }
+                };
+                match MeshFrame::decode(decoded) {
                     Ok(frame) => {
                         if frame.node_id() == config.node_id {
                             continue;
@@ -2396,15 +2649,10 @@ async fn receive_task(
                             frame,
                             peer,
                             FrameHandler {
-                                socket: &socket,
                                 cache: &cache,
-                                peers: &peers,
-                                peer_regions: &peer_regions,
-                                peer_roles: &peer_roles,
-                                remote_slots: &remote_slots,
                                 shared: &shared,
                                 config: &config,
-                                reply_sender: &mut reply_sender,
+                                replica_tx: &replica_tx,
                                 rx_first_us: first_seen_us,
                                 decoded_us,
                             },
@@ -2417,16 +2665,128 @@ async fn receive_task(
     }
 }
 
+fn elapsed_nanoseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Queue work without waiting: false, and a drop counted, when the queue is
+/// full.
+fn try_enqueue<T>(
+    sender: &mpsc::Sender<T>,
+    depth: &AtomicU64,
+    max_depth: &AtomicU64,
+    drops: &AtomicU64,
+    value: T,
+) -> bool {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            let current = depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            max_depth.fetch_max(current, Ordering::Relaxed);
+            permit.send(value);
+            true
+        }
+        Err(_) => {
+            drops.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn decrement_depth(depth: &AtomicU64) {
+    let mut current = depth.load(Ordering::Relaxed);
+    while current > 0 {
+        match depth.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// A replica request, served by the replica task so that a large range does
+/// not hold up the receive task.
+struct ReplicaWork {
+    requester_node_id: String,
+    peer: SocketAddr,
+    stream_id: u64,
+    from_slot: u64,
+    count: u32,
+}
+
+async fn replica_task(
+    socket: Arc<UdpSocket>,
+    cache: Arc<ChunkCache>,
+    shared: Arc<MeshShared>,
+    config: CacheMeshConfig,
+    mut replica_rx: mpsc::Receiver<ReplicaWork>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        REPLY_BLOCK_ID_BASE + config.block_id_offset,
+        Arc::clone(&shared.counters),
+    )
+    .with_link_loss(Arc::clone(&shared.link_loss));
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                debug!("cache mesh replica task shutting down");
+                return;
+            }
+            work = replica_rx.recv() => {
+                let Some(work) = work else {
+                    return;
+                };
+                decrement_depth(&shared.counters.replica_queue_depth);
+                let started = Instant::now();
+                let service_result = serve_replica_request(
+                    &socket,
+                    &cache,
+                    &mut sender,
+                    &config,
+                    work.peer,
+                    work.stream_id,
+                    work.from_slot,
+                    work.count,
+                    #[cfg(test)]
+                    None,
+                )
+                .await;
+                shared
+                    .counters
+                    .replica_requests_serviced
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = service_result {
+                    shared
+                        .counters
+                        .replica_service_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        requester = work.requester_node_id,
+                        peer = %work.peer,
+                        stream_id = work.stream_id,
+                        error = %err,
+                        "cache mesh replica request could not be served"
+                    );
+                }
+                shared.counters.replica_service_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(started),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
 struct FrameHandler<'a> {
-    socket: &'a Arc<UdpSocket>,
     cache: &'a Arc<ChunkCache>,
-    peers: &'a Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: &'a Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: &'a Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: &'a Arc<RwLock<HashSet<(u64, usize)>>>,
-    shared: &'a MeshShared,
+    shared: &'a Arc<MeshShared>,
     config: &'a CacheMeshConfig,
-    reply_sender: &'a mut FecSender,
+    replica_tx: &'a mpsc::Sender<ReplicaWork>,
     /// When the first datagram of the frame's FEC block arrived.
     rx_first_us: u64,
     /// When the frame's FEC block decoded.
@@ -2453,36 +2813,44 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             peers,
         } => {
             if handler.config.same_region_only && region != handler.config.region {
-                handler.peers.write().await.remove(&peer);
-                handler.peer_regions.write().await.remove(&peer);
-                handler.peer_roles.write().await.remove(&peer);
+                handler.shared.peers.write().await.remove(&peer);
+                handler.shared.peer_regions.write().await.remove(&peer);
+                handler.shared.peer_roles.write().await.remove(&peer);
                 debug!(node_id, region, peer = %peer, "ignored cache mesh peer from another region");
                 return;
             }
+            // Only authorized peers join, and only while the table has room.
             let mut discovered = 0usize;
-            let mut advertised = Vec::new();
+            let mut admitted = Vec::new();
+            if let Some(inserted) = admit_peer(handler.shared, peer, handler.config.max_peers).await
             {
-                let mut peer_set = handler.peers.write().await;
-                if peer_set.insert(peer) {
+                if inserted {
                     discovered = discovered.saturating_add(1);
                 }
-                for advertised_peer in peers {
-                    if advertised_peer == peer || advertised_peer == handler.config.bind_addr {
-                        continue;
-                    }
-                    if peer_set.insert(advertised_peer) {
+                admitted.push(peer);
+            }
+            for advertised_peer in peers {
+                if advertised_peer == peer || advertised_peer == handler.config.bind_addr {
+                    continue;
+                }
+                if let Some(inserted) =
+                    admit_peer(handler.shared, advertised_peer, handler.config.max_peers).await
+                {
+                    if inserted {
                         discovered = discovered.saturating_add(1);
                     }
-                    advertised.push(advertised_peer);
+                    admitted.push(advertised_peer);
                 }
             }
-            let mut peer_regions = handler.peer_regions.write().await;
-            peer_regions.insert(peer, region.clone());
-            for advertised_peer in advertised {
-                peer_regions.insert(advertised_peer, region.clone());
+            let peer_admitted = admitted.contains(&peer);
+            let mut peer_regions = handler.shared.peer_regions.write().await;
+            for admitted_peer in admitted {
+                peer_regions.insert(admitted_peer, region.clone());
             }
             drop(peer_regions);
-            handler.peer_roles.write().await.insert(peer, role);
+            if peer_admitted {
+                handler.shared.peer_roles.write().await.insert(peer, role);
+            }
             debug!(node_id, region, peer = %peer, discovered, "cache mesh peer discovered");
         }
         MeshFrame::Chunk {
@@ -2501,17 +2869,29 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 );
                 return;
             };
+            if let Err(err) = handler.cache.validate_payload(&payload) {
+                warn!(
+                    node_id,
+                    stream_id,
+                    slot_id,
+                    error = err,
+                    "cache mesh chunk rejected"
+                );
+                return;
+            }
+            let handle = handler.cache.resolve_or_create_stream(stream_id).await;
             // Each parent sends every part. The second copy of a part is not
             // written again, so it costs no copy and wakes no reader.
             if handler
                 .cache
-                .get_for_stream_id(stream_id, slot_id)
+                .get_for_handle(handle, slot_id)
                 .await
                 .is_some_and(|(existing, _)| existing == payload)
             {
                 return;
             }
             let bytes = payload.len();
+            let remote_key = (handle, slot_id);
             // The set tells the copy loop which slots came from a peer, so
             // that it does not send them back. An edge has no copy loop: it
             // must not keep a set that nothing reads and nothing prunes.
@@ -2522,20 +2902,29 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             // slot as remote. Holding the lock also keeps a prune, which
             // drops slots above the watermark, from running in between.
             let mut remote_slots = if handler.config.role != CacheMeshRole::Edge {
-                Some(handler.remote_slots.write().await)
+                Some(handler.shared.remote_slots.write().await)
             } else {
                 None
             };
-            let marked = remote_slots
-                .as_mut()
-                .is_some_and(|remote_slots| remote_slots.insert((stream_id, slot_id)));
+            let marked = match remote_slots.as_mut() {
+                Some(remote_slots) => mark_remote_slot(
+                    handler.cache,
+                    remote_slots,
+                    remote_key,
+                    handler.config.max_remote_slots,
+                    &handler.shared.counters,
+                ),
+                None => false,
+            };
+            // A peer's part may replace a newer id of the same generation: a
+            // restarted origin numbers its parts from the start again.
             let written = handler
                 .cache
-                .add_for_stream_id(stream_id, slot_id, payload)
+                .add_remote_for_handle(handle, slot_id, payload)
                 .await;
             if written.is_err() && marked {
                 if let Some(remote_slots) = remote_slots.as_mut() {
-                    remote_slots.remove(&(stream_id, slot_id));
+                    remote_slots.remove(&remote_key);
                 }
             }
             drop(remote_slots);
@@ -2606,25 +2995,26 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             {
                 return;
             }
-            handler.peers.write().await.insert(peer);
-            if let Err(err) = serve_replica_request(
-                handler.socket,
-                handler.cache,
-                handler.reply_sender,
-                handler.config,
-                peer,
-                stream_id,
-                from_slot,
-                count,
-            )
-            .await
-            {
+            // The requester is a child: it learns parts from this node from
+            // now on. The reply goes to its address either way.
+            let _ = admit_peer(handler.shared, peer, handler.config.max_peers).await;
+            if !try_enqueue(
+                handler.replica_tx,
+                &handler.shared.counters.replica_queue_depth,
+                &handler.shared.counters.replica_queue_max_depth,
+                &handler.shared.counters.replica_queue_drops,
+                ReplicaWork {
+                    requester_node_id: node_id,
+                    peer,
+                    stream_id,
+                    from_slot,
+                    count,
+                },
+            ) {
                 debug!(
-                    requester = node_id,
                     peer = %peer,
                     stream_id,
-                    error = %err,
-                    "cache mesh replica request could not be served"
+                    "cache mesh replica request queue full"
                 );
             }
         }
@@ -2639,7 +3029,13 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             {
                 return;
             }
-            handler.peers.write().await.insert(peer);
+            // A child that the peer table has no room for is not served.
+            if admit_peer(handler.shared, peer, handler.config.max_peers)
+                .await
+                .is_none()
+            {
+                return;
+            }
             let lease = Duration::from_millis(u64::from(lease_ms).max(1)).min(
                 handler
                     .config
@@ -2690,8 +3086,11 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
     }
 }
 
+/// Whether this node takes cache data and requests from a peer. The sender
+/// is authorized already: the receive task drops every other datagram.
 async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     let region_allowed = handler
+        .shared
         .peer_regions
         .read()
         .await
@@ -2703,6 +3102,7 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     }
     if handler.config.role == CacheMeshRole::Edge {
         return handler
+            .shared
             .peer_roles
             .read()
             .await
@@ -2712,6 +3112,65 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     true
 }
 
+/// Add an authorized peer to the peer table. `None` when the peer is not
+/// authorized or the table is full; otherwise whether it is new.
+async fn admit_peer(shared: &MeshShared, peer: SocketAddr, max_peers: usize) -> Option<bool> {
+    if !shared.is_allowed(&peer) {
+        return None;
+    }
+    let mut peers = shared.peers.write().await;
+    if peers.contains(&peer) {
+        return Some(false);
+    }
+    if peers.len() >= max_peers.max(1) {
+        shared
+            .counters
+            .peer_limit_drops
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(peers.insert(peer))
+}
+
+/// Mark a slot as received from a peer, under the held lock. A full set is
+/// first pruned to the slots that the cache retains; it never drops a slot
+/// that the cache still holds, which the copy loop would send back. Returns
+/// whether the slot was newly marked.
+fn mark_remote_slot(
+    cache: &ChunkCache,
+    remote_slots: &mut HashSet<(StreamHandle, usize)>,
+    key: (StreamHandle, usize),
+    max_remote_slots: usize,
+    counters: &CacheMeshFecCounters,
+) -> bool {
+    if remote_slots.contains(&key) {
+        return false;
+    }
+    if remote_slots.len() >= max_remote_slots.max(1) {
+        retain_retained_remote_slots(cache, remote_slots);
+        if remote_slots.len() >= max_remote_slots.max(1) {
+            // Only a limit set below the cache's capacity gets here. The part
+            // is still stored; the copy loop may send it back once.
+            counters
+                .remote_slot_evictions
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+    remote_slots.insert(key)
+}
+
+#[cfg(test)]
+struct ReplicaServiceHook {
+    first_chunk_sent: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+/// Send a requester the parts of a stream: `count` parts from `from_slot`
+/// (a hole), or, with a `count` of zero, the initialization and every
+/// retained part from `from_slot` to the newest. Stops when the stream's
+/// index is reused while the parts go out.
+#[allow(clippy::too_many_arguments)]
 async fn serve_replica_request(
     socket: &UdpSocket,
     cache: &ChunkCache,
@@ -2721,54 +3180,43 @@ async fn serve_replica_request(
     stream_id: u64,
     from_slot: u64,
     count: u32,
+    #[cfg(test)] hook: Option<&ReplicaServiceHook>,
 ) -> Result<usize, MeshError> {
-    let Some(stream_idx) = cache.get_stream_idx(stream_id).await else {
+    let Some(handle) = cache.resolve_stream(stream_id) else {
         return Ok(0);
     };
     let mut sent = 0usize;
     // A request for named parts fills a hole. The requester has the
     // initialization of the stream already.
-    if count > 0 {
-        let Some(last) = cache.last(stream_idx) else {
-            return Ok(0);
-        };
-        let first = usize::try_from(from_slot).unwrap_or(usize::MAX);
-        if first > last {
-            return Ok(0);
-        }
-        let end = first.saturating_add(count as usize - 1).min(last);
-        for slot_id in first.max(cache.retained_start(last))..=end {
-            let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
-                continue;
-            };
-            if hash == 0 && payload.is_empty() {
-                continue;
-            }
+    if count == 0 {
+        if let Some(initialization) = cache.stream_initialization_for_handle(handle) {
             let frame =
-                MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
+                MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
                     .encode()?;
             sender.send(socket, peer, &frame).await?;
             sent = sent.saturating_add(1);
         }
-        debug!(peer = %peer, stream_id, from_slot, count, sent, "cache mesh hole filled");
-        return Ok(sent);
     }
-    if let Some(initialization) = cache.stream_initialization(stream_id) {
-        let frame = MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
-            .encode()?;
-        sender.send(socket, peer, &frame).await?;
-        sent = sent.saturating_add(1);
-    }
-    let Some(last) = cache.last(stream_idx) else {
+    let Some(last) = cache.last_for_handle(handle) else {
         return Ok(sent);
     };
-    let from_slot = usize::try_from(from_slot).unwrap_or(usize::MAX);
-    if from_slot > last {
+    let first = usize::try_from(from_slot).unwrap_or(usize::MAX);
+    if first > last {
         return Ok(sent);
     }
-    let from_slot = from_slot.max(cache.retained_start(last));
-    for slot_id in from_slot..=last {
-        let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+    let end = if count > 0 {
+        first.saturating_add(count as usize - 1).min(last)
+    } else {
+        last
+    };
+    #[cfg(test)]
+    let mut chunks_sent = 0usize;
+    for slot_id in first.max(cache.retained_start(last))..=end {
+        let Some((payload, hash)) = cache.get_for_handle(handle, slot_id).await else {
+            if cache.last_for_handle(handle).is_none() {
+                // The index now holds another stream.
+                break;
+            }
             continue;
         };
         if hash == 0 && payload.is_empty() {
@@ -2778,25 +3226,33 @@ async fn serve_replica_request(
             .encode()?;
         sender.send(socket, peer, &frame).await?;
         sent = sent.saturating_add(1);
+        #[cfg(test)]
+        {
+            chunks_sent += 1;
+            if chunks_sent == 1 {
+                if let Some(hook) = hook {
+                    hook.first_chunk_sent.wait().await;
+                    hook.resume.wait().await;
+                }
+            }
+        }
     }
-    debug!(peer = %peer, stream_id, sent, "cache mesh replica request served");
+    debug!(peer = %peer, stream_id, from_slot, count, sent, "cache mesh replica request served");
     Ok(sent)
 }
 
 async fn announce_task(
     socket: Arc<UdpSocket>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    _peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    stats: Arc<CacheMeshFecCounters>,
-    link_loss: LinkLossTable,
-    measured_loss: MeasuredLossTable,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    let mut sender =
-        FecSender::from_config_with_initial_block_id(&config, config.block_id_offset, stats)
-            .with_link_loss(link_loss);
+    let mut sender = FecSender::from_config_with_initial_block_id(
+        &config,
+        config.block_id_offset,
+        Arc::clone(&shared.counters),
+    )
+    .with_link_loss(Arc::clone(&shared.link_loss));
     let mut reported: HashMap<SocketAddr, (Instant, u32)> = HashMap::new();
     let mut interval = tokio::time::interval(config.announce_interval);
 
@@ -2807,8 +3263,8 @@ async fn announce_task(
                 return;
             }
             _ = interval.tick() => {
-                let current_peers = peers.read().await.iter().copied().collect::<Vec<_>>();
-                let peer_regions = peer_regions.read().await;
+                let current_peers = shared.peers.read().await.iter().copied().collect::<Vec<_>>();
+                let peer_regions = shared.peer_regions.read().await;
                 let advertised_peers = if config.role == CacheMeshRole::Edge {
                     Vec::new()
                 } else {
@@ -2845,7 +3301,7 @@ async fn announce_task(
                 }
                 // Tell each peer what this node loses of what the peer
                 // sends, so that the peer protects the path accordingly.
-                let measured = lock(&measured_loss).clone();
+                let measured = lock(&shared.measured_loss).clone();
                 for (peer, loss_ppm) in measured {
                     if !current_peers.contains(&peer) {
                         continue;
@@ -2884,31 +3340,31 @@ async fn announce_task(
 
 /// The watermark of each stream when the sync task last looked at it.
 #[derive(Default)]
-struct SeenWatermarks(HashMap<(u64, usize), usize>);
+struct SeenWatermarks(HashMap<StreamHandle, usize>);
 
 impl SeenWatermarks {
     /// Remember the watermark `last` of a stream and return the one seen
     /// before.
-    fn record(&mut self, stream_id: u64, stream_idx: usize, last: Option<usize>) -> Option<usize> {
+    fn record(&mut self, stream: StreamHandle, last: Option<usize>) -> Option<usize> {
         match last {
-            Some(last) => self.0.insert((stream_id, stream_idx), last),
-            None => self.0.remove(&(stream_id, stream_idx)),
+            Some(last) => self.0.insert(stream, last),
+            None => self.0.remove(&stream),
         }
     }
 
     /// Remember the current watermark of every stream.
-    fn refresh(&mut self, cache: &ChunkCache, stream_ids: &[(u64, usize)]) {
-        for (stream_id, stream_idx) in stream_ids {
-            self.record(*stream_id, *stream_idx, cache.last(*stream_idx));
+    fn refresh(&mut self, cache: &ChunkCache, streams: &[StreamHandle]) {
+        for handle in streams {
+            self.record(*handle, cache.last_for_handle(*handle));
         }
-        self.retain_streams(stream_ids);
+        self.retain_streams(streams);
     }
 
     /// Forget the streams that the cache no longer holds.
-    fn retain_streams(&mut self, stream_ids: &[(u64, usize)]) {
-        if self.0.len() > stream_ids.len() {
-            let current = stream_ids.iter().copied().collect::<HashSet<_>>();
-            self.0.retain(|key, _| current.contains(key));
+    fn retain_streams(&mut self, streams: &[StreamHandle]) {
+        if self.0.len() > streams.len() {
+            let current = streams.iter().copied().collect::<HashSet<_>>();
+            self.0.retain(|stream, _| current.contains(stream));
         }
     }
 }
@@ -2925,28 +3381,36 @@ const REMOTE_SLOT_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Forget the slots that came from a peer and that the cache no longer
 /// retains: slots behind the window of their stream, and slots of a stream
-/// that was released.
+/// that was released or whose index was reused.
 async fn forget_unretained_remote_slots(
     cache: &ChunkCache,
-    remote_slots: &RwLock<HashSet<(u64, usize)>>,
+    remote_slots: &RwLock<HashSet<(StreamHandle, usize)>>,
 ) {
     // The streams and their watermarks are read under the lock. The receive
     // task marks a slot and writes it under the same lock, so a slot that is
     // being received is never seen above the watermark, or in a stream not
     // yet created, here.
     let mut remote_slots = remote_slots.write().await;
-    let stream_ids = cache.stream_ids().await;
-    let retained_ranges = stream_ids
-        .iter()
-        .filter_map(|(stream_id, stream_idx)| {
+    retain_retained_remote_slots(cache, &mut remote_slots);
+}
+
+/// [`forget_unretained_remote_slots`] on the locked set.
+fn retain_retained_remote_slots(
+    cache: &ChunkCache,
+    remote_slots: &mut HashSet<(StreamHandle, usize)>,
+) {
+    let retained_ranges = cache
+        .stream_handles()
+        .into_iter()
+        .filter_map(|handle| {
             cache
-                .last(*stream_idx)
-                .map(|last| (*stream_id, (cache.retained_start(last), last)))
+                .last_for_handle(handle)
+                .map(|last| (handle, (cache.retained_start(last), last)))
         })
         .collect::<HashMap<_, _>>();
-    remote_slots.retain(|(stream_id, slot_id)| {
+    remote_slots.retain(|(stream, slot_id)| {
         retained_ranges
-            .get(stream_id)
+            .get(stream)
             .is_some_and(|(start, last)| slot_id >= start && slot_id <= last)
     });
 }
@@ -2970,10 +3434,9 @@ fn chunk_frame_header(
     out.extend_from_slice(&(payload_len as u32).to_be_bytes());
 }
 
-/// A part queued for a child in a batched pass.
+/// A part queued for a child in a pass.
 struct QueuedPart {
-    stream_id: u64,
-    stream_idx: usize,
+    stream: StreamHandle,
     slot_id: usize,
     /// Its messages are `first_message..end_message` of the child's batch;
     /// none for a part that the child is not sent (it came from a peer).
@@ -2986,7 +3449,7 @@ struct QueuedPart {
     object: Option<(ObjectDatagrams, usize)>,
 }
 
-/// What a batched pass sends one child.
+/// What a pass sends one child.
 #[derive(Default)]
 struct ChildBatch {
     messages: Vec<Message>,
@@ -2999,17 +3462,17 @@ impl ChildBatch {
     }
 }
 
+/// Sends the parts of the cache to the children. A part leaves as soon as
+/// the local watermark reaches it: the publication wakes this task, which
+/// visits only the streams that moved. Each child's datagrams go to the
+/// kernel in batches (`sendmmsg`, up to 64 messages a call), with generic
+/// segmentation offload where the kernel has it, and an object smaller than
+/// a symbol goes in one symbol of its own length. The tick does the rest:
+/// leases, the choice of children, warm-up windows and pruning.
 async fn sync_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
-    peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    peer_regions: Arc<RwLock<HashMap<SocketAddr, String>>>,
-    peer_roles: Arc<RwLock<HashMap<SocketAddr, CacheMeshRole>>>,
-    remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
-    stats: Arc<CacheMeshFecCounters>,
-    leases: LeaseTable,
-    served: ServedTable,
-    link_loss: LinkLossTable,
+    shared: Arc<MeshShared>,
     config: CacheMeshConfig,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
@@ -3020,11 +3483,14 @@ async fn sync_task(
     let mut sender = FecSender::from_config_with_initial_block_id(
         &config,
         CHUNK_BLOCK_ID_BASE + config.block_id_offset,
-        stats,
+        Arc::clone(&shared.counters),
     )
-    .with_link_loss(link_loss);
-    let batched = config.batched_send;
-    let mut batch_sender = BatchSender::new(&socket, batched && config.gso);
+    .with_link_loss(Arc::clone(&shared.link_loss));
+    #[cfg(test)]
+    let gso = config.gso;
+    #[cfg(not(test))]
+    let gso = true;
+    let mut batch_sender = BatchSender::new(&socket, gso);
     if batch_sender.gso() {
         // The kernel cuts an object into datagrams that fit a packet: keep
         // every symbol within one packet rather than fragment large ones.
@@ -3041,14 +3507,14 @@ async fn sync_task(
     let mut frame_header: Vec<u8> = Vec::new();
     // The payloads of the stream that the pass is on, by slot.
     let mut stream_payloads: HashMap<usize, Option<(Bytes, u64)>> = HashMap::new();
-    // The streams that the cache says advanced, and the stream at each
-    // index as the last look found it.
+    // The streams that the cache says advanced.
     let moved = cache.subscribe_publications();
     let mut moved_idxs: Vec<usize> = Vec::new();
-    let mut stream_at: HashMap<usize, u64> = HashMap::new();
-    let mut pass_streams: Vec<(u64, usize)> = Vec::new();
-    let mut sent: HashMap<(u64, usize, SocketAddr), usize> = HashMap::new();
-    let mut sent_initializations: HashMap<(u64, usize, SocketAddr), Bytes> = HashMap::new();
+    let mut pass_streams: Vec<StreamHandle> = Vec::new();
+    // Each child's cursor and initialization, by stream lifetime: a stream
+    // that restarted, or whose index was reused, is a new stream.
+    let mut sent: HashMap<(StreamHandle, SocketAddr), usize> = HashMap::new();
+    let mut sent_initializations: HashMap<(StreamHandle, SocketAddr), Bytes> = HashMap::new();
     // Demand replication state: the leases the last tick saw, the warm-up
     // window of each, and the warm-up byte allowance of each child.
     let mut active: HashSet<(SocketAddr, u64)> = HashSet::new();
@@ -3083,14 +3549,12 @@ async fn sync_task(
                 return;
             }
             _ = interval.tick() => true,
-            _ = published.as_mut(), if config.sync_on_publish => false,
+            _ = published.as_mut() => false,
         };
-        if config.sync_on_publish {
-            // Arm the next wait before the watermarks are read, so that a
-            // part published while this pass runs wakes the next one.
-            published.set(publication.notified());
-            published.as_mut().enable();
-        }
+        // Arm the next wait before the watermarks are read, so that a part
+        // published while this pass runs wakes the next one.
+        published.set(publication.notified());
+        published.as_mut().enable();
         if tick {
             let now = Instant::now();
             let elapsed = now.duration_since(last_tick);
@@ -3098,7 +3562,7 @@ async fn sync_task(
             if demand {
                 let mut current = HashSet::new();
                 {
-                    let mut leases = lock(&leases);
+                    let mut leases = lock(&shared.leases);
                     leases.retain(|_, lease| lease.expires > now);
                     for (key, lease) in leases.iter_mut() {
                         current.insert(*key);
@@ -3110,11 +3574,11 @@ async fn sync_task(
                 for (peer, stream_id) in active.difference(&current) {
                     // The lease ended. Forget the cursors, so that a later
                     // subscription starts with the initialization again.
-                    sent.retain(|(sent_stream, _, sent_peer), _| {
-                        sent_stream != stream_id || sent_peer != peer
+                    sent.retain(|(sent_stream, sent_peer), _| {
+                        sent_stream.stream_id() != *stream_id || sent_peer != peer
                     });
-                    sent_initializations.retain(|(sent_stream, _, sent_peer), _| {
-                        sent_stream != stream_id || sent_peer != peer
+                    sent_initializations.retain(|(sent_stream, sent_peer), _| {
+                        sent_stream.stream_id() != *stream_id || sent_peer != peer
                     });
                     backfills.remove(&(*peer, *stream_id));
                     pending_open.remove(&(*peer, *stream_id));
@@ -3129,7 +3593,7 @@ async fn sync_task(
                         *tokens = (*tokens + rate * elapsed.as_secs_f64()).min(burst);
                     }
                 }
-                *lock(&served) = active
+                *lock(&shared.served) = active
                     .iter()
                     .map(|(child, stream_id)| ServedSubscription {
                         child: *child,
@@ -3143,9 +3607,10 @@ async fn sync_task(
                     .collect();
             }
             children = {
-                let regions = peer_regions.read().await;
-                let roles = peer_roles.read().await;
-                let mut peers = peers
+                let regions = shared.peer_regions.read().await;
+                let roles = shared.peer_roles.read().await;
+                let mut peers = shared
+                    .peers
                     .read()
                     .await
                     .iter()
@@ -3179,14 +3644,18 @@ async fn sync_task(
                 // parents. An edge in demand replication never has a
                 // child, and its set grew by one entry for each part
                 // that it received, for the life of the process.
-                let stream_ids = cache.stream_ids().await;
+                let streams = cache.stream_handles();
                 // Keep the watermarks current, so that the parts published
                 // long ago are not reported as live sends to a child that
                 // comes later.
-                seen_last.refresh(&cache, &stream_ids);
+                seen_last.refresh(&cache, &streams);
                 if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
                     last_remote_slot_prune = Instant::now();
-                    forget_unretained_remote_slots(&cache, &remote_slots).await;
+                    forget_unretained_remote_slots(&cache, &shared.remote_slots).await;
+                    let peers = shared.peers.read().await.clone();
+                    forget_dead_cursors(&mut sent, &mut sent_initializations, &streams, &peers);
+                    #[cfg(test)]
+                    record_cursor_streams(&shared, &sent, &sent_initializations);
                 }
                 continue;
             }
@@ -3199,49 +3668,30 @@ async fn sync_task(
         moved_idxs.clear();
         moved.drain(&mut moved_idxs);
         if tick {
-            let stream_ids = cache.stream_ids().await;
+            let streams = cache.stream_handles();
             if last_remote_slot_prune.elapsed() >= REMOTE_SLOT_PRUNE_INTERVAL {
                 last_remote_slot_prune = Instant::now();
-                forget_unretained_remote_slots(&cache, &remote_slots).await;
+                forget_unretained_remote_slots(&cache, &shared.remote_slots).await;
+                let peers = shared.peers.read().await.clone();
+                forget_dead_cursors(&mut sent, &mut sent_initializations, &streams, &peers);
+                #[cfg(test)]
+                record_cursor_streams(&shared, &sent, &sent_initializations);
             }
-            seen_last.retain_streams(&stream_ids);
-            stream_at.clear();
-            stream_at.extend(stream_ids.iter().map(|(stream_id, idx)| (*idx, *stream_id)));
-            pass_streams = stream_ids;
+            seen_last.retain_streams(&streams);
+            pass_streams = streams;
         } else {
             if moved_idxs.is_empty() {
                 continue;
             }
-            let current = |stream_at: &HashMap<usize, u64>, idx: &usize| {
-                stream_at
-                    .get(idx)
-                    .filter(|stream_id| cache.stream_idx(**stream_id) == Some(*idx))
-                    .copied()
-            };
-            if moved_idxs
-                .iter()
-                .any(|idx| current(&stream_at, idx).is_none())
-            {
-                // A stream that is new since the last look.
-                stream_at.clear();
-                stream_at.extend(
-                    cache
-                        .stream_ids()
-                        .await
-                        .into_iter()
-                        .map(|(stream_id, idx)| (idx, stream_id)),
-                );
-            }
+            // The stream that holds each index now; none while the index is
+            // being given to another stream, whose parts a later pass sends.
             pass_streams.clear();
-            pass_streams.extend(
-                moved_idxs
-                    .iter()
-                    .filter_map(|idx| current(&stream_at, idx).map(|stream_id| (stream_id, *idx))),
-            );
+            pass_streams.extend(moved_idxs.iter().filter_map(|idx| cache.handle_at(*idx)));
         }
-        'streams: for &(stream_id, stream_idx) in &pass_streams {
-            let last = cache.last(stream_idx);
-            let previous = seen_last.record(stream_id, stream_idx, last);
+        'streams: for &handle in &pass_streams {
+            let stream_id = handle.stream_id();
+            let last = cache.last_for_handle(handle);
+            let previous = seen_last.record(handle, last);
             // A publication woke this pass: only a stream whose watermark
             // moved has a part to send. The tick does everything else.
             if !tick && (last.is_none() || last == previous) {
@@ -3263,31 +3713,29 @@ async fn sync_task(
             if stream_children.is_empty() {
                 continue;
             }
-            if let Some(initialization) = cache.stream_initialization(stream_id) {
+            if let Some(initialization) = cache.stream_initialization_for_handle(handle) {
                 // Encoded only when a child lacks this initialization.
                 let mut frame = None;
                 for peer in &stream_children {
-                    let key = (stream_id, stream_idx, *peer);
+                    let key = (handle, *peer);
                     if sent_initializations
                         .get(&key)
                         .is_some_and(|sent| same_bytes(sent, &initialization))
                     {
                         continue;
                     }
-                    if batched {
-                        // The parts queued before it must not overtake it.
-                        flush_child(
-                            &socket,
-                            &mut sender,
-                            &mut batch_sender,
-                            *peer,
-                            batches.get_mut(peer),
-                            &mut call_times,
-                            &mut sent,
-                            &config,
-                        )
-                        .await;
-                    }
+                    // The parts queued before it must not overtake it.
+                    flush_child(
+                        &socket,
+                        &mut sender,
+                        &mut batch_sender,
+                        *peer,
+                        batches.get_mut(peer),
+                        &mut call_times,
+                        &mut sent,
+                        &config,
+                    )
+                    .await;
                     let frame = match &mut frame {
                         Some(frame) => frame,
                         None => match MeshFrame::initialization(
@@ -3325,7 +3773,13 @@ async fn sync_task(
             };
             let retained_start = cache.retained_start(last);
             stream_payloads.clear();
+            // Set when the stream's index is given to another stream during
+            // the pass: nothing more of it is sent.
+            let mut stale = false;
             for peer in &stream_children {
+                if stale {
+                    break;
+                }
                 if let Some((from_slot, backfill_parts)) = pending_open.remove(&(*peer, stream_id))
                 {
                     // A new lease starts live at the next part. The
@@ -3333,7 +3787,7 @@ async fn sync_task(
                     let low = from_slot
                         .max(retained_start)
                         .max(last.saturating_add(1).saturating_sub(backfill_parts));
-                    sent.insert((stream_id, stream_idx, *peer), last);
+                    sent.insert((handle, *peer), last);
                     if low <= last && backfill_parts > 0 {
                         backfills.insert(
                             (*peer, stream_id),
@@ -3348,7 +3802,7 @@ async fn sync_task(
                 // stream restarted with a new publication, whose
                 // sequence starts again. Send it from its beginning.
                 let cursor = sent
-                    .get(&(stream_id, stream_idx, *peer))
+                    .get(&(handle, *peer))
                     .copied()
                     .filter(|slot| *slot <= last);
                 let next = cursor
@@ -3367,160 +3821,111 @@ async fn sync_task(
                     published_from.max(next)
                 };
 
-                if batched {
-                    // The slots of the range that came from a peer, read
-                    // under one lock.
-                    let from_peers = if config.role != CacheMeshRole::Distributor {
-                        let remote = remote_slots.read().await;
-                        if remote.is_empty() {
-                            Vec::new()
-                        } else {
-                            (next..=last)
-                                .filter(|slot_id| remote.contains(&(stream_id, *slot_id)))
-                                .collect()
-                        }
-                    } else {
+                // The slots of the range that came from a peer, read under
+                // one lock.
+                let from_peers = if config.role != CacheMeshRole::Distributor {
+                    let remote = shared.remote_slots.read().await;
+                    if remote.is_empty() {
                         Vec::new()
-                    };
-                    let batch = batches.entry(*peer).or_default();
-                    for slot_id in next..=last {
-                        if from_peers.binary_search(&slot_id).is_ok() {
-                            batch.parts.push(QueuedPart {
-                                stream_id,
-                                stream_idx,
-                                slot_id,
-                                first_message: batch.messages.len(),
-                                end_message: batch.messages.len(),
-                                live: false,
-                                warm_up: false,
-                                object: None,
-                            });
-                            continue;
-                        }
-                        let Some((payload, hash)) =
-                            stream_payload(&cache, &mut stream_payloads, stream_idx, slot_id).await
-                        else {
-                            continue;
-                        };
-                        chunk_frame_header(
-                            &mut frame_header,
-                            &config.node_id,
-                            stream_id,
-                            slot_id as u64,
-                            payload.len(),
-                        );
-                        match sender.prepare_object(
-                            *peer,
-                            (stream_id, slot_id as u64),
-                            hash,
-                            &[&frame_header, &payload],
-                        ) {
-                            Ok((object, count)) => {
-                                let first_message = batch.messages.len();
-                                batch_sender.push(&mut batch.messages, &object, count);
-                                batch.parts.push(QueuedPart {
-                                    stream_id,
-                                    stream_idx,
-                                    slot_id,
-                                    first_message,
-                                    end_message: batch.messages.len(),
-                                    live: slot_id >= live_from,
-                                    warm_up: false,
-                                    object: Some((object, count)),
-                                });
-                                if batch.messages.len() >= MESSAGES_PER_CALL {
-                                    // A full call: a catch-up of many parts
-                                    // does not hold the first of them back.
-                                    flush_child(
-                                        &socket,
-                                        &mut sender,
-                                        &mut batch_sender,
-                                        *peer,
-                                        Some(batch),
-                                        &mut call_times,
-                                        &mut sent,
-                                        &config,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(err) => {
-                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
-                            }
-                        }
+                    } else {
+                        (next..=last)
+                            .filter(|slot_id| remote.contains(&(handle, *slot_id)))
+                            .collect()
                     }
-                    continue;
-                }
-
+                } else {
+                    Vec::new()
+                };
+                let batch = batches.entry(*peer).or_default();
                 for slot_id in next..=last {
-                    if config.role != CacheMeshRole::Distributor
-                        && remote_slots.read().await.contains(&(stream_id, slot_id))
-                    {
-                        sent.insert((stream_id, stream_idx, *peer), slot_id);
+                    if from_peers.binary_search(&slot_id).is_ok() {
+                        batch.parts.push(QueuedPart {
+                            stream: handle,
+                            slot_id,
+                            first_message: batch.messages.len(),
+                            end_message: batch.messages.len(),
+                            live: false,
+                            warm_up: false,
+                            object: None,
+                        });
                         continue;
                     }
-                    let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                    let Some((payload, hash)) =
+                        stream_payload(&cache, &mut stream_payloads, handle, slot_id).await
+                    else {
+                        if cache.last_for_handle(handle).is_none() {
+                            stale = true;
+                            break;
+                        }
                         continue;
                     };
-                    if hash == 0 && payload.is_empty() {
-                        continue;
-                    }
-                    let frame = match MeshFrame::chunk(
-                        config.node_id.clone(),
+                    chunk_frame_header(
+                        &mut frame_header,
+                        &config.node_id,
                         stream_id,
                         slot_id as u64,
-                        payload,
-                    )
-                    .encode()
-                    {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
-                            continue;
-                        }
-                    };
-                    match sender
-                        .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
-                        .await
-                    {
-                        Ok(sent_us) => {
-                            sent.insert((stream_id, stream_idx, *peer), slot_id);
-                            if slot_id >= live_from {
-                                if let Some(observer) = &config.send_observer.0 {
-                                    observer(stream_id, slot_id as u64, *peer, sent_us);
-                                }
+                        payload.len(),
+                    );
+                    match sender.prepare_object(
+                        *peer,
+                        (stream_id, slot_id as u64),
+                        hash,
+                        &[&frame_header, &payload],
+                    ) {
+                        Ok((object, count)) => {
+                            let first_message = batch.messages.len();
+                            batch_sender.push(&mut batch.messages, &object, count);
+                            batch.parts.push(QueuedPart {
+                                stream: handle,
+                                slot_id,
+                                first_message,
+                                end_message: batch.messages.len(),
+                                live: slot_id >= live_from,
+                                warm_up: false,
+                                object: Some((object, count)),
+                            });
+                            if batch.messages.len() >= MESSAGES_PER_CALL {
+                                // A full call: a catch-up of many parts does
+                                // not hold the first of them back.
+                                flush_child(
+                                    &socket,
+                                    &mut sender,
+                                    &mut batch_sender,
+                                    *peer,
+                                    Some(batch),
+                                    &mut call_times,
+                                    &mut sent,
+                                    &config,
+                                )
+                                .await;
                             }
                         }
                         Err(err) => {
-                            debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh chunk send failed");
-                            break;
+                            warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
                         }
                     }
                 }
             }
 
-            if batched {
-                // The stream's live parts leave now, one call for each
-                // child, before the pass encodes the next stream.
-                for peer in &stream_children {
-                    flush_child(
-                        &socket,
-                        &mut sender,
-                        &mut batch_sender,
-                        *peer,
-                        batches.get_mut(peer),
-                        &mut call_times,
-                        &mut sent,
-                        &config,
-                    )
-                    .await;
-                }
+            // The stream's live parts leave now, one call for each child,
+            // before the pass encodes the next stream.
+            for peer in &stream_children {
+                flush_child(
+                    &socket,
+                    &mut sender,
+                    &mut batch_sender,
+                    *peer,
+                    batches.get_mut(peer),
+                    &mut call_times,
+                    &mut sent,
+                    &config,
+                )
+                .await;
             }
 
             // Warm-up windows go after the live parts of the tick,
             // newest part first, within the allowance of each child.
             // Only the tick sends them: it paces them.
-            if !tick {
+            if !tick || stale {
                 continue;
             }
             for peer in &stream_children {
@@ -3538,75 +3943,48 @@ async fn sync_task(
                         break;
                     }
                     backfill.next = slot_id.checked_sub(1);
-                    let Some((payload, hash)) = cache.get(stream_idx, slot_id).await else {
+                    let Some((payload, hash)) = cache.get_for_handle(handle, slot_id).await else {
+                        if cache.last_for_handle(handle).is_none() {
+                            backfill.next = None;
+                            break;
+                        }
                         continue;
                     };
                     if hash == 0 && payload.is_empty() {
                         continue;
                     }
                     let bytes = payload.len();
-                    if batched {
-                        // Sent after the live parts of every stream of the
-                        // pass.
-                        chunk_frame_header(
-                            &mut frame_header,
-                            &config.node_id,
-                            stream_id,
-                            slot_id as u64,
-                            payload.len(),
-                        );
-                        match sender.prepare_object(
-                            *peer,
-                            (stream_id, slot_id as u64),
-                            hash,
-                            &[&frame_header, &payload],
-                        ) {
-                            Ok((object, count)) => {
-                                let batch = warm_batches.entry(*peer).or_default();
-                                let first_message = batch.messages.len();
-                                batch_sender.push(&mut batch.messages, &object, count);
-                                batch.parts.push(QueuedPart {
-                                    stream_id,
-                                    stream_idx,
-                                    slot_id,
-                                    first_message,
-                                    end_message: batch.messages.len(),
-                                    live: false,
-                                    warm_up: true,
-                                    object: Some((object, count)),
-                                });
-                            }
-                            Err(err) => {
-                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
-                                continue;
-                            }
+                    // Sent after the live parts of every stream of the pass.
+                    chunk_frame_header(
+                        &mut frame_header,
+                        &config.node_id,
+                        stream_id,
+                        slot_id as u64,
+                        payload.len(),
+                    );
+                    match sender.prepare_object(
+                        *peer,
+                        (stream_id, slot_id as u64),
+                        hash,
+                        &[&frame_header, &payload],
+                    ) {
+                        Ok((object, count)) => {
+                            let batch = warm_batches.entry(*peer).or_default();
+                            let first_message = batch.messages.len();
+                            batch_sender.push(&mut batch.messages, &object, count);
+                            batch.parts.push(QueuedPart {
+                                stream: handle,
+                                slot_id,
+                                first_message,
+                                end_message: batch.messages.len(),
+                                live: false,
+                                warm_up: true,
+                                object: Some((object, count)),
+                            });
                         }
-                    } else {
-                        let frame = match MeshFrame::chunk(
-                            config.node_id.clone(),
-                            stream_id,
-                            slot_id as u64,
-                            payload,
-                        )
-                        .encode()
-                        {
-                            Ok(frame) => frame,
-                            Err(err) => {
-                                warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
-                                continue;
-                            }
-                        };
-                        match sender
-                            .send_object(&socket, *peer, (stream_id, slot_id as u64), hash, &frame)
-                            .await
-                        {
-                            // A warm-up part is not a live send: the observer
-                            // does not see it.
-                            Ok(_) => {}
-                            Err(err) => {
-                                debug!(peer = %peer, stream_id, slot_id, error = %err, "cache mesh warm-up send failed");
-                                break;
-                            }
+                        Err(err) => {
+                            warn!(stream_id, slot_id, error = %err, "cache mesh chunk encode failed");
+                            continue;
                         }
                     }
                     if limited {
@@ -3623,34 +4001,61 @@ async fn sync_task(
             }
         }
 
-        if batched {
-            // The warm-up parts of the pass, after every live part, each
-            // child's in as few calls as the kernel takes them. (The live
-            // batches are empty here: each stream sent its own.)
-            for (peer, batch) in batches.iter_mut().chain(warm_batches.iter_mut()) {
-                if batch.is_empty() {
-                    continue;
-                }
-                flush_child(
-                    &socket,
-                    &mut sender,
-                    &mut batch_sender,
-                    *peer,
-                    Some(batch),
-                    &mut call_times,
-                    &mut sent,
-                    &config,
-                )
-                .await;
+        // The warm-up parts of the pass, after every live part, each child's
+        // in as few calls as the kernel takes them. (The live batches are
+        // empty here: each stream sent its own.)
+        for (peer, batch) in batches.iter_mut().chain(warm_batches.iter_mut()) {
+            if batch.is_empty() {
+                continue;
             }
-            if batches.len() > children.len().max(1) * 4 {
-                batches.retain(|peer, _| children.contains(peer));
-            }
-            if warm_batches.len() > children.len().max(1) * 4 {
-                warm_batches.retain(|peer, _| children.contains(peer));
-            }
+            flush_child(
+                &socket,
+                &mut sender,
+                &mut batch_sender,
+                *peer,
+                Some(batch),
+                &mut call_times,
+                &mut sent,
+                &config,
+            )
+            .await;
+        }
+        if batches.len() > children.len().max(1) * 4 {
+            batches.retain(|peer, _| children.contains(peer));
+        }
+        if warm_batches.len() > children.len().max(1) * 4 {
+            warm_batches.retain(|peer, _| children.contains(peer));
         }
     }
+}
+
+#[cfg(test)]
+fn record_cursor_streams(
+    shared: &MeshShared,
+    sent: &HashMap<(StreamHandle, SocketAddr), usize>,
+    sent_initializations: &HashMap<(StreamHandle, SocketAddr), Bytes>,
+) {
+    *lock(&shared.cursor_streams) = sent
+        .keys()
+        .chain(sent_initializations.keys())
+        .map(|(stream, _)| *stream)
+        .collect();
+}
+
+/// Forget the cursors and initializations sent for streams that the cache no
+/// longer holds in that lifetime, and for peers that are gone.
+fn forget_dead_cursors(
+    sent: &mut HashMap<(StreamHandle, SocketAddr), usize>,
+    sent_initializations: &mut HashMap<(StreamHandle, SocketAddr), Bytes>,
+    streams: &[StreamHandle],
+    peers: &HashSet<SocketAddr>,
+) {
+    if sent.is_empty() && sent_initializations.is_empty() {
+        return;
+    }
+    let live = streams.iter().copied().collect::<HashSet<_>>();
+    sent.retain(|(stream, peer), _| live.contains(stream) && peers.contains(peer));
+    sent_initializations.retain(|(stream, peer), _| live.contains(stream) && peers.contains(peer));
 }
 
 /// The payload of `slot_id` of a stream and its hash, read from the cache
@@ -3659,13 +4064,13 @@ async fn sync_task(
 async fn stream_payload(
     cache: &ChunkCache,
     payloads: &mut HashMap<usize, Option<(Bytes, u64)>>,
-    stream_idx: usize,
+    handle: StreamHandle,
     slot_id: usize,
 ) -> Option<(Bytes, u64)> {
     if let Some(payload) = payloads.get(&slot_id) {
         return payload.clone();
     }
-    let payload = match cache.get(stream_idx, slot_id).await {
+    let payload = match cache.get_for_handle(handle, slot_id).await {
         Some((payload, hash)) if hash != 0 || !payload.is_empty() => Some((payload, hash)),
         _ => None,
     };
@@ -3685,7 +4090,7 @@ async fn flush_child(
     peer: SocketAddr,
     batch: Option<&mut ChildBatch>,
     call_times: &mut Vec<(usize, u64)>,
-    sent: &mut HashMap<(u64, usize, SocketAddr), usize>,
+    sent: &mut HashMap<(StreamHandle, SocketAddr), usize>,
     config: &CacheMeshConfig,
 ) {
     let Some(batch) = batch else {
@@ -3712,11 +4117,11 @@ async fn flush_child(
         if part.warm_up {
             continue;
         }
-        sent.insert((part.stream_id, part.stream_idx, peer), part.slot_id);
+        sent.insert((part.stream, peer), part.slot_id);
         if part.live && part.end_message > part.first_message {
             if let Some(observer) = &config.send_observer.0 {
                 observer(
-                    part.stream_id,
+                    part.stream.stream_id(),
                     part.slot_id as u64,
                     peer,
                     call_time(call_times, part.first_message),
@@ -3754,42 +4159,90 @@ mod tests {
     fn mesh_frame_roundtrips() {
         let frame = MeshFrame::chunk("uk", 42, 7, Bytes::from_static(b"media"));
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let frame = MeshFrame::initialization("uk", 42, Bytes::from_static(b"ftyp-moov-init"));
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let frame = MeshFrame::hello_with_peers("us", "us-east", Vec::new());
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
 
         let peer: SocketAddr = "127.0.0.1:9911".parse().unwrap();
         let frame = MeshFrame::hello_with_peers("us", "us-east", vec![peer]);
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
-
-        let mut legacy_hello = BytesMut::new();
-        legacy_hello.put_slice(FRAME_MAGIC);
-        legacy_hello.put_u8(FRAME_VERSION_LEGACY);
-        legacy_hello.put_u8(FRAME_HELLO);
-        legacy_hello.put_u16(2);
-        legacy_hello.put_slice(b"uk");
-        legacy_hello.put_u16(7);
-        legacy_hello.put_slice(b"uk-west");
-        assert_eq!(
-            MeshFrame::decode(&legacy_hello).unwrap(),
-            MeshFrame::hello_with_peers("uk", "uk-west", Vec::new())
-        );
 
         let frame = MeshFrame::replica_request("jp", 42, 3);
         let encoded = frame.encode().unwrap();
-        let decoded = MeshFrame::decode(&encoded).unwrap();
+        let decoded = MeshFrame::decode(encoded).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    /// One wire format: a version 1 frame, a hello without its role and a
+    /// replica request without its count are refused.
+    #[test]
+    fn only_the_current_wire_format_is_accepted() {
+        let mut v1_hello = BytesMut::new();
+        v1_hello.put_slice(FRAME_MAGIC);
+        v1_hello.put_u8(1);
+        v1_hello.put_u8(FRAME_HELLO);
+        v1_hello.put_u16(2);
+        v1_hello.put_slice(b"uk");
+        v1_hello.put_u16(7);
+        v1_hello.put_slice(b"uk-west");
+        assert!(MeshFrame::decode(v1_hello.freeze()).is_err());
+
+        let mut hello = BytesMut::new();
+        hello.put_slice(FRAME_MAGIC);
+        hello.put_u8(FRAME_VERSION);
+        hello.put_u8(FRAME_HELLO);
+        hello.put_u16(2);
+        hello.put_slice(b"uk");
+        hello.put_u16(7);
+        hello.put_slice(b"uk-west");
+        hello.put_u16(0);
+        assert!(MeshFrame::decode(hello.clone().freeze()).is_err());
+        hello.put_u8(CacheMeshRole::Edge.wire_value());
+        assert_eq!(
+            MeshFrame::decode(hello.freeze()).unwrap(),
+            MeshFrame::hello_with_role("uk", "uk-west", CacheMeshRole::Edge, Vec::new())
+        );
+
+        let request = MeshFrame::replica_request("jp", 42, 3).encode().unwrap();
+        assert_eq!(request.len(), 12 + 2 + 20);
+        assert!(MeshFrame::decode(request.slice(..request.len() - 4)).is_err());
+
+        let chunk = MeshFrame::chunk("uk", 42, 7, Bytes::from_static(b"media"))
+            .encode()
+            .unwrap();
+        let mut v1_chunk = chunk.to_vec();
+        v1_chunk[FRAME_MAGIC.len()] = 1;
+        assert!(MeshFrame::decode(Bytes::from(v1_chunk.clone())).is_err());
+        assert_eq!(chunk_frame_slot(&v1_chunk), None);
+        assert_eq!(chunk_frame_slot(&chunk), Some((42, 7)));
+    }
+
+    /// A decoded payload is a slice of the decoded frame, not a copy.
+    #[test]
+    fn a_decoded_payload_shares_the_frame_buffer() {
+        let encoded = MeshFrame::chunk("uk", 42, 7, Bytes::from(vec![5_u8; 600]))
+            .encode()
+            .unwrap();
+        let range = encoded.as_ptr_range();
+        let MeshFrame::Chunk { payload, .. } = MeshFrame::decode(encoded.clone()).unwrap() else {
+            panic!("a chunk frame");
+        };
+        assert!(range.contains(&payload.as_ptr()));
+        // The public parser copies: its caller keeps its own buffer.
+        let (_, _, copied) = chunk_frame_payload(&encoded).unwrap();
+        assert_eq!(copied, payload);
+        assert!(!range.contains(&copied.as_ptr()));
     }
 
     #[tokio::test]
@@ -3912,6 +4365,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(parent_cache.get_for_stream_id(8, 0).await.is_none());
+        assert!(edge.shared.remote_slots.read().await.is_empty());
 
         parent.shutdown();
         edge.shutdown();
@@ -4071,7 +4525,9 @@ mod tests {
         let cache_b = Arc::new(ChunkCache::new(options));
         let cache_c = Arc::new(ChunkCache::new(options));
 
-        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a).with_peer(addr_b);
+        let mut config_a = CacheMeshConfig::new("uk", "uk", addr_a)
+            .with_peer(addr_b)
+            .with_allowed_peers([addr_c]);
         config_a.announce_interval = Duration::from_millis(20);
         config_a.sync_interval = Duration::from_secs(60);
         let mut config_b = CacheMeshConfig::new("us", "us", addr_b)
@@ -4079,7 +4535,9 @@ mod tests {
             .with_peer(addr_c);
         config_b.announce_interval = Duration::from_millis(20);
         config_b.sync_interval = Duration::from_secs(60);
-        let mut config_c = CacheMeshConfig::new("jp", "jp", addr_c).with_peer(addr_b);
+        let mut config_c = CacheMeshConfig::new("jp", "jp", addr_c)
+            .with_peer(addr_b)
+            .with_allowed_peers([addr_a]);
         config_c.announce_interval = Duration::from_millis(20);
         config_c.sync_interval = Duration::from_secs(60);
 
@@ -4208,7 +4666,7 @@ mod tests {
     /// encoded once for every child.
     #[test]
     fn an_encoding_is_reused_only_for_the_same_payload() {
-        let mut sender = FecSender::new(1, DEFAULT_SYMBOL_SIZE).with_fitted_symbols(true);
+        let mut sender = FecSender::new(1, DEFAULT_SYMBOL_SIZE);
         let [a, b, c]: [SocketAddr; 3] = [
             "127.0.0.1:9001".parse().unwrap(),
             "127.0.0.1:9002".parse().unwrap(),
@@ -4331,7 +4789,7 @@ mod tests {
         }
         assert!(decoded);
         // The block is decoded, and its loss is not counted yet.
-        assert!(receiver.loss.get(&peer).is_none());
+        assert!(!receiver.loss.contains_key(&peer));
         let late = datagrams
             .iter()
             .find(|datagram| symbol_id(datagram) == 1)
@@ -4389,6 +4847,516 @@ mod tests {
         assert_eq!(stats.rx_repaired_source_datagrams, 1);
         assert_eq!(stats.rx_late_source_datagrams, 0);
         assert_eq!(stats.rx_presumed_lost_source_datagrams, 1);
+    }
+
+    #[tokio::test]
+    async fn replica_response_stops_when_its_stream_index_is_reused() {
+        let cache = Arc::new(ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        }));
+        let old = cache.resolve_or_create_stream(801).await;
+        cache
+            .add_for_handle(old, 0, Bytes::from_static(b"old-0"))
+            .await
+            .unwrap();
+        cache
+            .add_for_handle(old, 1, Bytes::from_static(b"old-1"))
+            .await
+            .unwrap();
+
+        let sender_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let first_chunk_sent = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let service = {
+            let cache = Arc::clone(&cache);
+            let sender_socket = Arc::clone(&sender_socket);
+            let hook = ReplicaServiceHook {
+                first_chunk_sent: Arc::clone(&first_chunk_sent),
+                resume: Arc::clone(&resume),
+            };
+            tokio::spawn(async move {
+                let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+                let config =
+                    CacheMeshConfig::new("source", "uk", sender_socket.local_addr().unwrap());
+                serve_replica_request(
+                    &sender_socket,
+                    &cache,
+                    &mut sender,
+                    &config,
+                    receiver_addr,
+                    801,
+                    0,
+                    0,
+                    Some(&hook),
+                )
+                .await
+            })
+        };
+
+        first_chunk_sent.wait().await;
+        let current = cache.resolve_or_create_stream(802).await;
+        cache
+            .add_for_handle(current, 0, Bytes::from_static(b"new-0"))
+            .await
+            .unwrap();
+        cache
+            .add_for_handle(current, 1, Bytes::from_static(b"new-1"))
+            .await
+            .unwrap();
+        resume.wait().await;
+
+        assert_eq!(service.await.unwrap().unwrap(), 1);
+        let mut datagram = vec![0_u8; 65_536];
+        let (len, peer) = timeout(
+            Duration::from_millis(100),
+            receiver_socket.recv_from(&mut datagram),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut receiver = FecReceiver::new(Arc::new(CacheMeshFecCounters::default()));
+        let frame = receiver.push(peer, &datagram[..len]).unwrap().unwrap();
+        assert_eq!(
+            MeshFrame::decode(frame).unwrap(),
+            MeshFrame::chunk("source", 801, 0, Bytes::from_static(b"old-0"))
+        );
+        assert!(timeout(
+            Duration::from_millis(20),
+            receiver_socket.recv_from(&mut datagram)
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn fec_receiver_rejects_declared_transfer_before_allocating_decoder_state() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(1);
+        let datagrams = encoder.encode_object(&[7_u8; 128]).unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(2, 2, 64, Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9920".parse().unwrap();
+
+        assert!(matches!(
+            receiver.push(peer, &datagrams[0]),
+            Err(DatagramFecError::PayloadTooLargeForBlock {
+                actual: 128,
+                max: 64
+            })
+        ));
+        assert!(receiver.decoders.is_empty());
+        assert!(receiver.observations.is_empty());
+        assert_eq!(stats.snapshot().rx_oversized_objects, 1);
+    }
+
+    #[test]
+    fn fec_decode_error_expires_partial_decoder_state() {
+        let mut first_encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0)
+            .with_initial_block_id(7);
+        let mut conflicting_encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0)
+            .with_initial_block_id(7);
+        let first = first_encoder.encode_object(&[1_u8; 32]).unwrap();
+        let conflicting = conflicting_encoder.encode_object(&[2_u8; 40]).unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(1, 2, 1024, Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9921".parse().unwrap();
+
+        assert!(receiver.push(peer, &first[0]).unwrap().is_none());
+        assert_eq!(receiver.observations.len(), 1);
+        assert!(matches!(
+            receiver.push(peer, &conflicting[0]),
+            Err(DatagramFecError::InconsistentBlockGeometry { block_id: 7 })
+        ));
+        assert!(receiver.observations.is_empty());
+        assert_eq!(receiver.decoders[&peer].in_flight_block_count(), 0);
+        assert_eq!(stats.snapshot().rx_inflight_objects, 0);
+    }
+
+    #[test]
+    fn fec_receiver_bounds_peers_and_incomplete_objects() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(2, 3, 1024, Arc::clone(&stats));
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0);
+
+        for block in 0..10_u16 {
+            let payload = [block as u8; 32];
+            let datagrams = encoder.encode_object(&payload).unwrap();
+            let peer: SocketAddr = format!("127.0.0.1:{}", 10_000 + block).parse().unwrap();
+            assert!(receiver.push(peer, &datagrams[0]).unwrap().is_none());
+        }
+
+        assert!(receiver.decoders.len() <= 2);
+        assert!(receiver.observations.len() <= 3);
+        assert!(
+            receiver
+                .decoders
+                .values()
+                .map(DatagramFecDecoder::in_flight_block_count)
+                .sum::<usize>()
+                <= 3
+        );
+        assert!(stats.snapshot().rx_evicted_objects > 0);
+    }
+
+    /// The receiver prunes on every datagram, so the expiry queue holds no
+    /// more than the window.
+    #[test]
+    fn fec_receiver_expiry_queue_stays_within_the_datagram_window() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(1, 1, 1024, stats);
+        let peer: SocketAddr = "127.0.0.1:9930".parse().unwrap();
+        let key = (peer, 1);
+
+        for observed in 1..=FEC_OBSERVATION_DATAGRAM_WINDOW * 3 {
+            receiver.observed_datagrams = observed;
+            receiver.observations.insert(
+                key,
+                FecBlockObservation {
+                    source_symbols: 1,
+                    received_source_symbols: HashSet::new(),
+                    last_seen_datagram: observed,
+                    first_seen_us: 0,
+                    fragments: 1,
+                },
+            );
+            receiver.observation_expiries.push_back((observed, key));
+            receiver.prune_observations();
+        }
+
+        assert!(
+            receiver.observation_expiries.len() <= FEC_OBSERVATION_DATAGRAM_WINDOW as usize + 1
+        );
+        assert_eq!(receiver.observations.len(), 1);
+    }
+
+    /// A decoded block that misses a source symbol is counted as loss once
+    /// the late source has had its time, on the next datagram of any block:
+    /// the expiry queue keeps the grace of the low-latency receiver.
+    #[test]
+    fn a_missing_source_counts_as_loss_on_the_first_datagram_after_its_grace() {
+        let symbol_id = |datagram: &Vec<u8>| {
+            u32::from_be_bytes([
+                0,
+                datagram[HEADER_LEN + 1],
+                datagram[HEADER_LEN + 2],
+                datagram[HEADER_LEN + 3],
+            ])
+        };
+        let peer: SocketAddr = "127.0.0.1:9931".parse().unwrap();
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(2);
+        let repaired = encoder
+            .encode_object(b"mesh-frame-with-several-symbols")
+            .unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::new(Arc::clone(&stats));
+        for datagram in repaired.iter().filter(|datagram| symbol_id(datagram) != 1) {
+            if receiver.push(peer, datagram).unwrap().is_some() {
+                break;
+            }
+        }
+        assert_eq!(receiver.recoveries.len(), 1);
+        // Within the grace another block's datagram leaves it pending.
+        let next = encoder.encode_object(b"tiny").unwrap();
+        receiver.push(peer, &next[0]).unwrap();
+        assert_eq!(receiver.recoveries.len(), 1);
+        assert_eq!(stats.snapshot().rx_presumed_lost_source_datagrams, 0);
+
+        std::thread::sleep(LATE_SOURCE_GRACE + Duration::from_millis(30));
+        let next = encoder.encode_object(b"tiny").unwrap();
+        receiver.push(peer, &next[0]).unwrap();
+        assert!(receiver.recoveries.is_empty());
+        assert!(receiver.recovery_expiries.is_empty());
+        assert_eq!(stats.snapshot().rx_presumed_lost_source_datagrams, 1);
+        assert_eq!(receiver.loss[&peer].lost_symbols, 1);
+    }
+
+    /// An incomplete block that is dropped to make room never decoded: its
+    /// missing source symbols count as loss on the path.
+    #[test]
+    fn an_evicted_incomplete_block_counts_as_loss() {
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut receiver = FecReceiver::with_limits(4, 1, 1024, Arc::clone(&stats));
+        let peer: SocketAddr = "127.0.0.1:9932".parse().unwrap();
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(8)
+            .with_repair_symbols(0);
+        let first = encoder.encode_object(&[1_u8; 32]).unwrap();
+        let second = encoder.encode_object(&[2_u8; 32]).unwrap();
+        assert!(receiver.push(peer, &first[0]).unwrap().is_none());
+        assert!(receiver.push(peer, &second[0]).unwrap().is_none());
+        assert_eq!(stats.snapshot().rx_evicted_objects, 1);
+        let window = &receiver.loss[&peer];
+        assert_eq!(window.lost_symbols, 3);
+        assert!(window.expected_packets >= 4);
+    }
+
+    #[test]
+    fn bounded_replica_queue_drops_work_when_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let depth = AtomicU64::new(0);
+        let max_depth = AtomicU64::new(0);
+        let drops = AtomicU64::new(0);
+
+        assert!(try_enqueue(&sender, &depth, &max_depth, &drops, 1_u8));
+        assert!(!try_enqueue(&sender, &depth, &max_depth, &drops, 2_u8));
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+        assert_eq!(max_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.try_recv(), Ok(1));
+        decrement_depth(&depth);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        decrement_depth(&depth);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mesh_drops_unauthorized_datagrams_before_fec_decode() {
+        let bind_addr = loopback_addr();
+        let cache = Arc::new(ChunkCache::new(Options::default()));
+        let seen: Arc<StdMutex<usize>> = Arc::default();
+        struct Seen(Arc<StdMutex<usize>>);
+        impl CacheMeshReceiveObserver for Seen {
+            fn datagram(&self, _: SocketAddr, _: &[u8]) {
+                *lock(&self.0) += 1;
+            }
+            fn decoded(&self, _: SocketAddr, _: &[u8], _: &[u8]) {}
+        }
+        let mesh = CacheMesh::new(
+            cache,
+            CacheMeshConfig::new("closed", "uk", bind_addr)
+                .with_receive_observer(Arc::new(Seen(Arc::clone(&seen)))),
+        )
+        .start()
+        .await
+        .unwrap();
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        sender
+            .send(&attacker, mesh.local_addr(), b"unauthorized")
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if mesh.fec_stats().rx_unauthorized_datagrams > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let stats = mesh.fec_stats();
+        assert_eq!(stats.rx_wire_datagrams, 0);
+        assert_eq!(stats.rx_inflight_objects, 0);
+        // A cut-through observer never sees an unauthorized datagram.
+        assert_eq!(*lock(&seen), 0);
+        mesh.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rejected_runtime_peer_does_not_expand_the_allowlist() {
+        let bind_addr = loopback_addr();
+        let first_peer = loopback_addr();
+        let rejected_peer = loopback_addr();
+        let mesh = CacheMesh::new(
+            Arc::new(ChunkCache::new(Options::default())),
+            CacheMeshConfig::new("bounded", "uk", bind_addr).with_max_peers(1),
+        )
+        .start()
+        .await
+        .unwrap();
+
+        assert!(mesh.add_peer(first_peer).await);
+        assert!(!mesh.add_peer(rejected_peer).await);
+        assert!(mesh.shared.is_allowed(&first_peer));
+        assert!(!mesh.shared.is_allowed(&rejected_peer));
+        assert_eq!(mesh.peers().await, vec![first_peer]);
+        assert_eq!(mesh.fec_stats().peer_limit_drops, 1);
+
+        mesh.shutdown();
+    }
+
+    /// A hello can only bring authorized peers, and no more than the table
+    /// holds.
+    #[tokio::test]
+    async fn a_hello_admits_only_authorized_peers_within_the_limit() {
+        let bind_addr = loopback_addr();
+        let seed = loopback_addr();
+        let [authorized, second, unknown] = [loopback_addr(), loopback_addr(), loopback_addr()];
+        let mesh = CacheMesh::new(
+            Arc::new(ChunkCache::new(Options::default())),
+            CacheMeshConfig::new("node", "uk", bind_addr)
+                .with_peer(seed)
+                .with_allowed_peers([authorized, second])
+                .with_max_peers(2),
+        )
+        .start()
+        .await
+        .unwrap();
+        let socket = UdpSocket::bind(seed).await.unwrap();
+        let hello = MeshFrame::hello_with_peers("seed", "uk", vec![unknown, authorized, second])
+            .encode()
+            .unwrap();
+        FecSender::new(0, DEFAULT_SYMBOL_SIZE)
+            .send(&socket, bind_addr, &hello)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while mesh.fec_stats().peer_limit_drops == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the hello was not handled");
+        let mut peers = mesh.peers().await;
+        peers.sort_unstable();
+        let mut expected = vec![seed, authorized];
+        expected.sort_unstable();
+        assert_eq!(peers, expected);
+        assert!(!mesh.shared.is_allowed(&unknown));
+        mesh.shutdown();
+    }
+
+    /// The frame limit follows the cache, so a part that fits a slot is never
+    /// refused by the mesh; a fixed 1 MiB limit refused 4K parts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_frame_limit_follows_the_cache() {
+        let options = Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            buffer_size_kb: 2_048,
+            ..Options::default()
+        };
+        let cache = ChunkCache::new(options);
+        assert_eq!(frame_bytes_for(&cache), 2_048 * 1024 + FRAME_OVERHEAD_BYTES);
+        assert_eq!(
+            remote_slots_for(&cache),
+            4 + REMOTE_SLOT_PRUNE_INTERVAL.as_millis() as usize * 4
+        );
+
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(options));
+        let edge_cache = Arc::new(ChunkCache::new(options));
+        // Large symbols, as for 4K video: the part is about 100 of them, which
+        // an unoptimised build encodes in good time.
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_peer(edge_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_max_symbol_size(16_000)
+                .with_announce_interval(Duration::from_millis(50))
+                .without_gso(),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_socket_buffer_bytes(8 << 20)
+                .with_announce_interval(Duration::from_millis(50)),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        let part = Bytes::from(
+            (0..1_536 * 1024)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        distributor_cache
+            .add_for_stream_id(7, 0, part.clone())
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 0).await;
+        assert_eq!(edge_cache.get_for_stream_id(7, 0).await.unwrap().0, part);
+        assert_eq!(edge.fec_stats().rx_oversized_objects, 0);
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_frame_beyond_the_limit_is_not_sent() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stats = Arc::new(CacheMeshFecCounters::default());
+        let mut sender = FecSender::with_policy_and_initial_block_id(
+            1,
+            0.0,
+            1,
+            DEFAULT_SYMBOL_SIZE,
+            0,
+            Arc::clone(&stats),
+        )
+        .with_max_frame_bytes(100);
+        let peer = socket.local_addr().unwrap();
+        assert!(matches!(
+            sender.send(&socket, peer, &[0_u8; 101]).await,
+            Err(MeshError::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            sender.prepare_object(peer, (7, 0), 1, &[&[0_u8; 60], &[0_u8; 41]]),
+            Err(MeshError::InvalidFrame(_))
+        ));
+        let stats = stats.snapshot();
+        assert_eq!(stats.tx_errors, 2);
+        assert_eq!(stats.tx_objects, 0);
+        sender.send(&socket, peer, &[0_u8; 100]).await.unwrap();
+    }
+
+    /// A full set of remote slots is pruned to what the cache retains; it
+    /// never drops a slot that the cache holds, which would be sent back.
+    #[tokio::test]
+    async fn a_full_remote_slot_set_is_pruned_and_keeps_retained_slots() {
+        let cache = ChunkCache::new(demand_options());
+        let counters = CacheMeshFecCounters::default();
+        let stream = cache.resolve_or_create_stream(7).await;
+        let mut remote_slots = HashSet::new();
+        for slot_id in 0..100_usize {
+            cache
+                .add_for_handle(stream, slot_id, Bytes::from_static(b"part"))
+                .await
+                .unwrap();
+            assert!(mark_remote_slot(
+                &cache,
+                &mut remote_slots,
+                (stream, slot_id),
+                80,
+                &counters,
+            ));
+        }
+        // The set reached 80 and was pruned to the 64 retained slots.
+        assert!(remote_slots.len() <= 80);
+        assert!((36..100).all(|slot_id| remote_slots.contains(&(stream, slot_id))));
+        assert_eq!(counters.snapshot().remote_slot_evictions, 0);
+        // A limit below what the cache retains cannot be kept without
+        // dropping a live slot: the part is left unmarked and counted.
+        let mut small = HashSet::new();
+        for slot_id in 36..100_usize {
+            mark_remote_slot(&cache, &mut small, (stream, slot_id), 8, &counters);
+        }
+        assert_eq!(small.len(), 8);
+        assert_eq!(counters.snapshot().remote_slot_evictions, 56);
     }
 
     #[test]
@@ -4471,11 +5439,16 @@ mod tests {
         .unwrap_or_else(|_| panic!("stream {stream_id} slot {slot_id} did not arrive"));
     }
 
-    /// Wait until the child has learned the role and region of its parents.
+    /// Wait until the child has learned the role and region of its parents,
+    /// and its own first hello has gone out. A parent that keeps to its
+    /// region refuses a child's subscription until it has the child's hello;
+    /// sent after it on the same socket, the subscription arrives after it.
     async fn wait_for_hello(handle: &CacheMeshHandle, parents: usize) {
         timeout(Duration::from_secs(3), async {
             loop {
-                if handle.peer_roles.read().await.len() >= parents {
+                if handle.shared.peer_roles.read().await.len() >= parents
+                    && handle.fec_stats().tx_source_datagrams > 0
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4494,13 +5467,13 @@ mod tests {
             backfill_parts: 32,
             lease_ms: 5_000,
         };
-        assert_eq!(MeshFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+        assert_eq!(MeshFrame::decode(frame.encode().unwrap()).unwrap(), frame);
 
         let frame = MeshFrame::Unsubscribe {
             node_id: "edge-1".into(),
             stream_id: 2001,
         };
-        assert_eq!(MeshFrame::decode(&frame.encode().unwrap()).unwrap(), frame);
+        assert_eq!(MeshFrame::decode(frame.encode().unwrap()).unwrap(), frame);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4535,7 +5508,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
-            edge_cache.get_stream_idx(7).await.is_none(),
+            edge_cache.resolve_stream(7).is_none(),
             "a playlist without demand must not be replicated"
         );
         assert!(parent.served_subscriptions().is_empty());
@@ -4555,7 +5528,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_slot(&edge_cache, 7, 4).await;
-        assert!(edge_cache.get_stream_idx(8).await.is_none());
+        assert!(edge_cache.resolve_stream(8).is_none());
         assert_eq!(edge.subscribed_streams(), vec![7]);
         let served = parent.served_subscriptions();
         assert_eq!(served.len(), 1);
@@ -4697,17 +5670,22 @@ mod tests {
     /// the pass, so a live part never waits behind another stream's
     /// warm-up. (When the pass visits the warm-up stream first, a pass that
     /// queued everything in one batch per child sent the window first.)
+    ///
+    /// A part leaves on its publication to the children of the last tick.
+    /// With one child per tick, the parts published during the other
+    /// child's turn reach the edge on its next tick: the tick on which its
+    /// new window opens, so the pass has both.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_live_part_is_not_held_behind_a_warm_up_window() {
         let parent_addr = loopback_addr();
         let edge_addr = loopback_addr();
+        let other_addr = loopback_addr();
         let parent_cache = Arc::new(ChunkCache::new(demand_options()));
         let edge_cache = Arc::new(ChunkCache::new(demand_options()));
-        // Only the tick sends, so that the live part and the warm-up window
-        // share a pass.
+        let other_cache = Arc::new(ChunkCache::new(demand_options()));
         let mut parent_config = demand_distributor("parent", parent_addr)
-            .with_peer(edge_addr)
-            .with_sync_on_publish(false)
+            .with_peers([edge_addr, other_addr])
+            .with_max_children(1)
             .with_subscription_lease(Duration::from_secs(5));
         parent_config.sync_interval = Duration::from_millis(200);
         let parent = CacheMesh::new(Arc::clone(&parent_cache), parent_config)
@@ -4725,16 +5703,42 @@ mod tests {
         .start()
         .await
         .unwrap();
+        let other = CacheMesh::new(
+            Arc::clone(&other_cache),
+            demand_edge("other", other_addr)
+                .with_peer(parent_addr)
+                .with_subscription_lease(Duration::from_secs(5)),
+        )
+        .start()
+        .await
+        .unwrap();
         wait_for_hello(&edge, 1).await;
+        wait_for_hello(&other, 1).await;
 
-        // Stream 8 is live at the edge.
+        // Stream 8 is live at both children.
         parent_cache
             .add_for_stream_id(8, 0, Bytes::from(vec![8_u8; 100]))
             .await
             .unwrap();
-        edge.subscribe(8, 0, 1).await.unwrap();
-        wait_for_slot(&edge_cache, 8, 0).await;
-        while applied_rx.try_recv().is_ok() {}
+        // A subscription is renewed until its part comes, as a node with
+        // readers does: a loaded host can lose a datagram.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut arrived = true;
+                for (child, cache) in [(&edge, &edge_cache), (&other, &other_cache)] {
+                    if cache.get_for_stream_id(8, 0).await.is_none() {
+                        arrived = false;
+                        child.subscribe(8, 0, 1).await.unwrap();
+                    }
+                }
+                if arrived {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("stream 8 did not reach both children");
 
         // Stream 7 has forty parts that the edge has not asked for yet.
         for slot in 0..40 {
@@ -4743,27 +5747,87 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // A live part of stream 8, then a lease on stream 7 with its whole
-        // window: the next tick has both.
-        parent_cache
-            .add_for_stream_id(8, 1, Bytes::from(vec![8_u8; 100]))
-            .await
-            .unwrap();
+        while applied_rx.try_recv().is_ok() {}
+
+        // Stream 8 goes on through both children's turns, and the edge asks
+        // for the whole window of stream 7 meanwhile.
+        let published: Arc<StdMutex<HashMap<usize, u64>>> = Arc::default();
+        let publisher = {
+            let cache = Arc::clone(&parent_cache);
+            let published = Arc::clone(&published);
+            tokio::spawn(async move {
+                for slot in 1..=40_usize {
+                    lock(&published).insert(slot, unix_micros());
+                    cache
+                        .add_for_stream_id(8, slot, Bytes::from(vec![8_u8; 100]))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(250)).await;
         edge.subscribe(7, 0, 40).await.unwrap();
 
         let mut order = Vec::new();
-        while order.len() < 41 {
-            let applied = timeout(Duration::from_secs(3), applied_rx.recv())
-                .await
-                .expect("a part did not arrive")
-                .unwrap();
-            order.push((applied.stream_id, applied.slot_id));
+        timeout(Duration::from_secs(5), async {
+            while order
+                .iter()
+                .filter(|event: &&AppliedSlot| event.stream_id == 7)
+                .count()
+                < 40
+                || !order
+                    .iter()
+                    .any(|event: &AppliedSlot| (event.stream_id, event.slot_id) == (8, 40))
+            {
+                match timeout(Duration::from_millis(250), applied_rx.recv()).await {
+                    Ok(event) => order.push(event.unwrap()),
+                    // Nothing for a while: the subscription may be lost.
+                    Err(_) => {
+                        edge.subscribe(7, 0, 40).await.unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a part did not arrive");
+        publisher.await.unwrap();
+        let published = lock(&published).clone();
+
+        let window = order.iter().position(|event| event.stream_id == 7).unwrap();
+        let window_us = order[window].rx_first_us;
+        // The window went out on the edge's tick, in one go after the live
+        // parts of that tick.
+        assert!(
+            order[window..window + 40]
+                .iter()
+                .all(|event| event.stream_id == 7),
+            "{order:?}"
+        );
+        // That tick had live parts: parts published during the other child's
+        // turn, which waited for it and arrived just before the window.
+        assert!(
+            order[..window].iter().any(|event| {
+                event.stream_id == 8
+                    && window_us.saturating_sub(event.rx_first_us) < 50_000
+                    && event.rx_first_us.saturating_sub(published[&event.slot_id]) > 100_000
+            }),
+            "the window's tick carried no held live part: {order:?}"
+        );
+        // No live part that was there well before the window came after it.
+        for event in &order[window..] {
+            if event.stream_id == 8 {
+                assert!(
+                    published[&event.slot_id] + 20_000 > window_us,
+                    "part {} waited behind the window: {order:?}",
+                    event.slot_id
+                );
+            }
         }
-        assert_eq!(order[0], (8, 1), "{order:?}");
-        assert!(order[1..].iter().all(|(stream_id, _)| *stream_id == 7));
 
         parent.shutdown();
         edge.shutdown();
+        other.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4922,15 +5986,27 @@ mod tests {
     async fn remote_slots_that_the_cache_has_dropped_are_forgotten() {
         let cache = ChunkCache::new(demand_options());
         let remote_slots = RwLock::new(HashSet::new());
+        let old = cache.resolve_or_create_stream(7).await;
+        cache
+            .add_for_handle(old, 0, Bytes::from_static(b"part"))
+            .await
+            .unwrap();
+        remote_slots.write().await.insert((old, 0_usize));
+        // Stream 7 again, on another index with the same generation number.
+        cache.zero_stream_id(7);
+        let stream = cache.resolve_or_create_stream(7).await;
+        assert_ne!(stream, old);
         for slot_id in 0..400_usize {
             cache
-                .add_for_stream_id(7, slot_id, Bytes::from_static(b"part"))
+                .add_for_handle(stream, slot_id, Bytes::from_static(b"part"))
                 .await
                 .unwrap();
-            remote_slots.write().await.insert((7_u64, slot_id));
+            remote_slots.write().await.insert((stream, slot_id));
         }
         // A stream that the cache does not hold.
-        remote_slots.write().await.insert((9_u64, 3_usize));
+        let gone = cache.resolve_or_create_stream(9).await;
+        cache.release_stream_id(9).await;
+        remote_slots.write().await.insert((gone, 3_usize));
 
         forget_unretained_remote_slots(&cache, &remote_slots).await;
 
@@ -4939,7 +6015,7 @@ mod tests {
         assert_eq!(left.len(), 64);
         assert!(left
             .iter()
-            .all(|(stream_id, slot_id)| *stream_id == 7 && *slot_id >= 336));
+            .all(|(kept, slot_id)| *kept == stream && *slot_id >= 336));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5032,7 +6108,7 @@ mod tests {
 
         // The source restarts: the parent drops the stream and its sequence
         // starts again below the part that the child was last sent.
-        parent_cache.zero_stream_id(7).await;
+        parent_cache.zero_stream_id(7);
         for slot in 0..2 {
             parent_cache
                 .add_for_stream_id(7, slot, Bytes::from(vec![2_u8; 32]))
@@ -5044,7 +6120,7 @@ mod tests {
                 let restarted = edge_cache
                     .get_for_stream_id(7, 1)
                     .await
-                    .is_some_and(|(bytes, _)| bytes == Bytes::from(vec![2_u8; 32]));
+                    .is_some_and(|(bytes, _)| bytes == vec![2_u8; 32]);
                 if restarted {
                     return;
                 }
@@ -5056,6 +6132,421 @@ mod tests {
         .expect("the restarted stream did not reach the child");
 
         parent.shutdown();
+        edge.shutdown();
+    }
+
+    /// A 40-byte part tagged with its publication (`A` or `B`) and its slot:
+    /// one fitted symbol.
+    fn tagged_part(tag: u8, slot: usize) -> Bytes {
+        let mut part = vec![0_u8; 40];
+        part[0] = tag;
+        part[1..9].copy_from_slice(&(slot as u64).to_le_bytes());
+        Bytes::from(part)
+    }
+
+    /// A restarted publication reaches an edge whole, in full and in demand
+    /// replication, and nothing of the old one shows again: the edge ring
+    /// has wrapped, so every restarted part lands on a slot that holds a
+    /// newer id of the old publication (C7), and every restarted part has
+    /// the same stream, slot and length as an old one (the encoding is
+    /// keyed by the payload hash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_publication_reaches_edges_whole_and_old_parts_never_reappear() {
+        for demand in [false, true] {
+            restarted_publication_run(demand).await;
+        }
+    }
+
+    async fn restarted_publication_run(demand: bool) {
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 2,
+            max_parts_per_segment: 32,
+            buffer_size_kb: 4,
+            ..Options::default()
+        };
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(options));
+        let edge_cache = Arc::new(ChunkCache::new(options));
+        let (distributor_config, edge_config) = if demand {
+            (
+                demand_distributor("distributor", distributor_addr).with_peer(edge_addr),
+                demand_edge("edge", edge_addr).with_peer(distributor_addr),
+            )
+        } else {
+            (
+                CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                    .with_peer(edge_addr)
+                    .with_role(CacheMeshRole::Distributor)
+                    .with_sync_interval(Duration::from_millis(10))
+                    .with_announce_interval(Duration::from_millis(50)),
+                CacheMeshConfig::new("edge", "uk", edge_addr)
+                    .with_peer(distributor_addr)
+                    .with_role(CacheMeshRole::Edge)
+                    .with_announce_interval(Duration::from_millis(50)),
+            )
+        };
+        let distributor = CacheMesh::new(Arc::clone(&distributor_cache), distributor_config)
+            .start()
+            .await
+            .unwrap();
+        let edge = CacheMesh::new(Arc::clone(&edge_cache), edge_config)
+            .start()
+            .await
+            .unwrap();
+        wait_for_hello(&edge, 1).await;
+        let subscribe = || async {
+            if demand {
+                edge.subscribe(7, 0, 16).await.unwrap();
+            }
+        };
+        subscribe().await;
+
+        // Phase A: 200 parts, so the edge's ring of 64 wraps three times.
+        let init_a = Bytes::from_static(b"init-a");
+        let init_b = Bytes::from_static(b"init-b");
+        let first = distributor_cache.resolve_or_create_stream(7).await;
+        distributor_cache
+            .set_stream_initialization_for_handle(first, init_a.clone())
+            .unwrap();
+        for slot in 0..200 {
+            distributor_cache
+                .add_for_handle(first, slot, tagged_part(b'A', slot))
+                .await
+                .unwrap();
+            if slot % 50 == 49 {
+                subscribe().await;
+                wait_for_slot(&edge_cache, 7, slot).await;
+            }
+        }
+        wait_for_slot(&edge_cache, 7, 199).await;
+        let old_edge = edge_cache.resolve_stream(7).unwrap();
+        assert_eq!(edge_cache.stream_initialization(7), Some(init_a.clone()));
+
+        // A reader polls the edge throughout: once it has read a restarted
+        // part or initialization, the old one never shows again.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let edge_cache = Arc::clone(&edge_cache);
+            let stop = Arc::clone(&stop);
+            let (init_a, init_b) = (init_a.clone(), init_b.clone());
+            tokio::spawn(async move {
+                let mut restarted = [false; 50];
+                let mut restarted_init = false;
+                loop {
+                    // A last pass after the stop, which comes once every
+                    // restarted part is there.
+                    let stopping = stop.load(Ordering::Relaxed);
+                    for (slot, restarted) in restarted.iter_mut().enumerate() {
+                        if let Some((bytes, _)) = edge_cache.get_for_stream_id(7, slot).await {
+                            assert_eq!(&bytes[1..9], &(slot as u64).to_le_bytes());
+                            match bytes[0] {
+                                b'B' => *restarted = true,
+                                b'A' => assert!(!*restarted, "slot {slot} went back"),
+                                tag => panic!("tag {tag}"),
+                            }
+                        }
+                    }
+                    match edge_cache.stream_initialization(7) {
+                        Some(init) if init == init_b => restarted_init = true,
+                        Some(init) if init == init_a => {
+                            assert!(!restarted_init, "the old initialization came back")
+                        }
+                        other => assert!(other.is_none(), "{other:?}"),
+                    }
+                    if stopping {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                restarted.iter().all(|seen| *seen) && restarted_init
+            })
+        };
+
+        // The restart.
+        let before = distributor.fec_stats();
+        distributor_cache.zero_stream_id(7);
+        let second = distributor_cache.resolve_or_create_stream(7).await;
+        // Another lifetime of the stream; the generation is per index.
+        assert_ne!(second, first);
+        assert!(distributor_cache.get_for_handle(first, 199).await.is_none());
+        assert!(distributor_cache.last_for_handle(first).is_none());
+        distributor_cache
+            .set_stream_initialization_for_handle(second, init_b.clone())
+            .unwrap();
+        for slot in 0..50 {
+            distributor_cache
+                .add_for_handle(second, slot, tagged_part(b'B', slot))
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut whole = edge_cache.stream_initialization(7) == Some(init_b.clone());
+                for slot in 0..50 {
+                    whole &= edge_cache
+                        .get_for_stream_id(7, slot)
+                        .await
+                        .is_some_and(|(bytes, _)| bytes == tagged_part(b'B', slot));
+                }
+                if whole {
+                    return;
+                }
+                subscribe().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the restarted publication did not reach the edge (demand {demand})")
+        });
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.await.unwrap(), "the reader saw every restarted part");
+
+        // The wire carries no generation: the edge keeps its stream (C7).
+        assert_eq!(edge_cache.resolve_stream(7), Some(old_edge));
+        // Each restarted part was encoded anew, not taken from the encodings
+        // of the old parts with the same stream, slot and length.
+        let encoded = distributor.fec_stats().tx_objects - before.tx_objects;
+        assert!(encoded >= 50, "{encoded} objects (demand {demand})");
+        // The sync task forgets the old generation's cursors at its prune.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let cursors = lock(&distributor.shared.cursor_streams).clone();
+                if cursors.contains(&second) && !cursors.contains(&first) {
+                    return;
+                }
+                subscribe().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the cursors of the old generation were not forgotten");
+
+        distributor.shutdown();
+        edge.shutdown();
+    }
+
+    async fn next_applied(
+        applied_rx: &mut mpsc::UnboundedReceiver<AppliedSlot>,
+        slot_id: usize,
+    ) -> AppliedSlot {
+        let event = timeout(Duration::from_secs(2), applied_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("slot {slot_id} was not applied"))
+            .unwrap();
+        assert_eq!((event.stream_id, event.slot_id), (7, slot_id));
+        event
+    }
+
+    /// The readers of an edge, started before anything is published, wake
+    /// for parts that arrive over the mesh: an exact-part waiter on a stream
+    /// that the edge does not have yet, a lane notifier, and a publication
+    /// subscriber. Then a reader that holds a handle of a stream that the
+    /// edge released finds it stale and resolves the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_readers_wake_for_parts_that_arrive_over_the_mesh() {
+        let wake_bound_us = if cfg!(debug_assertions) {
+            10_000
+        } else {
+            2_000
+        };
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let raw_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_peer(edge_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_sync_interval(Duration::from_millis(10))
+                .with_announce_interval(Duration::from_millis(50)),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            CacheMeshConfig::new("edge", "uk", edge_addr)
+                .with_peer(distributor_addr)
+                .with_allowed_peers([raw_addr])
+                .with_role(CacheMeshRole::Edge)
+                .with_announce_interval(Duration::from_millis(50))
+                .with_applied_tx(applied_tx),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 1).await;
+        let playlists = crate::m3u8_cache::M3u8Cache::new(demand_options());
+
+        // 1. An exact-part waiter on a stream that the edge does not have: it
+        // is given (C6) and creates no mapping.
+        let waiter = edge_cache
+            .exact_part_waiter(7, 0)
+            .expect("a waiter for a stream that is not mapped yet");
+        assert!(edge_cache.resolve_stream(7).is_none());
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let exact = {
+            let edge_cache = Arc::clone(&edge_cache);
+            tokio::spawn(async move {
+                let mut armed_tx = Some(armed_tx);
+                loop {
+                    let notified = waiter.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if edge_cache.get_for_stream_id(7, 0).await.is_some() {
+                        break;
+                    }
+                    if let Some(armed_tx) = armed_tx.take() {
+                        let _ = armed_tx.send(());
+                    }
+                    notified.await;
+                }
+                let woke_us = unix_micros();
+                // The write time is there as soon as the part is: no await.
+                let written_us = edge_cache
+                    .written_unix_us_for_stream_id(7, 0)
+                    .expect("the write time of a part that a waiter was woken for");
+                assert!(written_us <= unix_micros());
+                woke_us
+            })
+        };
+        armed_rx.await.unwrap();
+        // 3. A publication subscriber, before the first part.
+        let moved = edge_cache.subscribe_publications();
+        let mut drained = Vec::new();
+
+        distributor_cache
+            .add_for_stream_id(7, 0, Bytes::from_static(b"part-0"))
+            .await
+            .unwrap();
+        let event = next_applied(&mut applied_rx, 0).await;
+        let woke_us = exact.await.unwrap();
+        assert!(
+            woke_us.saturating_sub(event.committed_us) < wake_bound_us,
+            "exact waiter woke {} us after the commit",
+            woke_us.saturating_sub(event.committed_us)
+        );
+        let stream = edge_cache.resolve_stream(7).unwrap();
+        drained.clear();
+        moved.drain(&mut drained);
+        assert_eq!(drained, vec![stream.index()]);
+        playlists
+            .add_part_us(7, 2_500, true, Some(event.bytes))
+            .unwrap();
+
+        // 2. The lane notifier wakes for the next part, and for a new
+        // initialization.
+        let lane = edge_cache.update_notifier(stream.index()).unwrap();
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let lane_reader = {
+            let edge_cache = Arc::clone(&edge_cache);
+            tokio::spawn(async move {
+                let mut armed_tx = Some(armed_tx);
+                loop {
+                    let notified = lane.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if edge_cache.last_for_handle(stream) == Some(1) {
+                        break;
+                    }
+                    if let Some(armed_tx) = armed_tx.take() {
+                        let _ = armed_tx.send(());
+                    }
+                    notified.await;
+                }
+                let woke_us = unix_micros();
+                loop {
+                    let notified = lane.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if edge_cache
+                        .stream_initialization_for_handle(stream)
+                        .as_deref()
+                        == Some(b"init".as_slice())
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                woke_us
+            })
+        };
+        armed_rx.await.unwrap();
+        distributor_cache
+            .add_for_stream_id(7, 1, Bytes::from_static(b"part-1"))
+            .await
+            .unwrap();
+        let event = next_applied(&mut applied_rx, 1).await;
+        distributor_cache
+            .set_stream_initialization(7, Bytes::from_static(b"init"))
+            .await
+            .unwrap();
+        let woke_us = timeout(Duration::from_secs(2), lane_reader)
+            .await
+            .expect("the lane notifier did not wake for the initialization")
+            .unwrap();
+        assert!(
+            woke_us.saturating_sub(event.committed_us) < wake_bound_us,
+            "lane reader woke {} us after the commit",
+            woke_us.saturating_sub(event.committed_us)
+        );
+        drained.clear();
+        moved.drain(&mut drained);
+        assert_eq!(drained, vec![stream.index()]);
+        playlists
+            .add_part_us(7, 2_500, false, Some(event.bytes))
+            .unwrap();
+
+        // The publication set is marked exactly when the edge's watermark
+        // advances: a part beyond a gap moves it, the part of the gap does
+        // not.
+        let raw = UdpSocket::bind(raw_addr).await.unwrap();
+        let mut raw_sender = FecSender::new(1, DEFAULT_SYMBOL_SIZE);
+        for slot in [4_u64, 3] {
+            let frame = MeshFrame::chunk("raw", 7, slot, Bytes::from(vec![slot as u8; 20]))
+                .encode()
+                .unwrap();
+            raw_sender.send(&raw, edge_addr, &frame).await.unwrap();
+            next_applied(&mut applied_rx, slot as usize).await;
+            drained.clear();
+            moved.drain(&mut drained);
+            if slot == 4 {
+                assert_eq!(drained, vec![stream.index()], "the watermark moved to 4");
+            } else {
+                assert!(drained.is_empty(), "slot 3 is below the watermark");
+            }
+        }
+        assert_eq!(edge_cache.last_for_handle(stream), Some(4));
+
+        // The edge releases the stream: a reader's handle is stale, and the
+        // next part makes a new stream that it resolves.
+        assert!(edge_cache.release_stream_id(7).await);
+        assert!(edge_cache.last_for_handle(stream).is_none());
+        assert!(edge_cache.get_for_handle(stream, 1).await.is_none());
+        distributor_cache
+            .add_for_stream_id(7, 5, Bytes::from_static(b"part-5"))
+            .await
+            .unwrap();
+        next_applied(&mut applied_rx, 5).await;
+        let renewed = edge_cache.resolve_stream(7).unwrap();
+        assert_ne!(renewed, stream);
+        assert_eq!(edge_cache.last_for_handle(renewed), Some(5));
+        assert!(edge_cache.last_for_handle(stream).is_none());
+
+        // The playlist side: a reader's notifier for a zeroed playlist stream
+        // is gone with it.
+        let playlist = playlists.resolve_stream(7).unwrap();
+        assert!(playlists.update_notifier_for_handle(playlist).is_some());
+        playlists.zero_stream_id(7);
+        assert!(playlists.update_notifier_for_handle(playlist).is_none());
+
+        distributor.shutdown();
         edge.shutdown();
     }
 
@@ -5327,16 +6818,19 @@ mod tests {
         .unwrap();
         wait_for_hello(&edge, 1).await;
         // The edge accepts parts of the playlist, and asks for parts 4 and 5.
-        lock(&edge.wanted).insert(7);
+        lock(&edge.shared.wanted).insert(7);
         let before = distributor.fec_stats().tx_objects;
         assert_eq!(edge.request_parts(7, 4, 2, 1).await.unwrap(), 1);
         wait_for_slot(&edge_cache, 7, 5).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let stream = edge_cache.get_stream_idx(7).await.unwrap();
-        assert!(edge_cache.get(stream, 4).await.is_some());
-        assert!(edge_cache.get(stream, 5).await.is_some());
+        let stream = edge_cache.resolve_stream(7).unwrap();
+        assert!(edge_cache.get_for_handle(stream, 4).await.is_some());
+        assert!(edge_cache.get_for_handle(stream, 5).await.is_some());
         for slot in [3_usize, 6, 9] {
-            assert!(edge_cache.get(stream, slot).await.is_none(), "slot {slot}");
+            assert!(
+                edge_cache.get_for_handle(stream, slot).await.is_none(),
+                "slot {slot}"
+            );
         }
         // Two parts went out, beside a few hellos: not the six parts from
         // the hole to the newest part.
@@ -5474,16 +6968,13 @@ mod tests {
     }
 
     #[test]
-    fn sync_on_publish_is_on_by_default_and_can_be_turned_off() {
+    fn a_config_with_a_send_observer_stays_printable() {
         let addr: SocketAddr = "127.0.0.1:9915".parse().unwrap();
         let config = CacheMeshConfig::new("node", "uk", addr);
-        assert!(config.sync_on_publish);
         assert!(config.send_observer.0.is_none());
         let config = config
-            .with_sync_on_publish(false)
             .with_sync_interval(Duration::from_millis(50))
             .with_send_observer(Arc::new(|_, _, _, _| {}));
-        assert!(!config.sync_on_publish);
         assert_eq!(config.sync_interval, Duration::from_millis(50));
         assert!(config.send_observer.0.is_some());
         // The configuration stays printable with an observer in it.
@@ -5498,8 +6989,6 @@ mod tests {
     /// commit to its application, the applied slots, and what the send
     /// observer saw.
     async fn commit_to_apply(
-        sync_on_publish: bool,
-        batched_send: bool,
         parts: usize,
     ) -> (
         Vec<Duration>,
@@ -5527,8 +7016,6 @@ mod tests {
                 .with_role(CacheMeshRole::Distributor)
                 .with_announce_interval(Duration::from_millis(100))
                 .with_sync_interval(Duration::from_millis(50))
-                .with_sync_on_publish(sync_on_publish)
-                .with_batched_send(batched_send)
                 .with_send_observer(observer),
         )
         .start()
@@ -5590,9 +7077,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_committed_part_leaves_at_once_when_sync_on_publish() {
-        let (mut latencies, applied, sent, distributor_addr, edge_addr) =
-            commit_to_apply(true, true, 19).await;
+    async fn a_committed_part_leaves_at_once() {
+        let (mut latencies, applied, sent, distributor_addr, edge_addr) = commit_to_apply(19).await;
         latencies.sort_unstable();
         let median = latencies[latencies.len() / 2];
         assert!(
@@ -5634,31 +7120,24 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_committed_part_waits_for_the_tick_without_sync_on_publish() {
-        let (latencies, applied, _sent, distributor_addr, _edge_addr) =
-            commit_to_apply(false, true, 3).await;
-        // Each part is committed just after a tick delivered the one before,
-        // so it waits most of the next 50 ms interval.
-        assert!(
-            latencies
-                .iter()
-                .all(|latency| *latency >= Duration::from_millis(20)),
-            "a part left before the tick: {latencies:?}"
-        );
-        assert!(applied.iter().all(|event| event.parent == distributor_addr));
-    }
-    #[test]
-    fn seen_watermarks_tell_a_pass_which_streams_moved() {
+    #[tokio::test]
+    async fn seen_watermarks_tell_a_pass_which_streams_moved() {
+        let cache = ChunkCache::new(demand_options());
+        let seven = cache.resolve_or_create_stream(7).await;
+        let nine = cache.resolve_or_create_stream(9).await;
         let mut seen = SeenWatermarks::default();
-        assert_eq!(seen.record(7, 0, Some(3)), None);
-        assert_eq!(seen.record(7, 0, Some(3)), Some(3), "unchanged");
-        assert_eq!(seen.record(7, 0, Some(5)), Some(3), "advanced");
-        assert_eq!(seen.record(9, 1, None), None);
-        // The same slot index holding another stream is another stream.
-        assert_eq!(seen.record(8, 0, Some(1)), None);
-        seen.retain_streams(&[(8, 0)]);
-        assert_eq!(seen.record(7, 0, Some(5)), None, "forgotten");
+        assert_eq!(seen.record(seven, Some(3)), None);
+        assert_eq!(seen.record(seven, Some(3)), Some(3), "unchanged");
+        assert_eq!(seen.record(seven, Some(5)), Some(3), "advanced");
+        assert_eq!(seen.record(nine, None), None);
+        // The same stream in another lifetime is another stream, even with
+        // the same generation number on another index.
+        cache.zero_stream_id(7);
+        let restarted = cache.resolve_or_create_stream(7).await;
+        assert_eq!(seen.record(restarted, Some(1)), None);
+        seen.retain_streams(&[restarted]);
+        assert_eq!(seen.record(seven, Some(5)), None, "forgotten");
+        assert_eq!(seen.record(restarted, Some(2)), Some(1), "kept");
     }
 
     #[test]
@@ -5674,7 +7153,8 @@ mod tests {
     /// already marked as remote. The check runs inside the wake-up, so it
     /// sees exactly what the sync task would see if it ran at once.
     struct RemoteAtWake {
-        remote_slots: Arc<RwLock<HashSet<(u64, usize)>>>,
+        shared: Arc<MeshShared>,
+        /// Stream and slot, in whatever lifetime the receiver gave it.
         slot: (u64, usize),
         // 0: not woken, 1: marked, 2: not marked, 3: set locked.
         seen: std::sync::atomic::AtomicU8,
@@ -5686,8 +7166,14 @@ mod tests {
         }
 
         fn wake_by_ref(self: &Arc<Self>) {
-            let seen = match self.remote_slots.try_read() {
-                Ok(remote_slots) if remote_slots.contains(&self.slot) => 1,
+            let seen = match self.shared.remote_slots.try_read() {
+                Ok(remote_slots)
+                    if remote_slots
+                        .iter()
+                        .any(|(stream, slot_id)| (stream.stream_id(), *slot_id) == self.slot) =>
+                {
+                    1
+                }
                 Ok(_) => 2,
                 // The receive task holds the set until the write is done, so
                 // the sync task waits for it and then sees the slot.
@@ -5733,7 +7219,7 @@ mod tests {
         wait_for_hello(&receiver, 1).await;
 
         let probe = Arc::new(RemoteAtWake {
-            remote_slots: Arc::clone(&receiver.remote_slots),
+            shared: Arc::clone(&receiver.shared),
             slot: (7, 0),
             seen: std::sync::atomic::AtomicU8::new(0),
         });
@@ -5763,7 +7249,13 @@ mod tests {
             2,
             "the publication woke the sender before the slot was marked remote"
         );
-        assert!(receiver.remote_slots.read().await.contains(&(7, 0)));
+        let stream = receiver_cache.resolve_stream(7).unwrap();
+        assert!(receiver
+            .shared
+            .remote_slots
+            .read()
+            .await
+            .contains(&(stream, 0)));
         sender.shutdown();
         receiver.shutdown();
     }
@@ -5782,10 +7274,11 @@ mod tests {
             })
         };
         // The distributor has no child yet: it learns of the edge from its
-        // hello, after these parts are published.
+        // hello, after these parts are published. The edge is authorized.
         let distributor = CacheMesh::new(
             Arc::clone(&distributor_cache),
             CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_allowed_peers([edge_addr])
                 .with_role(CacheMeshRole::Distributor)
                 .with_announce_interval(Duration::from_millis(20))
                 .with_sync_interval(Duration::from_millis(10))
@@ -5855,35 +7348,11 @@ mod tests {
         edge.shutdown();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_committed_part_leaves_at_once_without_batched_send() {
-        let (mut latencies, applied, sent, distributor_addr, edge_addr) =
-            commit_to_apply(true, false, 9).await;
-        latencies.sort_unstable();
-        assert!(
-            latencies[latencies.len() / 2] < Duration::from_millis(5),
-            "{latencies:?}"
-        );
-        let sent = lock(&sent).clone();
-        for event in &applied {
-            assert_eq!(event.parent, distributor_addr);
-            let &(_, _, child, sent_us) = sent
-                .iter()
-                .find(|(_, slot_id, _, _)| *slot_id == event.slot_id as u64)
-                .expect("the send observer saw the part");
-            assert_eq!(child, edge_addr);
-            assert!(sent_us <= event.rx_first_us);
-        }
-    }
-
     #[test]
-    fn batched_send_and_gso_are_on_by_default_and_can_be_turned_off() {
+    fn generic_segmentation_offload_is_on_by_default() {
         let config = CacheMeshConfig::new("node", "uk", "127.0.0.1:9916".parse().unwrap());
-        assert!(config.batched_send);
         assert!(config.gso);
-        let config = config.with_batched_send(false).with_gso(false);
-        assert!(!config.batched_send);
-        assert!(!config.gso);
+        assert!(!config.without_gso().gso);
     }
 
     fn percentile(sorted: &[u64], fraction: f64) -> u64 {
@@ -5957,16 +7426,53 @@ mod tests {
         Sockets,
     }
 
+    /// What else runs during a throughput run.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Load {
+        /// Nothing: the run measures the send path alone.
+        None,
+        /// The caches are in use as in a product: the distributor churns
+        /// other streams through its lanes, and each edge has readers that
+        /// poll, a reader that blocks on each part, and a playlist fed from
+        /// the parts it applies with readers of its own. The edges replicate
+        /// on demand, so the churned streams stay at the distributor.
+        CachesInUse,
+    }
+
+    /// A part of a loaded run: its slot and the generation of its stream in
+    /// the first 16 bytes.
+    fn load_part(slot: usize, generation: u64, part_bytes: usize) -> Bytes {
+        let mut part = vec![7_u8; part_bytes.max(16)];
+        part[..8].copy_from_slice(&(slot as u64).to_le_bytes());
+        part[8..16].copy_from_slice(&generation.to_le_bytes());
+        Bytes::from(part)
+    }
+
+    /// What the readers of a loaded run saw.
+    #[derive(Default)]
+    struct LoadChecks {
+        polled: std::sync::atomic::AtomicU64,
+        mismatches: std::sync::atomic::AtomicU64,
+        /// Parts that each edge's blocking reader read, in order.
+        blocking_reads: Vec<std::sync::atomic::AtomicU64>,
+        /// Microseconds from each part's commit at an edge to the wake of
+        /// its blocking reader.
+        blocking_wakes: StdMutex<Vec<u64>>,
+        playlist_errors: std::sync::atomic::AtomicU64,
+        playlist_reads: std::sync::atomic::AtomicU64,
+    }
+
     /// A distributor alone on one core (a one-thread runtime on its own OS
     /// thread) sends to two children, while a publisher thread commits
     /// `rate` parts of `part_bytes` a second for `seconds` at its cache, each
     /// at its own deadline. Returns, sorted, the microseconds from each
     /// part's commit to the arrival of its first datagram at each child, and
     /// from the commit to the send observer's time; and the parts that a
-    /// child never received.
+    /// child never received. With [`Load::CachesInUse`] it also checks what
+    /// the readers saw.
     fn publish_to_two_children(
         children: Children,
-        batched_send: bool,
+        load: Load,
         rate: u64,
         seconds: u64,
         part_bytes: usize,
@@ -5974,17 +7480,39 @@ mod tests {
         // One run at a time: they measure time, and each takes cores.
         static RUNS: StdMutex<()> = StdMutex::new(());
         let _run = lock(&RUNS);
+        let loaded = load == Load::CachesInUse;
+        assert!(!loaded || children == Children::MeshEdges);
         let parts = (rate * seconds) as usize;
         let sends: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::default();
         let options = Options {
-            num_playlists: 2,
+            // Lanes for the churned streams beside stream 7.
+            num_playlists: if loaded { 8 } else { 2 },
             max_segments: 1,
             max_parts_per_segment: parts + 64,
             ..Options::default()
         };
+        // An edge's ring wraps in about a second at 4,000 parts a second.
+        let edge_options = if loaded {
+            Options {
+                num_playlists: 8,
+                max_segments: 2,
+                max_parts_per_segment: 2_048,
+                buffer_size_kb: 64,
+                ..Options::default()
+            }
+        } else {
+            options
+        };
+        let lease = Duration::from_secs(seconds + 10);
         let distributor_addr = loopback_addr();
         let child_addrs = [loopback_addr(), loopback_addr()];
         let distributor_cache = Arc::new(ChunkCache::new(options));
+        let checks = Arc::new(LoadChecks {
+            blocking_reads: (0..2)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            ..LoadChecks::default()
+        });
 
         // The children: each one's arrivals by slot.
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -5996,6 +7524,8 @@ mod tests {
         let mut arrivals: Vec<Arrivals> = Vec::new();
         let mut threads = Vec::new();
         let mut edges = Vec::new();
+        let mut edge_caches = Vec::new();
+        let mut playlists = Vec::new();
         for (index, addr) in child_addrs.into_iter().enumerate() {
             if children == Children::Sockets {
                 let (child_arrivals, thread) = raw_child(addr, Arc::clone(&stop));
@@ -6005,36 +7535,73 @@ mod tests {
             }
             let child_arrivals: Arrivals = Arc::default();
             arrivals.push(Arc::clone(&child_arrivals));
+            let edge_cache = Arc::new(ChunkCache::new(edge_options));
+            let playlist = Arc::new(crate::m3u8_cache::M3u8Cache::new(Options::default()));
             let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<AppliedSlot>();
-            runtime.spawn(async move {
-                while let Some(event) = applied_rx.recv().await {
-                    lock(&child_arrivals)
-                        .entry(event.slot_id)
-                        .or_insert(event.rx_first_us);
-                }
-            });
+            let commits: Arc<StdMutex<HashMap<usize, u64>>> = Arc::default();
+            {
+                let playlist = Arc::clone(&playlist);
+                let checks = Arc::clone(&checks);
+                let commits = Arc::clone(&commits);
+                runtime.spawn(async move {
+                    while let Some(event) = applied_rx.recv().await {
+                        lock(&child_arrivals)
+                            .entry(event.slot_id)
+                            .or_insert(event.rx_first_us);
+                        if loaded {
+                            lock(&commits).insert(event.slot_id, event.committed_us);
+                            let independent = event.slot_id % 400 == 0;
+                            if playlist
+                                .add_part_us(7, 2_500, independent, Some(event.bytes))
+                                .is_err()
+                            {
+                                checks.playlist_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+            let mut config = CacheMeshConfig::new(format!("edge-{index}"), "uk", addr)
+                .with_peer(distributor_addr)
+                .with_role(CacheMeshRole::Edge)
+                .with_socket_buffer_bytes(4 << 20)
+                .with_announce_interval(Duration::from_millis(100))
+                .with_applied_tx(applied_tx);
+            if loaded {
+                config = config
+                    .with_replication(ReplicationMode::Demand)
+                    .with_subscription_lease(lease);
+            }
             edges.push(runtime.block_on(async {
-                CacheMesh::new(
-                    Arc::new(ChunkCache::new(options)),
-                    CacheMeshConfig::new(format!("edge-{index}"), "uk", addr)
-                        .with_peer(distributor_addr)
-                        .with_role(CacheMeshRole::Edge)
-                        .with_socket_buffer_bytes(4 << 20)
-                        .with_announce_interval(Duration::from_millis(100))
-                        .with_applied_tx(applied_tx),
-                )
-                .start()
-                .await
-                .unwrap()
+                CacheMesh::new(Arc::clone(&edge_cache), config)
+                    .start()
+                    .await
+                    .unwrap()
             }));
+            if loaded {
+                threads.extend(edge_readers(
+                    index,
+                    &edge_cache,
+                    &playlist,
+                    &commits,
+                    &checks,
+                    &stop,
+                    parts,
+                ));
+            }
+            edge_caches.push(edge_cache);
+            playlists.push(playlist);
         }
 
         // The distributor.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (distributor_applied_tx, mut distributor_applied_rx) = mpsc::unbounded_channel();
+        let distributor_stats: Arc<StdMutex<Option<CacheMeshFecStats>>> = Arc::default();
         let distributor = {
             let cache = Arc::clone(&distributor_cache);
             let sends = Arc::clone(&sends);
+            let distributor_stats = Arc::clone(&distributor_stats);
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -6042,23 +7609,24 @@ mod tests {
                     .unwrap();
                 let cpu_start = thread_cpu_us();
                 runtime.block_on(async move {
-                    let mesh = CacheMesh::new(
-                        cache,
-                        CacheMeshConfig::new("distributor", "uk", distributor_addr)
-                            .with_peers(child_addrs)
-                            .with_role(CacheMeshRole::Distributor)
-                            .with_socket_buffer_bytes(4 << 20)
-                            .with_announce_interval(Duration::from_millis(100))
-                            .with_batched_send(batched_send)
-                            .with_send_observer(Arc::new(move |_, slot_id, _, sent_us| {
-                                lock(&sends).push((slot_id, sent_us));
-                            })),
-                    )
-                    .start()
-                    .await
-                    .unwrap();
+                    let mut config = CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                        .with_peers(child_addrs)
+                        .with_role(CacheMeshRole::Distributor)
+                        .with_socket_buffer_bytes(4 << 20)
+                        .with_announce_interval(Duration::from_millis(100))
+                        .with_applied_tx(distributor_applied_tx)
+                        .with_send_observer(Arc::new(move |_, slot_id, _, sent_us| {
+                            lock(&sends).push((slot_id, sent_us));
+                        }));
+                    if loaded {
+                        config = config
+                            .with_replication(ReplicationMode::Demand)
+                            .with_subscription_lease(lease);
+                    }
+                    let mesh = CacheMesh::new(cache, config).start().await.unwrap();
                     ready_tx.send(()).unwrap();
                     let _ = stop_rx.await;
+                    *lock(&distributor_stats) = Some(mesh.fec_stats());
                     mesh.shutdown();
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 });
@@ -6066,13 +7634,22 @@ mod tests {
             })
         };
         ready_rx.recv().unwrap();
-        runtime.block_on(async {
+        let stream = runtime.block_on(async {
             for edge in &edges {
                 wait_for_hello(edge, 1).await;
+                if loaded {
+                    edge.subscribe(7, 0, 1).await.unwrap();
+                }
             }
             // Slot 0 lines the run up: both children receive parts.
+            let stream = distributor_cache.resolve_or_create_stream(7).await;
+            let part = if loaded {
+                load_part(0, stream.generation(), part_bytes)
+            } else {
+                Bytes::from(vec![0; part_bytes])
+            };
             distributor_cache
-                .add_for_stream_id(7, 0, Bytes::from(vec![0; part_bytes]))
+                .add_for_handle(stream, 0, part)
                 .await
                 .unwrap();
             timeout(Duration::from_secs(3), async {
@@ -6085,6 +7662,34 @@ mod tests {
             })
             .await
             .expect("the children did not receive the first part");
+            stream
+        });
+
+        // Streams that come and go at the distributor, a thousand a second:
+        // with the free list they never take stream 7's lane.
+        let churn = loaded.then(|| {
+            let cache = Arc::clone(&distributor_cache);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let mut churned = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let stream_id = 1_000 + churned;
+                    runtime.block_on(async {
+                        let handle = cache.resolve_or_create_stream(stream_id).await;
+                        cache
+                            .add_for_handle(handle, 0, Bytes::from_static(b"churn"))
+                            .await
+                            .unwrap();
+                        assert!(cache.release_stream_id(stream_id).await);
+                    });
+                    churned += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                churned
+            })
         });
 
         // The publisher.
@@ -6098,7 +7703,7 @@ mod tests {
                 let payload = Bytes::from(vec![7_u8; part_bytes]);
                 let mut published = vec![0_u64; parts + 1];
                 let start = std::time::Instant::now();
-                for slot in 1..=parts {
+                for (slot, published_us) in published.iter_mut().enumerate().skip(1) {
                     let deadline = start + period * slot as u32;
                     let now = std::time::Instant::now();
                     if deadline > now + Duration::from_micros(200) {
@@ -6107,10 +7712,19 @@ mod tests {
                     while std::time::Instant::now() < deadline {
                         std::hint::spin_loop();
                     }
-                    published[slot] = unix_micros();
-                    runtime
-                        .block_on(cache.add_for_stream_id(7, slot, payload.clone()))
-                        .unwrap();
+                    if loaded {
+                        let part = load_part(slot, stream.generation(), part_bytes);
+                        *published_us = unix_micros();
+                        runtime
+                            .block_on(cache.add_for_handle(stream, slot, part))
+                            .unwrap();
+                    } else {
+                        // As a product that names the stream on each write.
+                        *published_us = unix_micros();
+                        runtime
+                            .block_on(cache.add_for_stream_id(7, slot, payload.clone()))
+                            .unwrap();
+                    }
                 }
                 published
             })
@@ -6124,30 +7738,86 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
+        if loaded {
+            // The blocking readers have read up to the last part.
+            while std::time::Instant::now() < deadline
+                && !checks
+                    .blocking_reads
+                    .iter()
+                    .all(|reads| reads.load(Ordering::Relaxed) as usize >= parts)
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         stop.store(true, Ordering::Relaxed);
         let _ = stop_tx.send(());
         let cpu_us = distributor.join().unwrap();
         eprintln!(
-            "distributor thread CPU {:.1} us per part ({} parts, batched {batched_send})",
+            "distributor thread CPU {:.1} us per part ({} parts)",
             cpu_us as f64 / parts as f64,
             parts
         );
         for thread in threads {
             thread.join().unwrap();
         }
+        if let Some(churn) = churn {
+            let churned = churn.join().unwrap();
+            eprintln!("{churned} streams churned through the distributor's lanes");
+            assert!(churned > 0);
+            assert_eq!(distributor_cache.resolve_stream(7), Some(stream));
+        }
         runtime.block_on(async {
             for edge in &edges {
+                if loaded {
+                    let stats = edge.fec_stats();
+                    assert_eq!(stats.rx_unauthorized_datagrams, 0, "{stats:?}");
+                }
                 edge.shutdown();
             }
         });
+        if loaded {
+            // The edges sent nothing back to the distributor.
+            assert!(distributor_applied_rx.try_recv().is_err());
+            let stats = lock(&distributor_stats).expect("the distributor's stats");
+            assert_eq!(stats.rx_unauthorized_datagrams, 0, "{stats:?}");
+            let polled = checks.polled.load(Ordering::Relaxed);
+            assert!(polled > 0);
+            assert_eq!(
+                checks.mismatches.load(Ordering::Relaxed),
+                0,
+                "a reader read a part that is not the one it asked for"
+            );
+            for (edge, reads) in checks.blocking_reads.iter().enumerate() {
+                assert_eq!(
+                    reads.load(Ordering::Relaxed) as usize,
+                    parts,
+                    "the blocking reader of edge {edge} missed parts"
+                );
+            }
+            let mut wakes = lock(&checks.blocking_wakes).clone();
+            wakes.sort_unstable();
+            eprintln!(
+                "{polled} polled reads; blocking reader commit->wake p50 {} us, p99 {} us; {} playlist reads",
+                percentile(&wakes, 0.5),
+                percentile(&wakes, 0.99),
+                checks.playlist_reads.load(Ordering::Relaxed)
+            );
+            assert_eq!(checks.playlist_errors.load(Ordering::Relaxed), 0);
+            assert!(checks.playlist_reads.load(Ordering::Relaxed) > 0);
+            for (edge_cache, playlist) in edge_caches.iter().zip(&playlists) {
+                let edge_stream = edge_cache.resolve_stream(7).unwrap();
+                assert_eq!(edge_cache.last_for_handle(edge_stream), Some(parts));
+                assert!(playlist.last(7).unwrap().is_some());
+            }
+        }
 
         let mut latencies = Vec::with_capacity(2 * parts);
         let mut missing = 0;
         for arrivals in &arrivals {
             let arrivals = lock(arrivals);
-            for slot in 1..=parts {
+            for (slot, published_us) in published.iter().enumerate().skip(1) {
                 match arrivals.get(&slot) {
-                    Some(at) => latencies.push(at.saturating_sub(published[slot])),
+                    Some(at) => latencies.push(at.saturating_sub(*published_us)),
                     None => missing += 1,
                 }
             }
@@ -6160,6 +7830,129 @@ mod tests {
             .collect::<Vec<_>>();
         sent.sort_unstable();
         (latencies, sent, missing)
+    }
+
+    /// The readers of one edge in a loaded run, each on its own thread:
+    /// eight that poll the newest part, one that blocks on each part in
+    /// turn, and two that read the playlist.
+    fn edge_readers(
+        edge: usize,
+        cache: &Arc<ChunkCache>,
+        playlist: &Arc<crate::m3u8_cache::M3u8Cache>,
+        commits: &Arc<StdMutex<HashMap<usize, u64>>>,
+        checks: &Arc<LoadChecks>,
+        stop: &Arc<std::sync::atomic::AtomicBool>,
+        parts: usize,
+    ) -> Vec<std::thread::JoinHandle<()>> {
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(cache);
+            let checks = Arc::clone(checks);
+            let stop = Arc::clone(stop);
+            threads.push(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let mut generation = None;
+                runtime.block_on(async {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_micros(200));
+                        let Some(stream) = cache.resolve_stream(7) else {
+                            continue;
+                        };
+                        let Some(last) = cache.last_for_handle(stream) else {
+                            continue;
+                        };
+                        let Some((part, _)) = cache.get_for_handle(stream, last).await else {
+                            continue;
+                        };
+                        checks.polled.fetch_add(1, Ordering::Relaxed);
+                        let slot = u64::from_le_bytes(part[..8].try_into().unwrap());
+                        let tag = u64::from_le_bytes(part[8..16].try_into().unwrap());
+                        let first = *generation.get_or_insert(tag);
+                        if slot != last as u64 || tag != first {
+                            checks.mismatches.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }));
+        }
+        {
+            let cache = Arc::clone(cache);
+            let checks = Arc::clone(checks);
+            let stop = Arc::clone(stop);
+            let commits = Arc::clone(commits);
+            threads.push(std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut next = 1;
+                    while next <= parts && !stop.load(Ordering::Relaxed) {
+                        let waiter = cache
+                            .exact_part_waiter(7, next)
+                            .expect("an exact-part waiter");
+                        let notified = waiter.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        let read = cache.get_for_stream_id(7, next).await;
+                        let Some((part, _)) = read else {
+                            // Woken by the part, or polled again in a while
+                            // so that a stop is seen.
+                            let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+                            if cache.get_for_stream_id(7, next).await.is_none() {
+                                continue;
+                            }
+                            let woke_us = unix_micros();
+                            if let Some(committed_us) = lock(&commits).get(&next).copied() {
+                                lock(&checks.blocking_wakes)
+                                    .push(woke_us.saturating_sub(committed_us));
+                            }
+                            checks.blocking_reads[edge].fetch_add(1, Ordering::Relaxed);
+                            next += 1;
+                            continue;
+                        };
+                        if u64::from_le_bytes(part[..8].try_into().unwrap()) != next as u64 {
+                            checks.mismatches.fetch_add(1, Ordering::Relaxed);
+                        }
+                        checks.blocking_reads[edge].fetch_add(1, Ordering::Relaxed);
+                        next += 1;
+                    }
+                });
+            }));
+        }
+        for delta in [false, true] {
+            let playlist = Arc::clone(playlist);
+            let checks = Arc::clone(checks);
+            let stop = Arc::clone(stop);
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_micros(200));
+                    let Some(stream) = playlist.resolve_stream(7) else {
+                        continue;
+                    };
+                    let read = || {
+                        if delta {
+                            playlist.last_delta_for_handle(stream)
+                        } else {
+                            playlist.last_for_handle(stream)
+                        }
+                    };
+                    let before = playlist.version_for_handle(stream);
+                    let (Ok(Some((first, _))), Ok(Some((second, _)))) = (read(), read()) else {
+                        continue;
+                    };
+                    let after = playlist.version_for_handle(stream);
+                    checks.playlist_reads.fetch_add(2, Ordering::Relaxed);
+                    // Two reads of one version share one rendering.
+                    if before.is_some() && before == after && first.as_ptr() != second.as_ptr() {
+                        checks.mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        threads
     }
 
     fn report(label: &str, latencies: &[u64], sent: &[u64], missing: usize) -> (u64, u64) {
@@ -6192,8 +7985,8 @@ mod tests {
     #[test]
     fn a_distributor_on_one_core_sends_four_thousand_parts_a_second() {
         let (latencies, sent, missing) =
-            publish_to_two_children(Children::Sockets, true, 4_000, 2, 72);
-        let (_, p99) = report("batched, socket children", &latencies, &sent, missing);
+            publish_to_two_children(Children::Sockets, Load::None, 4_000, 2, 72);
+        let (_, p99) = report("socket children", &latencies, &sent, missing);
         assert_eq!(missing, 0, "parts did not arrive");
         assert!(p99 < THROUGHPUT_P99_US, "p99 {p99} us");
     }
@@ -6209,40 +8002,34 @@ mod tests {
     )]
     fn a_distributor_on_one_core_keeps_two_edges_at_four_thousand_parts_a_second() {
         let (latencies, sent, missing) =
-            publish_to_two_children(Children::MeshEdges, true, 4_000, 2, 72);
-        let (_, p99) = report("batched, mesh edges", &latencies, &sent, missing);
+            publish_to_two_children(Children::MeshEdges, Load::None, 4_000, 2, 72);
+        let (_, p99) = report("mesh edges", &latencies, &sent, missing);
         assert_eq!(missing, 0, "parts did not arrive");
         assert!(p99 < THROUGHPUT_P99_US, "p99 {p99} us");
     }
 
-    /// Both runs with `with_batched_send(false)`: one awaited send per
-    /// datagram, and every other change of the send path kept (the kept
-    /// encoding plan, the one-symbol repair table, fitted symbols, the
-    /// publication set). Reported, not judged. On the dev box (release
-    /// build, 2 x 4,000 parts/s) both meet the 2 ms bound with the same
-    /// latency, p99 about 100 us to sockets and 180 us to edges; batching
-    /// costs the distributor 24 to 27 us of CPU per part instead of 29 to
-    /// 31 (two runs, 2026-11-21, a busy host). The
-    /// latency fix of the 4,000 parts/s run is the encoding work: the code
-    /// before it (a225609) had a p99 of about 2 s at this rate. What
-    /// batching changes is the kernel calls of a pass, which
-    /// `a_batched_pass_makes_one_call_for_many_datagrams` checks.
+    /// Two mesh edges at 4,000 parts a second as a product runs them:
+    /// streams come and go through the distributor's lanes, and each edge's
+    /// cache has readers that poll, a reader that blocks on every part, and
+    /// a playlist with readers. Every part arrives, 99 in 100 within the
+    /// bound, every reader reads the part it asked for, and nothing goes
+    /// back to the distributor. The receive path of an unoptimised build
+    /// takes about 1,000 datagrams a second (see above), so there the run
+    /// is at 250 parts a second.
     #[test]
-    #[ignore = "comparison run: cargo test --release -- --ignored unbatched"]
-    fn unbatched_four_thousand_parts_a_second_for_comparison() {
+    fn a_distributor_and_its_edges_keep_up_while_caches_churn_and_readers_block() {
+        let rate = if cfg!(debug_assertions) { 250 } else { 4_000 };
         let (latencies, sent, missing) =
-            publish_to_two_children(Children::Sockets, false, 4_000, 2, 72);
-        report("unbatched, socket children", &latencies, &sent, missing);
-        let (latencies, sent, missing) =
-            publish_to_two_children(Children::MeshEdges, false, 4_000, 2, 72);
-        report("unbatched, mesh edges", &latencies, &sent, missing);
+            publish_to_two_children(Children::MeshEdges, Load::CachesInUse, rate, 2, 72);
+        let (_, p99) = report("mesh edges, caches in use", &latencies, &sent, missing);
+        assert_eq!(missing, 0, "parts did not arrive");
+        assert!(p99 < THROUGHPUT_P99_US, "p99 {p99} us");
     }
 
-    /// A batched pass hands a child's datagrams to the kernel in calls of up
-    /// to 64, and an unbatched pass makes one call for each datagram.
+    /// A pass hands a child's datagrams to the kernel in calls of up to 64.
     #[test]
     fn a_batched_pass_makes_one_call_for_many_datagrams() {
-        for batched in [true, false] {
+        {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -6272,8 +8059,7 @@ mod tests {
                     CacheMeshConfig::new("distributor", "uk", loopback_addr())
                         .with_peers(child_addrs)
                         .with_role(CacheMeshRole::Distributor)
-                        .with_announce_interval(Duration::from_secs(10))
-                        .with_batched_send(batched),
+                        .with_announce_interval(Duration::from_secs(10)),
                 )
                 .start()
                 .await
@@ -6298,39 +8084,37 @@ mod tests {
             }
             let datagrams = stats.tx_source_datagrams + stats.tx_repair_datagrams;
             assert!(datagrams >= 240, "{stats:?}");
-            eprintln!(
-                "batched {batched}: {} calls for {datagrams} datagrams",
-                stats.tx_send_calls
-            );
-            if batched {
-                // 120 datagrams for each child in two calls each, and the
-                // few hellos of the start, one call per datagram.
-                assert!(stats.tx_send_calls * 8 <= datagrams, "{stats:?}");
-            } else {
-                assert_eq!(stats.tx_send_calls, datagrams, "{stats:?}");
-            }
+            eprintln!("{} calls for {datagrams} datagrams", stats.tx_send_calls);
+            // 120 datagrams for each child in two calls each, and the few
+            // hellos of the start, one call per datagram.
+            assert!(stats.tx_send_calls * 8 <= datagrams, "{stats:?}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn with_gso_a_large_part_keeps_symbols_that_fit_a_packet() {
+        // Slots that hold the 200 kB part.
+        let options = Options {
+            buffer_size_kb: 256,
+            ..large_part_options()
+        };
         for gso in [true, false] {
             let distributor_addr = loopback_addr();
             let edge_addr = loopback_addr();
-            let distributor_cache = Arc::new(ChunkCache::new(large_part_options()));
-            let distributor = CacheMesh::new(
-                Arc::clone(&distributor_cache),
-                CacheMeshConfig::new("distributor", "uk", distributor_addr)
-                    .with_peer(edge_addr)
-                    .with_role(CacheMeshRole::Distributor)
-                    .with_max_symbol_size(8_100)
-                    .with_announce_interval(Duration::from_millis(100))
-                    .with_gso(gso),
-            )
-            .start()
-            .await
-            .unwrap();
-            let edge_cache = Arc::new(ChunkCache::new(large_part_options()));
+            let distributor_cache = Arc::new(ChunkCache::new(options));
+            let mut config = CacheMeshConfig::new("distributor", "uk", distributor_addr)
+                .with_peer(edge_addr)
+                .with_role(CacheMeshRole::Distributor)
+                .with_max_symbol_size(8_100)
+                .with_announce_interval(Duration::from_millis(100));
+            if !gso {
+                config = config.without_gso();
+            }
+            let distributor = CacheMesh::new(Arc::clone(&distributor_cache), config)
+                .start()
+                .await
+                .unwrap();
+            let edge_cache = Arc::new(ChunkCache::new(options));
             let edge = CacheMesh::new(
                 Arc::clone(&edge_cache),
                 CacheMeshConfig::new("edge", "uk", edge_addr)
@@ -6384,8 +8168,7 @@ mod tests {
             DEFAULT_SYMBOL_SIZE,
             0,
             Arc::clone(&stats),
-        )
-        .with_fitted_symbols(true);
+        );
         assert_eq!(fitted.symbol_size_for(120), 120);
         assert_eq!(fitted.symbol_size_for(0), 1);
         assert_eq!(fitted.symbol_size_for(1_200), 1_200);
@@ -6399,14 +8182,11 @@ mod tests {
         assert_eq!(fitted.symbol_size_for(5_000), 1_316);
         // A lossy path plans the same way.
         assert_eq!(fitted.plan(120, 50_000).0, 120);
-        let padded =
-            FecSender::with_policy_and_initial_block_id(1, 0.03, 32, DEFAULT_SYMBOL_SIZE, 0, stats);
-        assert_eq!(padded.symbol_size_for(120), 1_316);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_audio_part_goes_in_datagrams_of_its_own_size() {
-        for fitted in [true, false] {
+        {
             let distributor_addr = loopback_addr();
             let edge_addr = loopback_addr();
             let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
@@ -6415,8 +8195,7 @@ mod tests {
                 CacheMeshConfig::new("distributor", "uk", distributor_addr)
                     .with_peer(edge_addr)
                     .with_role(CacheMeshRole::Distributor)
-                    .with_announce_interval(Duration::from_millis(100))
-                    .with_fitted_symbols(fitted),
+                    .with_announce_interval(Duration::from_millis(100)),
             )
             .start()
             .await
@@ -6450,11 +8229,7 @@ mod tests {
             // The chunk frame: 12 bytes of head, the node id, 20 bytes of ids
             // and length, and the part; then the 36 bytes of FEC header.
             let frame = 12 + "distributor".len() + 20 + part.len();
-            if fitted {
-                assert_eq!(bytes as usize, 36 + frame);
-            } else {
-                assert_eq!(bytes, 1_352);
-            }
+            assert_eq!(bytes as usize, 36 + frame);
             distributor.shutdown();
             edge.shutdown();
         }

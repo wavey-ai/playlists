@@ -262,7 +262,7 @@ Verified implication: this aligns with the draft rule that the `EXT-X-TARGETDURA
 
 ### I. Part target and hold-back are configured and stable
 
-The manifest builder now uses `Options::part_target_us` (or the older `part_target_ms` when it is set) for `EXT-X-PART-INF:PART-TARGET` and derives `PART-HOLD-BACK` from that configured value: three part targets, or `Options::part_hold_back_ms` when that floor is larger. Durations are rendered exactly from microseconds (up to six decimals, at least three), so 2.5 ms is `0.0025` and the parts of a segment sum to its `EXTINF`. It also emits explicit `HOLD-BACK` at three Target Durations.
+The manifest builder now uses `Options::part_target_us` for `EXT-X-PART-INF:PART-TARGET` and derives `PART-HOLD-BACK` from that configured value: three part targets, or `Options::part_hold_back_ms` when that floor is larger. Durations are rendered exactly from microseconds (up to six decimals, at least three), so 2.5 ms is `0.0025` and the parts of a segment sum to its `EXTINF`. It also emits explicit `HOLD-BACK` at three Target Durations.
 
 Verified implication: this avoids changing `PART-TARGET`, `PART-HOLD-BACK`, or the server-side Advance Part Limit because of retained-window churn or early short parts. Callers must configure `part_target_us` to be at least as large as the actual part durations they publish.
 

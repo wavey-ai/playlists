@@ -771,3 +771,217 @@ Gate: `cargo test --release --all-features mesh::` (both 4,000/s tests), then th
 - **`av-contrib`:** off crates.io 0.1.6 onto the merged rev. Its `Options` literals need `..Default::default()` and lose `part_target_ms`.
 - **`web-services`:** locked at `e107101`. On update, its hls tests move from `M3u8Cache::add` and `M3u8Manifest::add_part*` to `add_part_us`, and `get_for_handle` now returns the newest playlist that contains the part.
 - **Open item for the product session:** an origin epoch on the wire, so that relays and edges follow a restarted stream (C7).
+
+---
+
+## 7. Resolution notes
+
+### Steps 1, 2 and 4: Cargo.toml, stream_registry.rs, m3u8_manifest.rs
+
+- **Cargo.toml.** Both sides kept. The `[profile.dev.package.raptorq]` block is placed after all five `[[bench]]` sections, not between them: TOML meaning is the same and the benches stay together. `Cargo.lock` is the merge-tree result, untouched.
+- **Registry free list.** As planned: `Lifecycle {next_index, free: VecDeque, is_free}`, seeded `0..capacity`. `remove_stream` and `reset_index` free the index after the reset closure has run. The churn pattern (2 lanes, no removals) still assigns 0, 1, 0, 1, ...
+- **`remove_stream`** returns `Option<ResolvedStream>`. Deviation: it now checks the owner before it unpublishes the cell. AUG cleared `accepting` and the published generation first and then returned on an owner mismatch, which would have left the current owner's gate closed. The mismatch cannot happen under the lifecycle lock; the reorder only removes that hazard.
+- **`handle_at` and the seqlock.** `handle_at` builds the identity from the published stream id and generation, as `is_current_fast` does. Because `handle_at` *returns* the stream id it read (`is_current_fast` only compares it), the two-load check was made a proper seqlock: a release fence before the writer stores the new stream id, and an acquire fence before the second generation load, in both `handle_at` and `is_current_fast`. On x86 both fences are compiler barriers only.
+- **Manifest head precompute: done.** `head_without_skip` and `head_with_skip` are `Arc<str>` built in `new()` from the normalized options. `RenderedPieces` carries `media_sequence: u32`, which `into_bytes` writes into the single exact-length buffer. Checked in a scratch crate against LL's `m3u8_manifest.rs`: byte-identical output over 5 option and part mixes (2.5 ms, 250 µs, 23.976 fps byte ranges, CAN-SKIP, parted limits). Allocations per render (default options, 4,000 parts, a read after each) went from 6.9 to 2.9, and render time went from 11.9 ms to 9.3 ms in total. This is the evidence for the provisional item in 2.2. The ported `playlist_writes` bench (step 8) should still confirm it.
+- **Rendition reports.** Deviation: they are rendered into text once, in `set_rendition_reports`, rather than on every render. The caps (256 reports, URIs of at most 2,048 bytes) and LL's quoted-string filter are applied there, before the count cap, so invalid URIs do not use up the 256. The version still increments. New test: `rendition_reports_are_capped_in_count_and_uri_length`.
+- **PDT.** AUG's `append_program_date_time` is used directly by `close_segment` and by the open-segment tail. `program_date_time_line` is deleted. `time_at` now uses `checked_add_signed` and saturates at `DateTime::<Utc>::MAX_UTC`; LL's `+` panicked on overflow.
+- **Tests.** `render_bytes_are_exact` (also asserts `pieces().len()` equals the rendered length), `direct_program_date_time_format_matches_chrono_rfc3339` (also bounds the line length) and `long_running_manifest_keeps_only_the_retained_timeline` (also checks the open segment's PDT at +19,999 s) are ported. New: `rendered_pieces_know_their_exact_length`. The `part_target_ms` block of `options_derive_ring_sizes_from_time_and_keep_given_counts` is replaced by a check that given counts are kept. All 24 manifest tests and 6 registry tests pass in scratch crates that use the step-3 `Options` (no `part_target_ms` or `eager_render`).
+- **Callers still to update in other steps.** Removed `M3u8Manifest::{add_part, add_part_with_byte_len, add_part_with_byte_range, add_part_us}` are still called by AUG `lib.rs` (`add_part_with_byte_len`, step 3) and `benches/playlist_cache.rs`/`playlist_writes.rs` (step 8). `non_independent_input_cannot_grow_an_open_segment_without_bound` belongs to step 5 (C5).
+
+### Step 6: chunk_cache.rs
+
+Built from AUG, with the LL features ported onto it. Checked in a scratch crate (`/tmp/claude-1000/plmerge-scratch/chunk`, the step-3 `Options`, with the merged `stream_registry.rs`): 50 tests pass, in debug and release. Clippy is clean, with and without `mesh`.
+
+- **Stream state is atomic (the provisional "write cost" item in 2.1, done).** AUG's `StdRwLock<ChunkStreamState>` is replaced by `StreamState {last: AtomicUsize (EMPTY = usize::MAX), next_id: AtomicUsize, version: AtomicU64}`.
+  - Writers change it only inside `with_validated` or `with_generation`, under the owner read lock. Resets run under the owner write lock, so no value crosses a generation.
+  - `raise_last` is a CAS loop that returns `advanced`. `version` never becomes 0.
+  - No other lock is taken per part, beyond the slot lock and the owner read lock.
+- **Write tag.** The three atomics per slot are one `Vec<SlotTag {id, generation, written_us}>`, not three Vecs. It is stored under the slot lock in the order of 2.1.
+  - `written_unix_us_for_handle` and `written_unix_us_for_stream_id` recheck the id, the generation and `is_current_fast` after loading the time.
+  - Clear and release reset the tag.
+- **Contiguous publication.** It now scans the slot tags, without slot locks or awaits, inside one `with_validated` region that also raises `next_id`. AUG used two regions and an await per slot.
+  - A `fence(SeqCst)` comes before the scan. Two writers that fill each other's gap therefore cannot both miss the other's tag.
+  - New test: `concurrent_contiguous_writers_publish_every_filled_gap`.
+- **Publication.** `signal_publication` fires only when `last` strictly advanced, after the slot lock is dropped, and before the exact-part and lane notifiers.
+  - This covers raw-lane `add` and `append` too: LL's `a_publication_wakes_a_task_waiting_for_it` uses `append(0, ..)`.
+  - Nothing else signals: repeats, conflicts, `Superseded` writes, rejected writes, raw `set`, inits, clear, release, zero and reuse. New test: `only_an_advancing_watermark_signals_publication`.
+  - Deviation: AUG's `put_if_absent` also publishes on `AlreadyPresent`. That is kept, but it signals only if it moved the watermark. LL published on `Inserted` only.
+- **`release_stream_id`** uses the identity that `remove_stream` returns. It empties the lane's slots whose generation is `<=` the released generation, not `==` as the plan said. That also frees hidden bytes from earlier `zero_stream_id` calls, as LL's release did, and never touches a stream that has taken the index since, because generations only grow on an index. New test: `a_release_keeps_the_parts_of_a_stream_that_took_the_index_since`.
+- **`clear_for_handle`** was added next to `clear_for_stream_id`, and `written_unix_us_for_handle` next to `written_unix_us_for_stream_id`.
+- **`handle_at` is `pub`, not `pub(crate)`.** `subscribe_publications` and `PublishedStreams::drain` are public and return indices. Once `stream_idx` and `stream_ids` are removed, `handle_at` is the only way an outside consumer can name those indices.
+- **`add_remote_for_handle` (C7)** is `pub(crate)` and has `allow(dead_code)` without `mesh`. Test: `a_remote_write_replaces_a_newer_id_of_the_same_generation`.
+- **`zero_stream_id`** is now one sync method (section 4, item 13, done here), matching `M3u8Cache::zero_stream_id`. `zero_stream_id_sync` is gone.
+- **Removed:** `add_stream_id`, `get_or_create_stream_idx`, `get_stream_idx`, `stream_idx`, `stream_ids`, `take_new_playlists_rx`/`new_playlist_*` and their four tests, and LL's three timing tests.
+- **Raw lanes and ids.** Writes at id `usize::MAX`, the empty marker, are refused with "Chunk id out of range". `update_notifier` stays and also fires for mapped streams; new test `a_lane_notifier_wakes_for_a_mapped_stream`.
+- **Hash.** The slot hash moved from `const_xxh3::xxh3_64`, a scalar const evaluator, to the runtime `xxh3::xxh3_64`. The values are identical (`the_slot_hash_is_xxh3_64`), so the mesh's `EncodedKey` is unaffected.
+- **Write cost.** Measured with one current-thread writer, `add_for_stream_id` (LL, AUG) versus `resolve_or_create_stream` + `add_for_handle` (merged), with one publication subscriber, best of 5. Scratch bench `/tmp/claude-1000/plmerge-scratch/bench`.
+
+  | Payload | LL | AUG | Merged |
+  |---|---|---|---|
+  | 72 B | 356 ns | 299 ns | 269 ns |
+  | 1,200 B | 1,215 ns | 1,161 ns | 324 ns |
+  | 256 KiB | 205 µs | 203 µs | 10.8 µs |
+
+  With the const hash, the merged structure alone costs 363 ns, 1,219 ns and 203 µs: the same as LL. The win comes from the hash. The product bench gate of step 6 was not run here, because the crate does not build until steps 3, 5 and 7 are resolved. It is still owed after `mesh.rs`.
+- **Tests.**
+  - AUG tests kept, with handles in place of `add_stream_id` and `stream_ids`.
+  - LL's two exact-waiter tests run without creating the stream first (C6).
+  - AUG's `exact_part_waiter_does_not_cross_a_stream_generation` became `a_waiter_woken_across_a_generation_finds_no_data_from_the_previous_one`, per C6. It asserts the wake, then that neither the old handle nor the stream id reads old-generation data.
+  - `waiter_for_unknown_stream_does_not_evict_a_live_stream` now asserts `Some`, per C6.
+  - The 8 LL-only tests are ported to handles. `a_released_stream_frees_the_bytes_of_its_parts` checks `ChunkSlot.id`/`bytes`.
+  - New: the tests named above, plus `a_write_time_is_bound_to_the_generation_that_wrote_it` and `handle_at_names_the_stream_of_a_drained_index`.
+
+### Step 5: m3u8_cache.rs
+
+Built from LL (render on read, O(1) `add_part_us`, `render_locks`, µs delta parsing), with AUG's identity and reader features ported onto it. Checked in a scratch crate (`/tmp/claude-1000/plmerge-scratch/m3u8`: the merged `m3u8_cache.rs`, `m3u8_manifest.rs` and `stream_registry.rs`, with the step-3 `Options`): 28 cache tests pass in debug and release, the two concurrency tests pass five runs in a row, and clippy and rustfmt are clean.
+
+- **Identity.** `StreamRegistry` plus `M3u8StreamHandle`, with `resolve_stream`, `resolve_or_create_stream`, `ensure_stream_id` and `zero_stream_id` (which frees the slot). `PlaylistSlot.generation` is the registry's u64. The reset runs under the slot lock before the new generation is published, so a handle write checks `is_current_fast` (registry and bounds) and then `slot.generation` under the slot lock, without taking the owner lock per part. `set_init_for_handle` keeps AUG's `with_validated`.
+- **One atomic position (deviation in form).** The generation, version and newest part are published per slot as a small sequence lock (`PublishedState`), written only under the slot lock. That keeps LL's lock-free `get`/`last_position` and AUG's single consistent position without an allocation per part, which an `ArcSwap` of the position would cost. Segment ranges are tagged as in AUG and live in the slot, read under its lock (`get_idxs_for_handle`).
+- **Versions** continue across reuse (`next_version`, never 0) and advance on parts, initializations and resets (C10). A lazy render does not change the version or notify.
+- **Read fast path: kept.** Per slot `rendered: ArcSwapOption<Rendered>`, tagged with generation and version. A hit takes no lock. `Rendered` also holds the delta, made once per version by the first reader that asks, in a `OnceLock` under the render lock; this replaces LL's `slot.delta`. LL's `slot.rendered` field is gone; the 5.4 test checks the `ArcSwap` instead.
+- **Replicas: kept, made at render time.** `Variants` copies the gzip of the full and delta playlists once per extra replica when a reader renders them; a reader picks `LATEST_READ_REPLICA % n`. One replica (the default) makes no copies.
+- **Scratch measurement** (release, 32 cores, default options, one stream of 4,000 parts of 2.5 ms; `examples/readers.rs` in the scratch crates, LL's cache in `m3u8-ll`). These are scratch numbers; the ported `playlist_cache` bench (step 8) should confirm them.
+
+  | Workload | LL | Merged |
+  |---|---|---|
+  | `last(1)` hit, 1 reader | 18.7M/s | 13.3M/s |
+  | `last(1)` hit, 8 readers | 3.0–3.5M/s | 9.5–11.2M/s |
+  | `last_delta(1)` hit, 8 readers | 2.3M/s | 6.2–7.3M/s |
+  | `last_delta_for_handle` hit, 8 readers, 1 / 8 replicas | n/a | 10.8M / 92–98M/s |
+  | `last_for_handle` hit, 8 readers, 1 / 8 replicas | n/a | 16–17M / 133–136M/s |
+  | writer at 4,000 parts/s, 1 `last` reader: `add_part_us` p50 / p99 | 0.56–0.82 / 53–86 µs | 0.67–1.23 / 2.0–4.8 µs |
+  | writer at 4,000 parts/s, no reader: p50 / p99 | 0.24–0.27 / 2.1–3.2 µs | 0.27–0.28 / 2.0–5.2 µs |
+
+  Given up: a single uncontended mapped hit costs about 30 ns more (85 ns against LL's 53 ns). Most of that is the registry's `resolve` (about 30 ns, a `RwLock<HashMap>` read); a handle read is 55 ns. With eight mapped readers the shared registry read lock, not the payload, becomes the limit, which is why replicas help handle readers (9×) and not mapped ones.
+- **Stored-playlist path removed** (section 4, item 6): LL's `add` and `end_segment`, the `manifest: None` fallback in `render()`, the `eager_render` branch and its test, and all of AUG's ring (`buffer`, `latest`, `calculate_index`, `prepare_variants`, `add_for_handle`, `add_prepared_for_handle`, the snapshot types). The per-snapshot `buffer_size_kb` budget goes with them; `buffer_size_kb` no longer bounds playlists.
+- **Added** `add_part_us_for_handle` (AUG's handle write, in LL's form) and `last_text_for_handle`. Unknown streams: `last`, `last_text` and `last_delta` return `StreamNotFound` (LL); `get`, `get_delta` and `get_idxs` return `Ok(None)`; a stale handle gets `StreamNotFound` (AUG). `last_position` is `None` until the first part (AUG; LL gave `(0, 0)`).
+- **Validate before create.** `add_part_us` creates the stream only when it is unmapped, and a first part can never be refused, so a refused part never evicts. Reads and `set_init` never create a stream. `rejected_mapped_writes_do_not_evict_a_live_stream` is rewritten to those cases (refused part, oversized init, init for an unknown stream, reads of unknown streams).
+- **`memory_stats`** counts slots with a manifest, the rendered text, every gzip replica of the full and delta playlists, and initializations. Deviation: `maximum_payload_bytes` is a per-stream bound from the options (per-line maxima × `max_segments` × `max_parts_per_segment`, plus zlib's compress bound per replica) times `num_playlists`, plus `init_size_kb` per slot. New test `the_rendering_bound_holds_for_the_largest_lines` checks it with the widest numbers.
+- **Hash.** Playlist hashes use the runtime `xxh3::xxh3_64`, as `ChunkCache` now does; the values equal `const_xxh3`.
+- **Tests.**
+  - LL's tests are kept. `eager_render_renders_each_part_as_it_is_added` is deleted. `a_part_is_added_without_rendering_and_read_renders_once` checks the `ArcSwap`. `a_reused_slot_starts_a_new_playlist` also asserts that versions continue across reuse.
+  - AUG's tests from section 4 item 6 are ported to `add_part_us`, with the same assertions. The positions and sequences come from the manifest, so the fixtures use 1 s independent parts to place segments, for example `get_idxs(7, 5) == (5, 7)` in place of `(25, 27)`. `open_segment_range_ignores_stale_ring_boundary` now also wraps the range ring and checks that the reused position is not read as the old segment. `delta_update_*` use the cache. `stale_handle_cannot_replace_new_playlist_or_initialization` uses a delayed write with the old handle in place of `prepare_variants`.
+  - The replica tests are rewritten to render-time copies. Byte equality across two caches no longer holds, because each manifest has its own PROGRAM-DATE-TIME, so they check equal bytes in distinct allocations, hashes, and the memory accounting. The concurrent replica test now interleaves 2,000 `add_part_us_for_handle` calls with 8 readers.
+  - `encoded_payload_memory_plateaus_after_ring_rotations` is rewritten over slot memory (C1). The five ring tests are dropped (C1). `constructor_rejects_capacity_arithmetic_overflow` also covers `init_size_kb`.
+  - New tests: `non_independent_input_cannot_grow_an_open_segment_without_bound` (C5, at cache level), `a_full_segment_refuses_non_independent_parts`, `a_segment_range_is_bound_to_its_stream_lifetime`, `concurrent_part_adds_publish_monotonic_positions` (5.4) and `a_render_on_read_is_not_published_by_notifier_but_the_part_is` (5.4).
+- **For step 3 (lib.rs).** Nothing in `M3u8Cache` produces `CacheError::Superseded` any more, so drop it.
+
+### Step 3: lib.rs
+
+Built from LL, with AUG's `Playlists` protocol ported onto it. With `lib.rs` resolved the non-mesh crate builds: `nice cargo build`, `nice cargo test` (122 lib tests, debug and release) and `nice cargo clippy --lib --tests --bins -- -D warnings` are clean. `--all-targets` still fails in the benches only (step 8: `part_target_ms`, `M3u8Manifest::add_part`, `M3u8Cache::add`/`add_for_handle`, and a deprecated `fetch_update` in `benches/support/mod.rs`).
+
+- **Options.** LL's, without `part_target_ms` and `eager_render`. `part_target_us()` is `part_target_us`, or the default when it is zero; `normalized()` no longer keeps a millisecond copy. New test `options_normalize_the_part_target_in_microseconds`.
+- **`CacheError`.** LL's set, which already had `ArithmeticOverflow` and `StreamNotFound`. `Superseded` is dropped: nothing produces it (`ChunkCache` uses `PutIfAbsentResult::Superseded`).
+- **`Playlists`.** AUG's `BTreeMap<u64, Arc<PlaylistEntry>>` with `PlaylistEntry {closing, commit: Mutex<()>}`, AUG's `fin` protocol (closing, commit lock, zero both caches, `ptr_eq` removal), the init-size precheck before an entry is made, `try_new`, the replica constructors and `PlaylistCacheBundle`. `add` (ms) calls `add_us`. Under the commit lock `add_us` resolves the playlist stream once (resolve, else create, as `M3u8Cache::add_part_us` does), then calls `set_init_for_handle` and `add_part_us_for_handle` with that handle, and returns false on any error. The live-stream count uses `self.options.num_playlists`. Both caches' `zero_stream_id` are sync.
+- **Tests.** `parts_are_added_in_microseconds` (LL), `test_fin_clears_chunk_cache_entry` (handles; `fin` is now sync, so the 200 ms polling loop became a direct assertion), `closing_entry_rejects_add_and_cannot_resurrect_cache_state` (holds `commit`; also asserts no playlist stream), `playlist_add_reports_an_initialization_budget_failure`, `playlists_constructor_rejects_capacity_arithmetic_overflow`. New: `an_initialization_is_stored_with_its_part`.
+- **5.4 `playlists_fin_racing_add_us_leaves_no_ghost_slot`.** Deviation in form: the plan's "threads loop `add_us` while another calls `fin`, then one final `fin`" cannot see a ghost, because AUG's `fin` zeroes the caches even when there is no entry, and a later add makes a new entry that hides it. The test runs 2,000 rounds of one `add_us` against one `fin` behind a barrier, and after each round asserts that a playlist stream exists exactly when its entry does and that `active()` matches. Then a final `fin` must leave `active() == 0`, no entry, `position(7) == None`, `occupied_slots == 0` and no chunk stream (one is created each round). Checked by mutation: with the commit lock removed from `add_us` it failed in 5 of 5 runs, and it passed 10 of 10 runs with the lock. A check that both outcomes of the race occur was tried and dropped: the add after `fin` almost never happened, so it was flaky.
+- **Also fixed** in `m3u8_manifest.rs`: clippy's `manual_is_multiple_of` in `push_seconds` (the existing LL warning noted in step 4), which `-D warnings` refuses.
+- **Not changed.** `tls-helpers` is an unused dependency on both lines; cargo warns about it (`cargo::unused_dependencies`), which `-D warnings` does not cover. Left for whoever owns `Cargo.toml` cleanup.
+
+### Step 7: mesh.rs, mesh_send.rs
+
+Built from LL (`ff09196`, the merge's HEAD side), with AUG ported by feature. `mesh_send.rs` is unchanged. Gates: `nice cargo build --all-features`, `nice cargo test --all-features` (192 passed, 2 LL-ignored) and `nice cargo test --release --all-features mesh::` (66 passed, both 4,000/s tests included) are green, and `cargo clippy --all-features --lib --tests --bins -- -D warnings` is clean.
+
+- **Send path (LL, unchanged in behaviour).** Send on publish always, `ObjectEncoder` with its caches, `sendmmsg` batches always, GSO with automatic fallback, fitted symbols always.
+  - Removed: `sync_on_publish`, `batched_send` with the unbatched branches and `FecSender::send_object`, the `with_gso`/`with_fitted_symbols` builders (and `FecSender::with_fitted_symbols`, `from_config`).
+  - GSO's only switch is a `#[cfg(test)]` config field (`without_gso()`).
+  - Deviation: fitted symbols now apply to every `FecSender`. The handle's control frames (subscribe, unsubscribe, replica and part requests) were padded on LL. They now go in fitted symbols too.
+- **Identity: keyed by the whole `StreamHandle`, not `(stream_id, generation)`.** A generation counts per index. With the free list, a stream recreated after `zero_stream_id` lands on another index with the same generation number; 5.2 hit this (both were 2). AUG's keys had the same ambiguity under round robin.
+  - Keyed by handle: `sent`, `sent_initializations`, `SeenWatermarks`, the remote-slot set and `QueuedPart`.
+  - A publication pass names each drained index with `handle_at`; the tick uses `stream_handles()`.
+  - A stale handle stops the stream: for the rest of the pass, in the warm-up loop and in replica service.
+  - `sent`/`sent_initializations` lose dead lifetimes and unknown peers at the 250 ms remote-slot prune (AUG), on ticks with and without children.
+- **Hardening.**
+  - `allowed_peers` is an `ArcSwap<HashSet<SocketAddr>>`. It is checked once per datagram, after the loss injection and before the receive observer, so cut-through never sees an unauthorized datagram. `peer_is_allowed` no longer reads it.
+  - Hello, Subscribe and ReplicaRequest go through `admit_peer`. A Subscribe that the full peer table refuses is ignored; a ReplicaRequest is still served. `add_peer` authorizes only an admitted peer.
+  - `max_peers`, `max_inflight_frames` and `replica_queue_capacity` are as AUG. There is no frame queue (C3).
+- **Limits that follow the cache.** `max_frame_bytes` and `max_remote_slots` are `usize`, and 0 means "follow the cache"; `CacheMesh::start` fills them in.
+  - `max_frame_bytes` = max(`buffer_size_kb`, `init_size_kb`) × 1024 + 64 KiB (`FRAME_OVERHEAD_BYTES`: any node id and the largest hello). The plan said "plus the frame header"; with a header-only margin, a 4 KiB-slot cache would refuse its own 256-peer hello.
+  - `max_remote_slots` = the cache's slot capacity + `num_playlists` × 1,000, which is one 250 ms prune interval at 4,000 parts/s.
+  - `FecSender` checks the limit in `send` and `prepare_object` (`tx_errors`, `InvalidFrame`). The handle's control sender uses it too.
+  - A full remote-slot set is pruned under the held lock (`mark_remote_slot`). If it is still full, which happens only when the limit is set below the cache's capacity, the part is stored unmarked and counted in `remote_slot_evictions`. It may be echoed once. Nothing live is evicted.
+- **FecReceiver.** The union of both field sets.
+  - An oversized `transfer_length` is rejected first. `admit_decoder_peer` also drops the evicted peer's loss window. A decode error calls `expire_block`.
+  - `make_observation_room` counts the dropped block's missing sources as loss in `LinkReport`. This was the provisional item; it is done.
+  - Pruning runs on every datagram (LL) over AUG's ordered queues, so it costs only what expires.
+  - **The auto-merged recovery loop is fixed.** It finalizes when the front is past the datagram cutoff or past `LATE_SOURCE_GRACE`, and pops stale entries. Observation expiry records loss as LL did.
+- **Receive.**
+  - Inline, as LL (C3).
+  - `ReplicaRequest` goes to the bounded `replica_task`, on LL's reply lane (`REPLY_BLOCK_ID_BASE + offset`, `with_link_loss`, `count`).
+  - Chunk apply follows the order in 2.4 and uses `add_remote_for_handle` (C7).
+  - `MeshFrame::decode(Bytes)` is zero-copy (`split_to`); `chunk_frame_payload(&[u8])` copies.
+  - Deviation: `decode_nanoseconds` is the wall-clock µs from `received_us` to the end of the FEC push, × 1,000. It reuses the clock read that is now `decoded_us`: one extra read per datagram, not AUG's two `Instant`s. It excludes the frame parse, and `decoded_us` is now taken before `receive_observer.decoded`.
+- **Wire.**
+  - v1 is gone from `decode` and `chunk_frame_slot`.
+  - A hello must carry its peer count and role; every v2 encoder on both lines writes them.
+  - A replica request is always 20 bytes.
+- **Misc.**
+  - `try_enqueue` uses `fetch_max` and `decrement_depth` a CAS loop, because AUG's `fetch_update` is deprecated in this toolchain.
+  - The stats are the union minus `frame_queue_*`.
+  - `CacheMeshRole` derives `Default`, and the "compatibility"/"original behavior" docs are reworded.
+- **Tests: removed and renamed** (section 4, items 3–5 and 9).
+  - Removed: `a_committed_part_waits_for_the_tick_without_sync_on_publish`, `a_committed_part_leaves_at_once_without_batched_send`, `unbatched_four_thousand_parts_a_second_for_comparison`, the `legacy_hello` case, the unbatched half of `a_batched_pass_makes_one_call_for_many_datagrams`, the `false` arm of `an_audio_part_goes_in_datagrams_of_its_own_size`, and the padded-sender assertion of `a_small_object_is_one_symbol_of_its_own_length`.
+  - Renamed: `a_committed_part_leaves_at_once`; `a_config_with_a_send_observer_stays_printable`, which keeps the observer half of the sync-on-publish test; `generic_segmentation_offload_is_on_by_default`.
+- **Tests: changed.**
+  - `a_live_part_is_not_held_behind_a_warm_up_window`: the plan's recipe cannot put a live part on a tick, because a new lease starts live after the newest part. It now uses `max_children(1)` and two children. The parts published during the other child's turn go out on the edge's tick that opens its 40-part window. It asserts the window is contiguous, that tick carried held live parts, and no part published well before the window comes after it. Subscriptions are renewed while waiting.
+  - C9: `with_allowed_peers` was added to `cache_mesh_gossips_peer_addresses_from_seed_node` (AUG's) and `the_send_observer_sees_live_parts_and_not_a_new_childs_catch_up`. `a_restarted_child_is_heard_by_its_parent_at_once` needs none: its parent lists the child.
+  - C11: `with_gso_a_large_part_keeps_symbols_that_fit_a_packet` uses `buffer_size_kb: 256` for its 200 kB part.
+  - Four lints that the current clippy raises in LL tests and the harness are fixed.
+  - LL's `wait_for_hello` also waits for the child's own first hello to go out. A child that had just started could subscribe before its parent had its hello; with `same_region_only` the parent refuses that subscription, and LL's tests subscribe once. This was traced as the cause of the flaky `a_restarted_child_is_heard_by_its_parent_at_once` and `an_edge_does_not_remember_the_slots_that_it_receives` (the Subscribe arrived 1.4 ms before the hello). After the fix the full debug suite passed 20 of 20 runs. `a_committed_part_leaves_at_once` (10 ms debug bound) still fails about once in 15 suite runs under load, as LL's original did on the baseline (1 in 15).
+- **Tests: added.**
+  - AUG's tests, adapted: `replica_response_stops_when_its_stream_index_is_reused` (with `count`), the three `fec_receiver_*` bound tests, and `fec_receiver_expiry_queue_stays_within_the_datagram_window`, whose bound is now window + 1 because pruning runs per datagram. Also `bounded_replica_queue_drops_work_when_full`, `mesh_drops_unauthorized_datagrams_before_fec_decode` (which also checks the observer never sees the datagram) and `rejected_runtime_peer_does_not_expand_the_allowlist`.
+  - New tests: `only_the_current_wire_format_is_accepted`, `a_decoded_payload_shares_the_frame_buffer`, `a_missing_source_counts_as_loss_on_the_first_datagram_after_its_grace`, `an_evicted_incomplete_block_counts_as_loss`, `a_hello_admits_only_authorized_peers_within_the_limit`, `the_frame_limit_follows_the_cache` (a 1.5 MiB part through 2 MiB slots), `a_frame_beyond_the_limit_is_not_sent` and `a_full_remote_slot_set_is_pruned_and_keeps_retained_slots`.
+- **5.1** is `a_distributor_and_its_edges_keep_up_while_caches_churn_and_readers_block`. The harness gained `Load`; the no-load gate path is LL's, including the publisher's `add_for_stream_id`. Deviations:
+  - It runs in demand replication. In full replication the churned streams reach the edges and evict stream 7 from their 8 lanes.
+  - Churn runs at 1,000 streams/s.
+  - "No echo" is checked as "no applied event at the distributor", because hellos are decoded objects.
+  - The readers run on their own threads and poll every 200 µs.
+  - Debug runs at 250 parts/s: a debug edge takes about 1,000 datagrams/s, the same on LL (its `--ignored` edges test in debug: about 5,200 of 8,000 parts missing on both lines).
+  - Release, at load average ~5, 5 of 5 passed: p50 101–114 µs, p99 0.70–1.13 ms, blocking wake p99 43–47 µs, distributor 33–35 µs CPU per part (churn wakes it about 1,350 times a second).
+  - At load average 11–14 it failed on p99 (3–6.6 ms), as LL's own edges gate did at that time.
+- **5.2** is `a_restarted_publication_reaches_edges_whole_and_old_parts_never_reappear`, in both modes, as planned. The cursor check reads a `#[cfg(test)]` snapshot (`MeshShared::cursor_streams`) that is refreshed at each prune.
+- **5.3** is `blocking_readers_wake_for_parts_that_arrive_over_the_mesh`. Deviations:
+  - The mesh applies with `add`, not contiguous puts, so a part beyond a gap does advance the watermark. The test asserts that the set is marked exactly when the watermark advances: slot 4 marks it, then slot 3 does not.
+  - The stale-handle step uses the edge's own `release_stream_id`, because a distributor restart does not restart the edge's stream (the C7 open item).
+- **Gate measurements.** Release; distributor alone on one core; 2 × 4,000 parts/s of 72 B for 2 s. LL is `ff09196` in `/tmp/claude-1000/plmerge-baseline`. Runs were back to back and alternating: 28 rounds each, on a host shared with other sessions (load average 4–12). Figures are medians [range].
+
+  | Test | Side | p50 µs | p99 µs | CPU µs/part |
+  |---|---|---|---|---|
+  | `sends_four_thousand_parts_a_second` | LL | 62.5 [54–71] | 189.5 [98–263] | 25.2 [23–34] |
+  | | merged | 61.5 [54–73] | 179.5 [97–264] | 25.3 [22–36] |
+  | `keeps_two_edges_at_four_thousand_parts_a_second` | LL | 79.5 [73–114] | 262.5 [151–1,466] | 25.7 [23–37] |
+  | | merged | 78.0 [64–113] | 259.5 [159–1,371] | 25.6 [23–37] |
+
+  In the last 4 rounds, on a quieter host, the p99s were LL 106.5/170.5 µs and merged 100.5/171.5 µs. Paired round by round over the first 24, merged was better in 9–14 rounds and worse in 8–13 on every metric, with no consistent direction. No regression was found, so no hot-path change was made. The allowlist check per datagram is an `ArcSwap` load with no lock.
+- **Not done here.** The `max_inflight_frames` 64 check (4K video with 4,000 audio parts/s at 30,000 ppm) and the product bench (Opus, PCM, 4K) are owed by the product session.
+- **`origin/low-latency` moved during this step.** At 23:59 on 21 Nov the product session pushed `fe8318c` and `89964dc` (the class split: video on its own socket and tasks, audio priority; +2,354 lines in `mesh.rs`). This merge is of `origin/main` into `ff09196` and does not contain them. They need a follow-up merge onto the merged mesh.
+
+### Step 8: benches, and the compatibility sweep
+
+- **Benches.** All five build (`cargo bench --all-features --no-run`). Every mode of every bench ran once for 0.25 s per step without a panic. The only failures they count are by design: the `reuse-race` and `churn` modes lose handles to concurrent reuse.
+  - `distribution_capacity`: `part_target_us: 5_000`.
+  - `mesh_pipeline`: `with_frame_queue_capacity` is gone. In its place the report has `rx_unauthorized_datagrams`, `rx_decode_errors`, `rx_expired_objects` and `peer_limit_drops` (all 0 in the runs). No `with_allowed_peers` was needed: the receive mode already lists its senders, and the replica mode's `with_peer` authorizes. Schema `mesh-pipeline.v2`.
+  - `playlist_writes`: every mode writes and then reads. `manifest-render` does `push_part_us` + `m3u8()`. `cache-write[-replicated]` does `add_part_us_for_handle` + `last_for_handle`, which renders on read. The `playlists-*` modes do `Playlists::add` + `M3u8Cache::last`. Schema `playlist-writes.v2`.
+  - `playlist_cache`: seeded with 40 `add_part_us` parts. A writer thread interleaves `add_part_us_for_handle` with the reads at `--parts-per-second` (default 400; 0 means no writer; there is no writer in `reuse-race`). Miss modes ask for a segment 10^9 ahead. `reuse-race` does `resolve_or_create_stream` + `add_part_us_for_handle` + `last_for_handle`. The report gains the writer's parts, failures and latency. Schema `playlist-cache.v2`.
+  - `support/mod.rs`: `fetch_update` (deprecated by this toolchain) is replaced with `fetch_max`.
+- **2.3 replicas: settled, keep.** `playlist_cache`, release, 2 s per step, 2 runs, load average 8. Delta reads by handle, in M reads/s:
+
+  | Writer | Mode | 1 worker | 2 | 4 | 32 |
+  |---|---|---|---|---|---|
+  | 0/s | handle-delta | 15.6–16.1 | 12.7–22.1 | 14.0–14.3 | 18.9–21.2 |
+  | 0/s | replicated | 16.3–16.4 | 30.4–30.8 | 57.4–60.7 | 281–301 |
+  | 400/s | handle-delta | 13.1–14.1 | 11.5–20.7 | 12.0–24.7 | 14.9–17.8 |
+  | 400/s | replicated | 12.9–13.9 | 26.6–27.8 | 49.7–49.8 | 156–221 |
+
+  At 400 parts/s, the p99 at 32 workers fell from 3.0–4.2 µs to 0.29–0.32 µs. The cost is more allocations per rendering (about 100k against 26k in 2 s at 32 replicas). With one replica there are no copies.
+- **4,000 versions/s.** At a writer of 4,000 parts/s, the delta modes collapse with or without replicas: about 3,700 reads/s, and p99 up to 4 s at 32 workers. Full reads still do 4–10 M/s.
+  - The cause is the render, not the merge. One render of the 2.7 KB playlist costs about 130 µs, and a delta read costs about 270 µs (two gzips). On the LL baseline `ff09196` the same probe measures 128/263 µs.
+  - Nearly all of it is the gzip. A bare `GzEncoder` (miniz_oxide) of 2.7 KB costs 120 µs at `Compression::fast()`, which is mostly compressor setup.
+  - When versions change faster than one render, every reader renders, and the readers queue on `render_locks`. This is recorded as an open item, not fixed in this step.
+- **2.2 head precompute: settled, keep.** Probe of `push_part_us` + `m3u8()` with the `playlist_writes` options, single thread, best of 7: merged 1,274 ns and 12.0 allocations per op, LL `ff09196` 1,373 ns and 17.0. The in-crate `manifest-render` mode: 10.0 allocations per op, 669k ops/s on one worker.
+- **2.1 read fast path: confirmed.** The same probe, mapped `last(1)` and `last_delta(1)` with a 400/s writer, in M reads/s:
+  - Merged against LL, full: 11.4 vs 19.2 at 1 reader, 4.1 vs 3.7 at 4, 4.2 vs 3.0 at 8, 5.0 vs 3.2 at 32.
+  - Delta: 10.2 vs 14.1 at 1 reader, 3.9 vs 3.1 at 4, 4.6 vs 2.1 at 8, 4.9 vs 2.0 at 32.
+  - The single uncontended mapped read is slower (the registry resolve, as step 5 found). Handle reads avoid it: `handle-full` does about 20 M/s on one worker.
+- **Compatibility sweep** of `src`, `benches` (there is no `tests/` or `examples/`). It found no compatibility code left. The only hits were a test comment ("kept for the version") and the test `with_gso_a_large_part_keeps_symbols_that_fit_a_packet`, whose no-GSO arm uses the planned `#[cfg(test)] without_gso`. `send_object`, `zero_stream_id_sync`, `stream_idx`, `frame_queue*`, `FrameWork`, `new_playlist_tx`, the stored-playlist path and `add_part*` wrappers are gone. `CacheError::Superseded` is gone; `PutIfAbsentResult::Superseded` (AUG's older-id protection) stays. Doc hits are left for step 9.
+- **Not changed:** `chunk_workloads` accepts `write`/`write-handle` and `mixed`/`mixed-handle` as names for the same modes, as AUG wrote it. These are short names, not old ones.
