@@ -357,6 +357,12 @@ pub struct CacheMeshConfig {
     /// not at the next `sync_interval` tick. The tick still runs: it picks up
     /// new leases and children and paces warm-up windows. Default true.
     pub sync_on_publish: bool,
+    /// A peer is heard when any datagram of it is read off a socket of the
+    /// mesh (either class lane), before FEC decode, not only when a frame of
+    /// it decodes. A parent whose blocks are slow to complete (a 4K part
+    /// that waits for its repair, a decode queue behind a burst) is still
+    /// alive. Default true; false is the behaviour from before.
+    pub liveness_on_receipt: bool,
     pub repair_symbols: u32,
     pub repair_ratio: f32,
     pub max_repair_symbols: u32,
@@ -475,6 +481,7 @@ impl CacheMeshConfig {
             announce_interval: DEFAULT_ANNOUNCE_INTERVAL,
             sync_interval: DEFAULT_SYNC_INTERVAL,
             sync_on_publish: true,
+            liveness_on_receipt: true,
             repair_symbols: DEFAULT_REPAIR_SYMBOLS,
             repair_ratio: DEFAULT_REPAIR_RATIO,
             max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
@@ -595,6 +602,13 @@ impl CacheMeshConfig {
     /// reaches it (true, the default) or only at the next sync tick (false).
     pub fn with_sync_on_publish(mut self, sync_on_publish: bool) -> Self {
         self.sync_on_publish = sync_on_publish;
+        self
+    }
+
+    /// Whether a peer is heard on the receipt of any of its datagrams (true,
+    /// the default) or only when one of its frames decodes (false).
+    pub fn with_liveness_on_receipt(mut self, liveness_on_receipt: bool) -> Self {
+        self.liveness_on_receipt = liveness_on_receipt;
         self
     }
 
@@ -3164,6 +3178,36 @@ impl FecReceiver {
     }
 }
 
+/// How often a receive task writes that a peer was heard into the shared
+/// map: every datagram would take the map's lock thousands of times a
+/// second for a 4K part, and liveness is read in hundreds of milliseconds.
+const PEER_HEARD_STAMP_INTERVAL: Duration = Duration::from_millis(5);
+
+/// A receive task's own record of when it last stamped each peer heard.
+#[derive(Default)]
+struct PeerHeard(HashMap<SocketAddr, Instant>);
+
+impl PeerHeard {
+    /// Stamp `peer` heard now, at most once per
+    /// [`PEER_HEARD_STAMP_INTERVAL`]. The record of a peer that left is
+    /// replaced when the map holds many more than a node has peers.
+    fn stamp(&mut self, peer_seen: &PeerSeen, peer: SocketAddr) {
+        let now = Instant::now();
+        if self
+            .0
+            .get(&peer)
+            .is_some_and(|last| now.duration_since(*last) < PEER_HEARD_STAMP_INTERVAL)
+        {
+            return;
+        }
+        if self.0.len() >= 4_096 {
+            self.0.clear();
+        }
+        self.0.insert(peer, now);
+        lock(peer_seen).insert(peer, now);
+    }
+}
+
 async fn receive_task(
     socket: Arc<UdpSocket>,
     cache: Arc<ChunkCache>,
@@ -3195,6 +3239,7 @@ async fn receive_task(
     )
     .with_link_loss(Arc::clone(&shared.link_loss));
     let mut buf = vec![0u8; 65_536];
+    let mut heard = PeerHeard::default();
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3235,6 +3280,9 @@ async fn receive_task(
                     }
                 }
 
+                if config.liveness_on_receipt {
+                    heard.stamp(&shared.peer_seen, peer);
+                }
                 if let Some(observer) = &observer.0 {
                     observer.datagram(peer, &buf[..len]);
                 }
@@ -5997,6 +6045,57 @@ mod tests {
             .expect("the parent was heard");
         assert!(silent >= Duration::from_millis(300), "{silent:?}");
         edge.shutdown();
+    }
+
+    /// Datagrams of a parent that never complete a block (a 4K part waiting
+    /// for repair, a decode behind a burst) still say that the parent is
+    /// alive: liveness is stamped on receipt, before FEC decode.
+    #[tokio::test]
+    async fn a_parent_is_heard_on_receipt_before_any_block_decodes() {
+        async fn heard_after_undecodable_datagrams(liveness_on_receipt: bool) -> Option<Duration> {
+            let parent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let parent_addr = parent.local_addr().unwrap();
+            let edge_addr = loopback_addr();
+            let edge = CacheMesh::new(
+                Arc::new(ChunkCache::new(demand_options())),
+                // Not same-region-only: a parent that has not said hello
+                // yet is one of the edge's parents.
+                CacheMeshConfig::new("edge", "uk", edge_addr)
+                    .with_role(CacheMeshRole::Edge)
+                    .with_peer(parent_addr)
+                    .with_liveness_on_receipt(liveness_on_receipt),
+            )
+            .start()
+            .await
+            .unwrap();
+            assert!(edge.parents_silent_for().await.is_none());
+            // Bytes that no FEC block ever decodes: only receipt hears them.
+            for _ in 0..5 {
+                parent.send_to(b"not a fec datagram", edge_addr).unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let silent = edge.parents_silent_for().await;
+            edge.shutdown();
+            silent
+        }
+        let silent = heard_after_undecodable_datagrams(true)
+            .await
+            .expect("the parent was heard on receipt");
+        assert!(silent < Duration::from_millis(200), "{silent:?}");
+        // The behaviour from before: only a decoded frame is heard.
+        assert!(heard_after_undecodable_datagrams(false).await.is_none());
+    }
+
+    #[test]
+    fn liveness_on_receipt_is_on_by_default_and_can_be_turned_off() {
+        let addr = loopback_addr();
+        assert!(CacheMeshConfig::new("n", "r", addr).liveness_on_receipt);
+        assert!(
+            !CacheMeshConfig::new("n", "r", addr)
+                .with_liveness_on_receipt(false)
+                .liveness_on_receipt
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
