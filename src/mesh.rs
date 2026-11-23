@@ -30,6 +30,28 @@ const FRAME_INITIALIZATION: u8 = 4;
 const FRAME_SUBSCRIBE: u8 = 5;
 const FRAME_UNSUBSCRIBE: u8 = 6;
 const FRAME_LINK_REPORT: u8 = 7;
+/// The version that a node speaking like a later build writes, and the kind
+/// of the frame that it sends besides (see
+/// `CacheMeshConfig::with_test_future_frames`).
+const FUTURE_FRAME_VERSION: u8 = FRAME_VERSION + 1;
+const FUTURE_FRAME_KIND: u8 = 0x7e;
+/// A hello extension that no build defines, which such a node appends.
+const FUTURE_HELLO_EXTENSION: u8 = 0x7f;
+/// How often such a node sends each peer a frame of the unknown kind.
+const FUTURE_FRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// Hello extensions follow the role byte, any number of them, each
+/// `tag u8, len u16, value[len]`. The process's start in Unix microseconds
+/// (u64): a peer whose boot id changed has restarted.
+const HELLO_EXTENSION_BOOT_ID: u8 = 0x01;
+/// The sender's build id: UTF-8, at most [`HELLO_BUILD_MAX_BYTES`].
+const HELLO_EXTENSION_BUILD: u8 = 0x02;
+/// The sender's state, one byte (see `CacheMeshConfig::with_hello_state`).
+const HELLO_EXTENSION_STATE: u8 = 0x03;
+const HELLO_BUILD_MAX_BYTES: usize = 64;
+/// The rank byte of a Subscribe whose sender gives no rank.
+const SUBSCRIBE_RANK_NONE: u8 = u8::MAX;
+/// One warning of a frame that does not decode, for each peer, in this long.
+const INVALID_FRAME_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// Packet loss on the path to a peer below which the configured repair is
 /// enough: 0.05%.
 const LINK_LOSS_FLOOR_PPM: u32 = 500;
@@ -88,6 +110,9 @@ const MAX_GOSSIP_PEERS: usize = 256;
 /// rank it after every live parent that is not (see
 /// `CacheMeshConfig::avoid_draining_parents`).
 const HELLO_DRAINING_BIT: u8 = 0x80;
+/// The low four bits of a hello's role byte: the role. Bits 4 to 6 are
+/// reserved and ignored.
+const HELLO_ROLE_MASK: u8 = 0x0f;
 const FEC_OBSERVATION_DATAGRAM_WINDOW: u64 = 8_192;
 const FEC_COMPLETED_BLOCK_WINDOW: usize = 4_096;
 const DEFAULT_MAX_PEERS: usize = 256;
@@ -124,12 +149,79 @@ impl CacheMeshRole {
         }
     }
 
-    fn from_wire(value: u8) -> Result<Self, MeshError> {
-        match value & !HELLO_DRAINING_BIT {
-            0 => Ok(Self::Peer),
-            1 => Ok(Self::Distributor),
-            2 => Ok(Self::Edge),
-            _ => Err(MeshError::InvalidFrame("unknown cache mesh role")),
+    /// The role in a hello's role byte.
+    fn from_wire(value: u8) -> WireRole {
+        match value & HELLO_ROLE_MASK {
+            0 => WireRole::Known(Self::Peer),
+            1 => WireRole::Known(Self::Distributor),
+            2 => WireRole::Known(Self::Edge),
+            other => WireRole::Other(other),
+        }
+    }
+}
+
+/// The role that a peer's hello gives: one of this build's, or one that this
+/// build does not know (a later build's). A peer of an unknown role is heard
+/// and counted (`rx_unknown_roles`); it is never a parent and never a child,
+/// and no node of this build can be given such a role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireRole {
+    Known(CacheMeshRole),
+    /// The role bits (3 to 15) as they arrived.
+    Other(u8),
+}
+
+impl WireRole {
+    fn wire_value(self) -> u8 {
+        match self {
+            Self::Known(role) => role.wire_value(),
+            Self::Other(value) => value & HELLO_ROLE_MASK,
+        }
+    }
+
+    /// Whether a node of role `own` takes playlists from a peer of this
+    /// role (`None`: its hello has not arrived).
+    fn may_be_parent(role: Option<Self>, own: CacheMeshRole) -> bool {
+        match role {
+            Some(Self::Other(_)) => false,
+            // Only a flat mesh of equal nodes takes parts from a leaf.
+            Some(Self::Known(CacheMeshRole::Edge)) => own == CacheMeshRole::Peer,
+            Some(Self::Known(_)) | None => true,
+        }
+    }
+
+    /// Whether a node of role `own` sends playlists to a peer of this role
+    /// (`None`: its hello has not arrived). A distributor's children are
+    /// the leaves.
+    fn may_be_child(role: Option<Self>, own: CacheMeshRole) -> bool {
+        match role {
+            Some(Self::Other(_)) => false,
+            Some(Self::Known(role)) => {
+                own != CacheMeshRole::Distributor || role == CacheMeshRole::Edge
+            }
+            None => true,
+        }
+    }
+}
+
+/// How a node writes its frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FrameForm {
+    /// As this build does.
+    #[default]
+    Current,
+    /// As a later build might (see
+    /// `CacheMeshConfig::with_test_future_frames`): a later version, an
+    /// extension on every hello and three bytes on every subscribe that this
+    /// build does not know.
+    Future,
+}
+
+impl FrameForm {
+    fn version(self) -> u8 {
+        match self {
+            Self::Current => FRAME_VERSION,
+            Self::Future => FUTURE_FRAME_VERSION,
         }
     }
 }
@@ -139,6 +231,9 @@ pub enum MeshError {
     Io(std::io::Error),
     Fec(DatagramFecError),
     InvalidFrame(&'static str),
+    /// A frame of a kind that this build does not know (a later build's).
+    /// Its body was not read.
+    UnknownKind(u8),
     InvalidUtf8(std::str::Utf8Error),
     Cache(&'static str),
 }
@@ -149,6 +244,7 @@ impl fmt::Display for MeshError {
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::Fec(err) => write!(f, "fec error: {err}"),
             Self::InvalidFrame(msg) => write!(f, "invalid mesh frame: {msg}"),
+            Self::UnknownKind(kind) => write!(f, "unknown mesh frame kind {kind:#04x}"),
             Self::InvalidUtf8(err) => write!(f, "invalid utf-8 in mesh frame: {err}"),
             Self::Cache(err) => write!(f, "cache error: {err}"),
         }
@@ -310,13 +406,14 @@ impl fmt::Debug for ReceiveObserverSlot {
 
 /// The stream and slot of a chunk frame, from its first bytes: the first
 /// source symbol of the frame's block is enough. `None` for any other frame,
-/// or when `prefix` is too short.
+/// or when `prefix` is too short. A frame of a later version is read as
+/// [`MeshFrame::decode`] reads it.
 pub fn chunk_frame_slot(prefix: &[u8]) -> Option<(u64, u64)> {
     let header = FRAME_MAGIC.len() + 2;
     if prefix.len() < header + 2 || &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
         return None;
     }
-    if prefix[FRAME_MAGIC.len()] != FRAME_VERSION || prefix[FRAME_MAGIC.len() + 1] != FRAME_CHUNK {
+    if prefix[FRAME_MAGIC.len()] < FRAME_VERSION || prefix[FRAME_MAGIC.len() + 1] != FRAME_CHUNK {
         return None;
     }
     let node_len = usize::from(u16::from_be_bytes([prefix[header], prefix[header + 1]]));
@@ -446,8 +543,8 @@ pub struct CacheMeshConfig {
     pub video_backfill_parts: Option<usize>,
     /// Subscribe frames carry the parent's place in this node's ranking of
     /// the playlist's parents (0: first), so a parent knows whether it is
-    /// the child's first parent. Off sends the frame of before (a parent of
-    /// before refuses the longer one).
+    /// the child's first parent. Off, the rank byte says that the child
+    /// gives none.
     pub subscribe_rank: bool,
     /// A renewal that finds the ranked parents of a playlist changed
     /// releases (Unsubscribe) the parents that left the set, at once.
@@ -474,6 +571,12 @@ pub struct CacheMeshConfig {
     pub receive_loss_ppm: u32,
     /// Offset of the first block id of each lane. `start` sets it.
     block_id_offset: u32,
+    /// What this node's hellos and subscribes give as its boot id: the
+    /// start of the process in Unix microseconds. Zero until `start` sets it
+    /// to the time of the start.
+    boot_id: u64,
+    /// The form of the frames that this node writes.
+    frame_form: FrameForm,
     /// Told when the first datagram of each part leaves for a child.
     send_observer: SendObserverSlot,
     /// Pairs whose live parts are not pushed (see `with_live_push_filter`).
@@ -573,6 +676,8 @@ impl CacheMeshConfig {
             applied_tx: None,
             receive_loss_ppm: 0,
             block_id_offset: 0,
+            boot_id: 0,
+            frame_form: FrameForm::Current,
             send_observer: SendObserverSlot(None),
             live_push_filter: LivePushFilterSlot(None),
             receive_observer: ReceiveObserverSlot(None),
@@ -731,6 +836,22 @@ impl CacheMeshConfig {
 
     pub fn with_receive_loss_ppm(mut self, receive_loss_ppm: u32) -> Self {
         self.receive_loss_ppm = receive_loss_ppm.min(1_000_000);
+        self
+    }
+
+    /// For the proof that two builds interoperate: make this node speak as a
+    /// later build might. It writes the next frame version, appends an
+    /// extension that no build defines to every hello and three bytes to
+    /// every subscribe, and sends every peer one frame of an unknown kind a
+    /// second. A node of this build reads all of it as far as it knows it
+    /// and counts the frame of the unknown kind (`rx_unknown_kinds`).
+    #[doc(hidden)]
+    pub fn with_test_future_frames(mut self, future: bool) -> Self {
+        self.frame_form = if future {
+            FrameForm::Future
+        } else {
+            FrameForm::Current
+        };
         self
     }
 
@@ -1443,6 +1564,14 @@ pub struct CacheMeshFecStats {
     pub rx_evicted_objects: u64,
     pub rx_oversized_objects: u64,
     pub rx_unauthorized_datagrams: u64,
+    /// Frames of a kind that this build does not know (a later build's):
+    /// dropped unread, and not logged.
+    pub rx_unknown_kinds: u64,
+    /// Hellos whose role this build does not know: the peer is heard, and
+    /// is neither a parent nor a child.
+    pub rx_unknown_roles: u64,
+    /// Frames that did not decode for any other reason.
+    pub rx_invalid_frames: u64,
     pub peer_limit_drops: u64,
     pub remote_slot_evictions: u64,
     pub replica_queue_depth: u64,
@@ -1500,6 +1629,9 @@ impl CacheMeshFecStats {
             rx_oversized_objects: self.rx_oversized_objects + other.rx_oversized_objects,
             rx_unauthorized_datagrams: self.rx_unauthorized_datagrams
                 + other.rx_unauthorized_datagrams,
+            rx_unknown_kinds: self.rx_unknown_kinds + other.rx_unknown_kinds,
+            rx_unknown_roles: self.rx_unknown_roles + other.rx_unknown_roles,
+            rx_invalid_frames: self.rx_invalid_frames + other.rx_invalid_frames,
             peer_limit_drops: self.peer_limit_drops + other.peer_limit_drops,
             remote_slot_evictions: self.remote_slot_evictions + other.remote_slot_evictions,
             replica_queue_depth: self.replica_queue_depth + other.replica_queue_depth,
@@ -1550,6 +1682,9 @@ struct CacheMeshFecCounters {
     rx_evicted_objects: AtomicU64,
     rx_oversized_objects: AtomicU64,
     rx_unauthorized_datagrams: AtomicU64,
+    rx_unknown_kinds: AtomicU64,
+    rx_unknown_roles: AtomicU64,
+    rx_invalid_frames: AtomicU64,
     peer_limit_drops: AtomicU64,
     remote_slot_evictions: AtomicU64,
     replica_queue_depth: AtomicU64,
@@ -1596,6 +1731,9 @@ impl CacheMeshFecCounters {
             rx_evicted_objects: self.rx_evicted_objects.load(Ordering::Relaxed),
             rx_oversized_objects: self.rx_oversized_objects.load(Ordering::Relaxed),
             rx_unauthorized_datagrams: self.rx_unauthorized_datagrams.load(Ordering::Relaxed),
+            rx_unknown_kinds: self.rx_unknown_kinds.load(Ordering::Relaxed),
+            rx_unknown_roles: self.rx_unknown_roles.load(Ordering::Relaxed),
+            rx_invalid_frames: self.rx_invalid_frames.load(Ordering::Relaxed),
             peer_limit_drops: self.peer_limit_drops.load(Ordering::Relaxed),
             remote_slot_evictions: self.remote_slot_evictions.load(Ordering::Relaxed),
             replica_queue_depth: self.replica_queue_depth.load(Ordering::Relaxed),
@@ -1629,6 +1767,9 @@ impl CacheMesh {
 
     pub async fn start(mut self) -> Result<CacheMeshHandle, MeshError> {
         self.config.block_id_offset = block_id_start_offset(&self.config);
+        if self.config.boot_id == 0 {
+            self.config.boot_id = unix_micros();
+        }
         if self.config.max_frame_bytes == 0 {
             self.config.max_frame_bytes = frame_bytes_for(&self.cache);
         }
@@ -1712,6 +1853,13 @@ impl CacheMesh {
             .take(max_peers)
             .collect::<HashSet<_>>();
         let shared = Arc::new(MeshShared {
+            identity: HelloIdentity {
+                node_id: self.config.node_id.clone(),
+                region: self.config.region.clone(),
+                role: self.config.role,
+                same_region_only: self.config.same_region_only,
+                boot_id: self.config.boot_id,
+            },
             peers: RwLock::new(initial_peers),
             allowed_peers: ArcSwap::from_pointee(self.config.allowed_peers.clone()),
             peer_regions: RwLock::new(HashMap::new()),
@@ -1881,6 +2029,8 @@ impl CacheMesh {
             release_unranked_parents: self.config.release_unranked_parents,
             avoid_draining_parents: self.config.avoid_draining_parents,
             warm_from_second_parent: self.config.warm_from_second_parent,
+            boot_id: self.config.boot_id,
+            frame_form: self.config.frame_form,
         })
     }
 }
@@ -1910,13 +2060,24 @@ fn remote_slots_for(cache: &ChunkCache) -> usize {
         .max(1)
 }
 
+/// What a node's hellos say of it, besides its peers and whether it is
+/// draining.
+struct HelloIdentity {
+    node_id: String,
+    region: String,
+    role: CacheMeshRole,
+    same_region_only: bool,
+    boot_id: u64,
+}
+
 /// State that the tasks of one mesh node and its handle share.
 struct MeshShared {
+    identity: HelloIdentity,
     peers: RwLock<HashSet<SocketAddr>>,
     /// Read once for every datagram, so without a lock.
     allowed_peers: ArcSwap<HashSet<SocketAddr>>,
     peer_regions: RwLock<HashMap<SocketAddr, String>>,
-    peer_roles: RwLock<HashMap<SocketAddr, CacheMeshRole>>,
+    peer_roles: RwLock<HashMap<SocketAddr, WireRole>>,
     /// Peers whose newest hello says that they are draining.
     peer_draining: StdMutex<HashSet<SocketAddr>>,
     /// This node is draining: its hellos say so (`CacheMeshHandle::set_draining`).
@@ -1978,6 +2139,38 @@ impl ClassLaneShared {
 impl MeshShared {
     fn is_allowed(&self, peer: &SocketAddr) -> bool {
         self.allowed_peers.load().contains(peer)
+    }
+
+    /// This node's hello as it stands now: its identity, the peers that it
+    /// gossips (a leaf gossips none) and whether it is draining.
+    async fn hello(&self) -> MeshFrame {
+        let identity = &self.identity;
+        let peers = if identity.role == CacheMeshRole::Edge {
+            Vec::new()
+        } else {
+            // One lock at a time: the sync task takes these two in the
+            // other order.
+            let mut peers = self.peers.read().await.iter().copied().collect::<Vec<_>>();
+            let peer_regions = self.peer_regions.read().await;
+            peers.retain(|peer| {
+                !identity.same_region_only
+                    || peer_regions
+                        .get(peer)
+                        .is_none_or(|region| region == &identity.region)
+            });
+            peers.truncate(MAX_GOSSIP_PEERS);
+            peers
+        };
+        MeshFrame::Hello {
+            node_id: identity.node_id.clone(),
+            region: identity.region.clone(),
+            role: WireRole::Known(identity.role),
+            peers,
+            draining: self.draining.load(Ordering::Relaxed),
+            boot_id: Some(identity.boot_id),
+            build: None,
+            state: None,
+        }
     }
 
     /// The peer that sent a datagram from `from` to the socket of `lane`, if
@@ -2058,6 +2251,8 @@ pub struct CacheMeshHandle {
     release_unranked_parents: bool,
     avoid_draining_parents: bool,
     warm_from_second_parent: bool,
+    boot_id: u64,
+    frame_form: FrameForm,
 }
 
 /// Packet loss on the links of this node to one peer, in parts per million.
@@ -2119,7 +2314,7 @@ impl CacheMeshHandle {
             from_slot: from_slot as u64,
             count,
         }
-        .encode()?;
+        .encode_as(self.frame_form)?;
         self.send_control(&peers, &frame).await
     }
 
@@ -2187,7 +2382,7 @@ impl CacheMeshHandle {
             return Ok(0);
         }
         let frame = MeshFrame::replica_request(self.node_id.clone(), stream_id, from_slot as u64)
-            .encode()?;
+            .encode_as(self.frame_form)?;
         self.send_control(&peers, &frame).await
     }
 
@@ -2220,7 +2415,11 @@ impl CacheMeshHandle {
             1
         };
         for (index, peer) in peers.iter().enumerate() {
-            let backfill_parts = if index < warm_parents { backfill_parts } else { 0 };
+            let backfill_parts = if index < warm_parents {
+                backfill_parts
+            } else {
+                0
+            };
             let frame = MeshFrame::Subscribe {
                 node_id: self.node_id.clone(),
                 stream_id,
@@ -2229,9 +2428,10 @@ impl CacheMeshHandle {
                 lease_ms,
                 rank: self
                     .subscribe_rank
-                    .then(|| u8::try_from(index).unwrap_or(u8::MAX)),
+                    .then(|| u8::try_from(index).unwrap_or(SUBSCRIBE_RANK_NONE - 1)),
+                boot_id: Some(self.boot_id),
             }
-            .encode()?;
+            .encode_as(self.frame_form)?;
             self.send_control(std::slice::from_ref(peer), &frame)
                 .await?;
         }
@@ -2251,7 +2451,7 @@ impl CacheMeshHandle {
                 node_id: self.node_id.clone(),
                 stream_id,
             }
-            .encode()?;
+            .encode_as(self.frame_form)?;
             self.send_control(&left, &frame).await?;
             self.shared
                 .counters
@@ -2278,7 +2478,7 @@ impl CacheMeshHandle {
             node_id: self.node_id.clone(),
             stream_id,
         }
-        .encode()?;
+        .encode_as(self.frame_form)?;
         self.send_control(&peers, &frame).await
     }
 
@@ -2462,17 +2662,7 @@ impl CacheMeshHandle {
                 {
                     return false;
                 }
-                if self.role == CacheMeshRole::Edge {
-                    return roles
-                        .get(peer)
-                        .is_none_or(|role| *role != CacheMeshRole::Edge);
-                }
-                if self.role == CacheMeshRole::Distributor {
-                    return roles
-                        .get(peer)
-                        .is_none_or(|role| *role != CacheMeshRole::Edge);
-                }
-                true
+                WireRole::may_be_parent(roles.get(peer).copied(), self.role)
             })
             .collect::<Vec<_>>();
         peers.sort_unstable();
@@ -2491,10 +2681,17 @@ enum MeshFrame {
     Hello {
         node_id: String,
         region: String,
-        role: CacheMeshRole,
+        role: WireRole,
         peers: Vec<SocketAddr>,
         /// The sender is draining (the top bit of the role byte).
         draining: bool,
+        /// The start of the sender's process in Unix microseconds
+        /// (extension `0x01`).
+        boot_id: Option<u64>,
+        /// The sender's build id (extension `0x02`).
+        build: Option<String>,
+        /// The sender's state (extension `0x03`).
+        state: Option<u8>,
     },
     Chunk {
         node_id: String,
@@ -2528,9 +2725,13 @@ enum MeshFrame {
         backfill_parts: u32,
         lease_ms: u32,
         /// The parent's place in the child's ranking of the playlist's
-        /// parents (0: first), when the child says (one byte after the
-        /// lease; a frame without it is the form from before).
+        /// parents (0: first), when the child says: one byte after the
+        /// lease, 255 for none.
         rank: Option<u8>,
+        /// The start of the child's process in Unix microseconds, after the
+        /// rank: a Subscribe with another boot id than the lease's comes
+        /// from a restarted child.
+        boot_id: Option<u64>,
     },
     Unsubscribe {
         node_id: String,
@@ -2545,15 +2746,10 @@ impl MeshFrame {
         region: impl Into<String>,
         peers: Vec<SocketAddr>,
     ) -> Self {
-        Self::Hello {
-            node_id: node_id.into(),
-            region: region.into(),
-            role: CacheMeshRole::Peer,
-            peers,
-            draining: false,
-        }
+        Self::hello_with_role(node_id, region, CacheMeshRole::Peer, peers)
     }
 
+    #[cfg(test)]
     fn hello_with_role(
         node_id: impl Into<String>,
         region: impl Into<String>,
@@ -2563,9 +2759,12 @@ impl MeshFrame {
         Self::Hello {
             node_id: node_id.into(),
             region: region.into(),
-            role,
+            role: WireRole::Known(role),
             peers,
             draining: false,
+            boot_id: None,
+            build: None,
+            state: None,
         }
     }
 
@@ -2607,7 +2806,27 @@ impl MeshFrame {
         }
     }
 
+    /// Whether this build reads frames of `kind`.
+    fn knows_kind(kind: u8) -> bool {
+        matches!(
+            kind,
+            FRAME_HELLO
+                | FRAME_CHUNK
+                | FRAME_REPLICA_REQUEST
+                | FRAME_INITIALIZATION
+                | FRAME_SUBSCRIBE
+                | FRAME_UNSUBSCRIBE
+                | FRAME_LINK_REPORT
+        )
+    }
+
+    /// The frame as this build writes it.
+    #[cfg(test)]
     fn encode(&self) -> Result<Bytes, MeshError> {
+        self.encode_as(FrameForm::Current)
+    }
+
+    fn encode_as(&self, form: FrameForm) -> Result<Bytes, MeshError> {
         let node_id = self.node_id().as_bytes();
         if node_id.len() > u16::MAX as usize {
             return Err(MeshError::InvalidFrame("node id too long"));
@@ -2615,13 +2834,16 @@ impl MeshFrame {
 
         let mut out = BytesMut::new();
         out.put_slice(FRAME_MAGIC);
-        out.put_u8(FRAME_VERSION);
+        out.put_u8(form.version());
         match self {
             Self::Hello {
                 region,
                 role,
                 peers,
                 draining,
+                boot_id,
+                build,
+                state,
                 ..
             } => {
                 let region = region.as_bytes();
@@ -2630,6 +2852,12 @@ impl MeshFrame {
                 }
                 if peers.len() > MAX_GOSSIP_PEERS {
                     return Err(MeshError::InvalidFrame("too many gossip peers"));
+                }
+                if build
+                    .as_ref()
+                    .is_some_and(|build| build.len() > HELLO_BUILD_MAX_BYTES)
+                {
+                    return Err(MeshError::InvalidFrame("build id too long"));
                 }
                 out.put_u8(FRAME_HELLO);
                 out.put_u16(node_id.len() as u16);
@@ -2646,10 +2874,28 @@ impl MeshFrame {
                     out.put_u16(peer.len() as u16);
                     out.put_slice(peer);
                 }
-                out.put_u8(
-                    role.wire_value()
-                        | if *draining { HELLO_DRAINING_BIT } else { 0 },
-                );
+                out.put_u8(role.wire_value() | if *draining { HELLO_DRAINING_BIT } else { 0 });
+                if let Some(boot_id) = boot_id {
+                    out.put_u8(HELLO_EXTENSION_BOOT_ID);
+                    out.put_u16(8);
+                    out.put_u64(*boot_id);
+                }
+                if let Some(build) = build {
+                    out.put_u8(HELLO_EXTENSION_BUILD);
+                    out.put_u16(build.len() as u16);
+                    out.put_slice(build.as_bytes());
+                }
+                if let Some(state) = state {
+                    out.put_u8(HELLO_EXTENSION_STATE);
+                    out.put_u16(1);
+                    out.put_u8(*state);
+                }
+                if form == FrameForm::Future {
+                    // Five bytes that this build skips.
+                    out.put_u8(FUTURE_HELLO_EXTENSION);
+                    out.put_u16(2);
+                    out.put_u16(0);
+                }
             }
             Self::Chunk {
                 stream_id,
@@ -2706,6 +2952,7 @@ impl MeshFrame {
                 backfill_parts,
                 lease_ms,
                 rank,
+                boot_id,
                 ..
             } => {
                 out.put_u8(FRAME_SUBSCRIBE);
@@ -2715,8 +2962,23 @@ impl MeshFrame {
                 out.put_u64(*from_slot);
                 out.put_u32(*backfill_parts);
                 out.put_u32(*lease_ms);
-                if let Some(rank) = rank {
-                    out.put_u8(*rank);
+                // A node always sends both the rank and its boot id. What
+                // follows them is unknown to this build, so the three bytes
+                // of the later form come only after both.
+                let boot_id = match form {
+                    FrameForm::Current => *boot_id,
+                    FrameForm::Future => Some(boot_id.unwrap_or(0)),
+                };
+                match (rank, boot_id) {
+                    (rank, Some(boot_id)) => {
+                        out.put_u8(rank.unwrap_or(SUBSCRIBE_RANK_NONE));
+                        out.put_u64(boot_id);
+                    }
+                    (Some(rank), None) => out.put_u8(*rank),
+                    (None, None) => {}
+                }
+                if form == FrameForm::Future {
+                    out.put_slice(&[FUTURE_HELLO_EXTENSION; 3]);
                 }
             }
             Self::Unsubscribe { stream_id, .. } => {
@@ -2729,10 +2991,30 @@ impl MeshFrame {
         Ok(out.freeze())
     }
 
+    /// A frame of a kind that no build defines, as a node that speaks like a
+    /// later build sends it. Its body is not a node id: a receiver that read
+    /// it as one would refuse the frame as invalid.
+    fn of_unknown_kind() -> Bytes {
+        let mut out = BytesMut::with_capacity(FRAME_MAGIC.len() + 10);
+        out.put_slice(FRAME_MAGIC);
+        out.put_u8(FUTURE_FRAME_VERSION);
+        out.put_u8(FUTURE_FRAME_KIND);
+        out.put_slice(&[0xff; 8]);
+        out.freeze()
+    }
+
     /// Decode a frame. The payload of a chunk or initialization frame is a
     /// slice of `bytes`, not a copy.
+    ///
+    /// A frame is read as far as this build knows it, so that two builds
+    /// interoperate for the length of a roll: any version from this build's
+    /// on is accepted (the version is the newest revision that the sender
+    /// speaks; an incompatible change takes a new magic or a new kind, never
+    /// a version test), every kind reads the fields it knows and ignores
+    /// what follows them, and a kind that this build does not know is
+    /// [`MeshError::UnknownKind`], found before anything of its body is read.
     fn decode(bytes: Bytes) -> Result<Self, MeshError> {
-        if bytes.len() < FRAME_MAGIC.len() + 4 {
+        if bytes.len() < FRAME_MAGIC.len() + 2 {
             return Err(MeshError::InvalidFrame("frame too short"));
         }
         let mut buf = bytes;
@@ -2740,10 +3022,13 @@ impl MeshFrame {
             return Err(MeshError::InvalidFrame("bad magic"));
         }
         buf.advance(FRAME_MAGIC.len());
-        if buf.get_u8() != FRAME_VERSION {
+        if buf.get_u8() < FRAME_VERSION {
             return Err(MeshError::InvalidFrame("unsupported version"));
         }
         let kind = buf.get_u8();
+        if !Self::knows_kind(kind) {
+            return Err(MeshError::UnknownKind(kind));
+        }
         let node_id = read_string(&mut buf)?;
         match kind {
             FRAME_HELLO => {
@@ -2762,17 +3047,43 @@ impl MeshFrame {
                         .map_err(|_| MeshError::InvalidFrame("invalid gossip peer addr"))?;
                     peers.push(peer);
                 }
-                if buf.remaining() != 1 {
-                    return Err(MeshError::InvalidFrame("hello role mismatch"));
+                if !buf.has_remaining() {
+                    return Err(MeshError::InvalidFrame("hello without its role"));
                 }
                 let role_byte = buf.get_u8();
-                let role = CacheMeshRole::from_wire(role_byte)?;
+                let mut boot_id = None;
+                let mut build = None;
+                let mut state = None;
+                // The extensions: tag, length, value. One that is cut short
+                // ends the list; one that this build does not know, or whose
+                // value it cannot read, is skipped.
+                while buf.remaining() >= 3 {
+                    let tag = buf.get_u8();
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let value = buf.split_to(len);
+                    match tag {
+                        HELLO_EXTENSION_BOOT_ID if len >= 8 => {
+                            boot_id = Some((&value[..]).get_u64());
+                        }
+                        HELLO_EXTENSION_BUILD if len <= HELLO_BUILD_MAX_BYTES => {
+                            build = std::str::from_utf8(&value).ok().map(str::to_string);
+                        }
+                        HELLO_EXTENSION_STATE if len >= 1 => state = Some(value[0]),
+                        _ => {}
+                    }
+                }
                 Ok(Self::Hello {
                     node_id,
                     region,
-                    role,
+                    role: CacheMeshRole::from_wire(role_byte),
                     peers,
                     draining: role_byte & HELLO_DRAINING_BIT != 0,
+                    boot_id,
+                    build,
+                    state,
                 })
             }
             FRAME_CHUNK => {
@@ -2782,8 +3093,8 @@ impl MeshFrame {
                 let stream_id = buf.get_u64();
                 let slot_id = buf.get_u64();
                 let payload_len = buf.get_u32() as usize;
-                if buf.remaining() != payload_len {
-                    return Err(MeshError::InvalidFrame("chunk payload length mismatch"));
+                if buf.remaining() < payload_len {
+                    return Err(MeshError::InvalidFrame("chunk payload cut short"));
                 }
                 let payload = buf.split_to(payload_len);
                 Ok(Self::Chunk {
@@ -2794,8 +3105,8 @@ impl MeshFrame {
                 })
             }
             FRAME_REPLICA_REQUEST => {
-                if buf.remaining() != 20 {
-                    return Err(MeshError::InvalidFrame("replica request header mismatch"));
+                if buf.remaining() < 20 {
+                    return Err(MeshError::InvalidFrame("replica request too short"));
                 }
                 let stream_id = buf.get_u64();
                 let from_slot = buf.get_u64();
@@ -2808,8 +3119,8 @@ impl MeshFrame {
                 })
             }
             FRAME_LINK_REPORT => {
-                if buf.remaining() != 4 {
-                    return Err(MeshError::InvalidFrame("link report header mismatch"));
+                if buf.remaining() < 4 {
+                    return Err(MeshError::InvalidFrame("link report too short"));
                 }
                 Ok(Self::LinkReport {
                     node_id,
@@ -2822,10 +3133,8 @@ impl MeshFrame {
                 }
                 let stream_id = buf.get_u64();
                 let payload_len = buf.get_u32() as usize;
-                if buf.remaining() != payload_len {
-                    return Err(MeshError::InvalidFrame(
-                        "initialization payload length mismatch",
-                    ));
+                if buf.remaining() < payload_len {
+                    return Err(MeshError::InvalidFrame("initialization payload cut short"));
                 }
                 let payload = buf.split_to(payload_len);
                 Ok(Self::Initialization {
@@ -2835,14 +3144,19 @@ impl MeshFrame {
                 })
             }
             FRAME_SUBSCRIBE => {
-                if buf.remaining() != 24 && buf.remaining() != 25 {
-                    return Err(MeshError::InvalidFrame("subscribe header mismatch"));
+                if buf.remaining() < 24 {
+                    return Err(MeshError::InvalidFrame("subscribe too short"));
                 }
+                let has_rank = buf.remaining() >= 25;
+                let has_boot_id = buf.remaining() >= 33;
                 let stream_id = buf.get_u64();
                 let from_slot = buf.get_u64();
                 let backfill_parts = buf.get_u32();
                 let lease_ms = buf.get_u32();
-                let rank = buf.has_remaining().then(|| buf.get_u8());
+                let rank = has_rank
+                    .then(|| buf.get_u8())
+                    .filter(|rank| *rank != SUBSCRIBE_RANK_NONE);
+                let boot_id = has_boot_id.then(|| buf.get_u64());
                 Ok(Self::Subscribe {
                     node_id,
                     stream_id,
@@ -2850,16 +3164,17 @@ impl MeshFrame {
                     backfill_parts,
                     lease_ms,
                     rank,
+                    boot_id,
                 })
             }
             FRAME_UNSUBSCRIBE => {
-                if buf.remaining() != 8 {
-                    return Err(MeshError::InvalidFrame("unsubscribe header mismatch"));
+                if buf.remaining() < 8 {
+                    return Err(MeshError::InvalidFrame("unsubscribe too short"));
                 }
                 let stream_id = buf.get_u64();
                 Ok(Self::Unsubscribe { node_id, stream_id })
             }
-            _ => Err(MeshError::InvalidFrame("unknown frame kind")),
+            _ => Err(MeshError::UnknownKind(kind)),
         }
     }
 }
@@ -3900,6 +4215,34 @@ impl PeerHeard {
     }
 }
 
+/// A receive task's record of when it last warned of a frame from each peer
+/// that did not decode. Every such frame is counted (`rx_invalid_frames`);
+/// a peer that sends many is named once in
+/// [`INVALID_FRAME_WARN_INTERVAL`].
+#[derive(Default)]
+struct InvalidFrameWarnings(HashMap<SocketAddr, Instant>);
+
+impl InvalidFrameWarnings {
+    /// Whether a warning that names `peer` is due. The caller asks only
+    /// for an authorized peer; the record is replaced when it holds many
+    /// more than a node has peers.
+    fn due(&mut self, peer: SocketAddr) -> bool {
+        let now = Instant::now();
+        if self
+            .0
+            .get(&peer)
+            .is_some_and(|last| now.duration_since(*last) < INVALID_FRAME_WARN_INTERVAL)
+        {
+            return false;
+        }
+        if self.0.len() >= 4_096 {
+            self.0.clear();
+        }
+        self.0.insert(peer, now);
+        true
+    }
+}
+
 /// Receives the datagrams of one socket of the mesh: the main socket, or the
 /// class socket of a mesh split by class, which takes parts and
 /// initializations only. `replica_tx` and `class_replicas` take the replica
@@ -3933,6 +4276,7 @@ async fn receive_task(
     .with_measured_loss(Arc::clone(shared.measured_loss_of(lane)));
     let mut buf = vec![0u8; 65_536];
     let mut heard = PeerHeard::default();
+    let mut invalid_frames = InvalidFrameWarnings::default();
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4030,7 +4374,16 @@ async fn receive_task(
                             },
                         ).await;
                     }
-                    Err(err) => warn!(peer = %peer, error = %err, "cache mesh frame decode failed"),
+                    // A frame of a later build: counted, never logged.
+                    Err(MeshError::UnknownKind(_)) => {
+                        counters.rx_unknown_kinds.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        counters.rx_invalid_frames.fetch_add(1, Ordering::Relaxed);
+                        if invalid_frames.due(peer) {
+                            warn!(peer = %peer, error = %err, "cache mesh frame decode failed");
+                        }
+                    }
                 }
             }
         }
@@ -4198,7 +4551,14 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             role,
             peers,
             draining,
+            ..
         } => {
+            if matches!(role, WireRole::Other(_)) {
+                handler
+                    .counters
+                    .rx_unknown_roles
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if handler.config.same_region_only && region != handler.config.region {
                 handler.shared.peers.write().await.remove(&peer);
                 handler.shared.peer_regions.write().await.remove(&peer);
@@ -4434,6 +4794,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             backfill_parts,
             lease_ms,
             rank,
+            ..
         } => {
             if !peer_is_allowed(peer, &handler).await || handler.config.role == CacheMeshRole::Edge
             {
@@ -4512,16 +4873,13 @@ async fn peer_is_allowed(peer: SocketAddr, handler: &FrameHandler<'_>) -> bool {
     if !region_allowed {
         return false;
     }
-    if handler.config.role == CacheMeshRole::Edge {
-        return handler
-            .shared
-            .peer_roles
-            .read()
-            .await
-            .get(&peer)
-            .is_none_or(|role| *role != CacheMeshRole::Edge);
+    match handler.shared.peer_roles.read().await.get(&peer) {
+        // A peer of a role that this build does not know is neither a
+        // parent nor a child: nothing is taken from it or served to it.
+        Some(WireRole::Other(_)) => false,
+        Some(WireRole::Known(CacheMeshRole::Edge)) => handler.config.role != CacheMeshRole::Edge,
+        Some(WireRole::Known(_)) | None => true,
     }
-    true
 }
 
 /// Add an authorized peer to the peer table. `None` when the peer is not
@@ -4606,7 +4964,7 @@ async fn serve_replica_request(
         if let Some(initialization) = cache.stream_initialization_for_handle(handle) {
             let frame =
                 MeshFrame::initialization(config.node_id.clone(), stream_id, initialization)
-                    .encode()?;
+                    .encode_as(config.frame_form)?;
             sender.send_to(socket, peer, dest, &frame).await?;
             sent = sent.saturating_add(1);
         }
@@ -4637,7 +4995,7 @@ async fn serve_replica_request(
             continue;
         }
         let frame = MeshFrame::chunk(config.node_id.clone(), stream_id, slot_id as u64, payload)
-            .encode()?;
+            .encode_as(config.frame_form)?;
         sender.send_to(socket, peer, dest, &frame).await?;
         sent = sent.saturating_add(1);
         #[cfg(test)]
@@ -4745,6 +5103,9 @@ async fn announce_task(
     .with_link_loss(Arc::clone(&shared.link_loss));
     let mut reported: HashMap<SocketAddr, (Instant, u32)> = HashMap::new();
     let mut interval = tokio::time::interval(config.announce_interval);
+    // When a node that speaks like a later build last sent its frame of an
+    // unknown kind.
+    let mut future_frame_sent: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -4754,33 +5115,7 @@ async fn announce_task(
             }
             _ = interval.tick() => {
                 let current_peers = shared.peers.read().await.iter().copied().collect::<Vec<_>>();
-                let peer_regions = shared.peer_regions.read().await;
-                let advertised_peers = if config.role == CacheMeshRole::Edge {
-                    Vec::new()
-                } else {
-                    current_peers
-                        .iter()
-                        .copied()
-                        .filter(|peer| {
-                            !config.same_region_only
-                                || peer_regions
-                                    .get(peer)
-                                    .is_none_or(|region| region == &config.region)
-                        })
-                        .take(MAX_GOSSIP_PEERS)
-                        .collect::<Vec<_>>()
-                };
-                drop(peer_regions);
-                let mut hello = MeshFrame::hello_with_role(
-                    config.node_id.clone(),
-                    config.region.clone(),
-                    config.role,
-                    advertised_peers,
-                );
-                if let MeshFrame::Hello { draining, .. } = &mut hello {
-                    *draining = shared.draining.load(Ordering::Relaxed);
-                }
-                let frame = match hello.encode() {
+                let frame = match shared.hello().await.encode_as(config.frame_form) {
                     Ok(frame) => frame,
                     Err(err) => {
                         error!(error = %err, "cache mesh hello encode failed");
@@ -4790,6 +5125,17 @@ async fn announce_task(
                 for peer in &current_peers {
                     if let Err(err) = sender.send(&socket, *peer, &frame).await {
                         debug!(peer = %peer, error = %err, "cache mesh hello send failed");
+                    }
+                }
+                if config.frame_form == FrameForm::Future
+                    && future_frame_sent.is_none_or(|at| at.elapsed() >= FUTURE_FRAME_INTERVAL)
+                {
+                    future_frame_sent = Some(Instant::now());
+                    let frame = MeshFrame::of_unknown_kind();
+                    for peer in &current_peers {
+                        if let Err(err) = sender.send(&socket, *peer, &frame).await {
+                            debug!(peer = %peer, error = %err, "cache mesh future frame send failed");
+                        }
                     }
                 }
                 // Tell each peer what this node loses of what the peer
@@ -4818,7 +5164,7 @@ async fn announce_task(
                         node_id: config.node_id.clone(),
                         loss_ppm,
                     };
-                    match report.encode() {
+                    match report.encode_as(config.frame_form) {
                         Ok(report) => {
                             if let Err(err) = sender.send(&socket, peer, &report).await {
                                 debug!(peer = %peer, error = %err, "cache mesh link report send failed");
@@ -4912,6 +5258,7 @@ fn retain_retained_remote_slots(
 /// A chunk frame without its payload: the payload follows it.
 fn chunk_frame_header(
     out: &mut Vec<u8>,
+    form: FrameForm,
     node_id: &str,
     stream_id: u64,
     slot_id: u64,
@@ -4919,7 +5266,7 @@ fn chunk_frame_header(
 ) {
     out.clear();
     out.extend_from_slice(FRAME_MAGIC);
-    out.push(FRAME_VERSION);
+    out.push(form.version());
     out.push(FRAME_CHUNK);
     out.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
     out.extend_from_slice(node_id.as_bytes());
@@ -5176,12 +5523,7 @@ async fn sync_task(
                                 .get(peer)
                                 .is_some_and(|region| region == &config.region)
                     })
-                    .filter(|peer| {
-                        config.role != CacheMeshRole::Distributor
-                            || roles
-                                .get(peer)
-                                .is_none_or(|role| *role == CacheMeshRole::Edge)
-                    })
+                    .filter(|peer| WireRole::may_be_child(roles.get(peer).copied(), config.role))
                     // A peer whose class socket would be beyond the last
                     // port has none.
                     .filter(|peer| !lane.is_class() || lane.peer_socket(*peer).is_some())
@@ -5363,7 +5705,7 @@ async fn sync_task(
                             stream_id,
                             initialization.clone(),
                         )
-                        .encode()
+                        .encode_as(config.frame_form)
                         {
                             Ok(encoded) => frame.insert(encoded),
                             Err(err) => {
@@ -5502,6 +5844,7 @@ async fn sync_task(
                     };
                     chunk_frame_header(
                         &mut frame_header,
+                        config.frame_form,
                         &config.node_id,
                         stream_id,
                         slot_id as u64,
@@ -5613,6 +5956,7 @@ async fn sync_task(
                     // Sent after the live parts of every stream of the pass.
                     chunk_frame_header(
                         &mut frame_header,
+                        config.frame_form,
                         &config.node_id,
                         stream_id,
                         slot_id as u64,
@@ -5993,6 +6337,719 @@ mod tests {
         let (_, _, copied) = chunk_frame_payload(&encoded).unwrap();
         assert_eq!(copied, payload);
         assert!(!range.contains(&copied.as_ptr()));
+    }
+
+    /// `frame` with another version byte.
+    fn as_version(frame: &[u8], version: u8) -> Bytes {
+        let mut bytes = frame.to_vec();
+        bytes[FRAME_MAGIC.len()] = version;
+        Bytes::from(bytes)
+    }
+
+    /// `frame` with `extra` bytes after it.
+    fn followed_by(frame: &[u8], extra: &[u8]) -> Bytes {
+        let mut bytes = frame.to_vec();
+        bytes.extend_from_slice(extra);
+        Bytes::from(bytes)
+    }
+
+    /// One frame of every kind, each with every field that this build
+    /// writes.
+    fn a_frame_of_every_kind() -> Vec<MeshFrame> {
+        vec![
+            MeshFrame::Hello {
+                node_id: "lon-dist-a".into(),
+                region: "london".into(),
+                role: WireRole::Known(CacheMeshRole::Distributor),
+                peers: vec!["10.80.3.21:29101".parse().unwrap()],
+                draining: true,
+                boot_id: Some(1_763_924_000_123_456),
+                build: Some("3f2a9c1d77e0-dirty".into()),
+                state: Some(1),
+            },
+            MeshFrame::chunk("uk", 42, 7, Bytes::from_static(b"media")),
+            MeshFrame::initialization("uk", 42, Bytes::from_static(b"ftyp-moov-init")),
+            MeshFrame::ReplicaRequest {
+                node_id: "jp".into(),
+                stream_id: 42,
+                from_slot: 3,
+                count: 5,
+            },
+            MeshFrame::LinkReport {
+                node_id: "jp".into(),
+                loss_ppm: 12_000,
+            },
+            MeshFrame::Subscribe {
+                node_id: "edge-1".into(),
+                stream_id: 2001,
+                from_slot: 77,
+                backfill_parts: 32,
+                lease_ms: 5_000,
+                rank: Some(1),
+                boot_id: Some(1_763_924_000_123_456),
+            },
+            MeshFrame::Unsubscribe {
+                node_id: "edge-1".into(),
+                stream_id: 2001,
+            },
+        ]
+    }
+
+    /// The version byte is the newest revision that the sender speaks: a
+    /// frame of any later version is read as this build's.
+    #[test]
+    fn a_frame_of_a_later_version_is_read() {
+        for frame in a_frame_of_every_kind() {
+            let encoded = frame.encode().unwrap();
+            assert_eq!(encoded[FRAME_MAGIC.len()], FRAME_VERSION);
+            for version in [FRAME_VERSION + 1, 9, u8::MAX] {
+                assert_eq!(
+                    MeshFrame::decode(as_version(&encoded, version)).unwrap(),
+                    frame,
+                    "version {version}"
+                );
+            }
+            // What a node that speaks like a later build writes.
+            let future = frame.encode_as(FrameForm::Future).unwrap();
+            assert_eq!(future[FRAME_MAGIC.len()], FUTURE_FRAME_VERSION);
+            assert!(future.len() >= encoded.len());
+            assert_eq!(MeshFrame::decode(future).unwrap(), frame);
+        }
+    }
+
+    /// Every kind reads the fields that it knows and ignores what a later
+    /// build put after them; a frame cut short of those fields is refused.
+    #[test]
+    fn every_frame_ignores_what_follows_its_fields() {
+        for frame in a_frame_of_every_kind() {
+            let encoded = frame.encode().unwrap();
+            for extra in [1_usize, 2, 3, 7, 40] {
+                assert_eq!(
+                    MeshFrame::decode(followed_by(&encoded, &vec![0xa5; extra])).unwrap(),
+                    frame,
+                    "{extra} bytes after {frame:?}"
+                );
+            }
+        }
+        // The payload of a chunk and of an initialization is the first
+        // `payload_len` bytes.
+        let chunk = MeshFrame::chunk("uk", 42, 7, Bytes::from_static(b"media"))
+            .encode()
+            .unwrap();
+        assert_eq!(
+            chunk_frame_payload(&followed_by(&chunk, b"later")),
+            Some((42, 7, Bytes::from_static(b"media")))
+        );
+        // Without the rank and the boot id a subscribe is 24 bytes; one byte
+        // more is the rank, and nine more the rank and the boot id.
+        let subscribe = MeshFrame::Subscribe {
+            node_id: "edge-1".into(),
+            stream_id: 2001,
+            from_slot: 77,
+            backfill_parts: 32,
+            lease_ms: 5_000,
+            rank: None,
+            boot_id: None,
+        }
+        .encode()
+        .unwrap();
+        let mut tail = vec![0_u8];
+        tail.extend_from_slice(&7_u64.to_be_bytes());
+        tail.extend_from_slice(b"later");
+        assert!(matches!(
+            MeshFrame::decode(followed_by(&subscribe, &tail)).unwrap(),
+            MeshFrame::Subscribe {
+                rank: Some(0),
+                boot_id: Some(7),
+                ..
+            }
+        ));
+        // Eight bytes after the lease are a rank and not yet a boot id.
+        assert!(matches!(
+            MeshFrame::decode(followed_by(&subscribe, &tail[..8])).unwrap(),
+            MeshFrame::Subscribe {
+                rank: Some(0),
+                boot_id: None,
+                ..
+            }
+        ));
+        // Cut short of the fields that this build reads, each is refused.
+        for frame in a_frame_of_every_kind() {
+            let encoded = frame.encode().unwrap();
+            let fixed = match &frame {
+                // The node id, the region and the peer count.
+                MeshFrame::Hello { .. } => continue,
+                MeshFrame::Chunk { payload, .. } => 20 + payload.len(),
+                MeshFrame::Initialization { payload, .. } => 12 + payload.len(),
+                MeshFrame::ReplicaRequest { .. } => 20,
+                MeshFrame::LinkReport { .. } => 4,
+                MeshFrame::Subscribe { .. } => 24,
+                MeshFrame::Unsubscribe { .. } => 8,
+            };
+            let head = FRAME_MAGIC.len() + 2 + 2 + frame.node_id().len();
+            assert!(
+                MeshFrame::decode(encoded.slice(..head + fixed)).is_ok(),
+                "{frame:?} with its fields"
+            );
+            assert!(
+                matches!(
+                    MeshFrame::decode(encoded.slice(..head + fixed - 1)),
+                    Err(MeshError::InvalidFrame(_))
+                ),
+                "{frame:?} cut short"
+            );
+        }
+    }
+
+    /// Counts the warnings and errors logged on the thread whose default
+    /// subscriber it is.
+    struct WarningCounter(Arc<AtomicU64>);
+
+    impl tracing::Subscriber for WarningCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A frame of a kind that this build does not know is recognised before
+    /// its node id is read, counted, and not logged: a later build may send
+    /// one a second to every peer for the length of a roll. A frame that
+    /// does not decode for another reason is counted too, and its peer is
+    /// named in one warning in ten seconds.
+    #[tokio::test]
+    async fn an_unknown_kind_is_counted_not_logged_and_its_body_is_not_parsed() {
+        let unknown = MeshFrame::of_unknown_kind();
+        // The body is not a node id: read as one, the frame would be invalid.
+        assert!(matches!(
+            read_string(&mut unknown.slice(FRAME_MAGIC.len() + 2..)),
+            Err(MeshError::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            MeshFrame::decode(unknown.clone()),
+            Err(MeshError::UnknownKind(FUTURE_FRAME_KIND))
+        ));
+        // With no body at all, and in this build's version too.
+        for kind in [0_u8, FRAME_LINK_REPORT + 1, FUTURE_FRAME_KIND, u8::MAX] {
+            let mut bare = FRAME_MAGIC.to_vec();
+            bare.extend_from_slice(&[FRAME_VERSION, kind]);
+            assert!(
+                matches!(
+                    MeshFrame::decode(Bytes::from(bare)),
+                    Err(MeshError::UnknownKind(found)) if found == kind
+                ),
+                "kind {kind}"
+            );
+        }
+
+        let warnings = Arc::new(AtomicU64::new(0));
+        // The mesh's tasks run on this thread: the runtime is current-thread.
+        let _subscriber = tracing::subscriber::set_default(WarningCounter(Arc::clone(&warnings)));
+        let bind_addr = loopback_addr();
+        let peer_addr = loopback_addr();
+        let mesh = CacheMesh::new(
+            Arc::new(ChunkCache::new(Options::default())),
+            CacheMeshConfig::new("node", "uk", bind_addr).with_peer(peer_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let socket = UdpSocket::bind(peer_addr).await.unwrap();
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        for _ in 0..3 {
+            sender.send(&socket, bind_addr, &unknown).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while mesh.fec_stats().rx_unknown_kinds < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the frames of an unknown kind were not counted");
+        assert_eq!(mesh.fec_stats().rx_invalid_frames, 0);
+        assert_eq!(warnings.load(Ordering::Relaxed), 0);
+
+        // A hello without its role is invalid.
+        let hello = MeshFrame::hello_with_peers("peer", "uk", Vec::new())
+            .encode()
+            .unwrap();
+        let invalid = hello.slice(..hello.len() - 1);
+        for _ in 0..3 {
+            sender.send(&socket, bind_addr, &invalid).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while mesh.fec_stats().rx_invalid_frames < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the invalid frames were not counted");
+        assert_eq!(warnings.load(Ordering::Relaxed), 1);
+        assert_eq!(mesh.fec_stats().rx_unknown_kinds, 3);
+        mesh.shutdown();
+    }
+
+    /// The datagrams that arrive at `socket` within `wait` and start a chunk
+    /// frame: the slot of each.
+    async fn chunks_arriving(socket: &UdpSocket, wait: Duration) -> Vec<u64> {
+        let mut slots = Vec::new();
+        let mut buf = vec![0_u8; 65_536];
+        let end = Instant::now() + wait;
+        while let Ok(Ok((len, _))) = tokio::time::timeout_at(end, socket.recv_from(&mut buf)).await
+        {
+            let datagram = &buf[..len];
+            if len < HEADER_LEN + 4 || DatagramFecHeader::decode(datagram).is_err() {
+                continue;
+            }
+            if let Some((_, slot_id)) = chunk_frame_slot(&datagram[HEADER_LEN + 4..]) {
+                slots.push(slot_id);
+            }
+        }
+        slots
+    }
+
+    /// A peer whose hello gives a role that this build does not know (a
+    /// later build's) is heard and counted. It is not a parent: it is not
+    /// ranked, and its parts are not applied. It is not a child: its
+    /// subscription is not served and no part is pushed to it. Before, the
+    /// hello did not decode, the peer's role stayed unknown, and a peer of
+    /// unknown role is both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unknown_role_is_heard_and_is_neither_parent_nor_child() {
+        assert_eq!(
+            CacheMeshRole::from_wire(HELLO_DRAINING_BIT | 0x72),
+            WireRole::Known(CacheMeshRole::Edge),
+            "bits 4 to 6 are ignored"
+        );
+        assert_eq!(CacheMeshRole::from_wire(9), WireRole::Other(9));
+        for own in [
+            CacheMeshRole::Peer,
+            CacheMeshRole::Distributor,
+            CacheMeshRole::Edge,
+        ] {
+            assert!(!WireRole::may_be_parent(Some(WireRole::Other(9)), own));
+            assert!(!WireRole::may_be_child(Some(WireRole::Other(9)), own));
+        }
+
+        let distributor_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let flat_addr = loopback_addr();
+        let stranger_addr = loopback_addr();
+        let distributor_cache = Arc::new(ChunkCache::new(demand_options()));
+        let distributor = CacheMesh::new(
+            Arc::clone(&distributor_cache),
+            demand_distributor("dist", distributor_addr).with_peers([edge_addr, stranger_addr]),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_edge("edge", edge_addr).with_peers([distributor_addr, stranger_addr]),
+        )
+        .start()
+        .await
+        .unwrap();
+        // A flat mesh of equal nodes sends every part to every peer and
+        // takes parts from every peer.
+        let flat_cache = Arc::new(ChunkCache::new(demand_options()));
+        let mut flat_config =
+            CacheMeshConfig::new("flat", "uk", flat_addr).with_peer(stranger_addr);
+        flat_config.sync_interval = Duration::from_millis(10);
+        let flat = CacheMesh::new(Arc::clone(&flat_cache), flat_config)
+            .start()
+            .await
+            .unwrap();
+
+        let stranger = UdpSocket::bind(stranger_addr).await.unwrap();
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        let hello_as = |role: WireRole| {
+            MeshFrame::Hello {
+                node_id: "stranger".into(),
+                region: "uk".into(),
+                role,
+                peers: Vec::new(),
+                draining: false,
+                boot_id: Some(1),
+                build: None,
+                state: None,
+            }
+            .encode()
+            .unwrap()
+        };
+        let hello = hello_as(WireRole::Other(9));
+        assert_eq!(
+            MeshFrame::decode(hello.clone()).unwrap().encode().unwrap(),
+            hello
+        );
+        for node in [distributor_addr, edge_addr, flat_addr] {
+            sender.send(&stranger, node, &hello).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while [&distributor, &edge, &flat]
+                .iter()
+                .any(|node| node.fec_stats().rx_unknown_roles == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the hello of an unknown role was not counted");
+        wait_for_hello(&edge, 2).await;
+
+        // Heard: a peer, seen, with no frame refused.
+        for node in [&distributor, &edge, &flat] {
+            assert!(node.peers().await.contains(&stranger_addr));
+            assert!(lock(&node.shared.peer_seen).contains_key(&stranger_addr));
+            assert_eq!(node.fec_stats().rx_invalid_frames, 0);
+        }
+
+        // Not a parent of the edge, which ranks its one distributor alone.
+        assert_eq!(edge.parents_for(7).await, vec![distributor_addr]);
+        assert_eq!(
+            edge.subscribe(7, 0, 4).await.unwrap(),
+            vec![distributor_addr]
+        );
+
+        // Not a child of the distributor: its subscription opens no lease.
+        let subscribe = MeshFrame::Subscribe {
+            node_id: "stranger".into(),
+            stream_id: 7,
+            from_slot: 0,
+            backfill_parts: 4,
+            lease_ms: 5_000,
+            rank: Some(0),
+            boot_id: Some(1),
+        }
+        .encode()
+        .unwrap();
+        sender
+            .send(&stranger, distributor_addr, &subscribe)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while distributor.served_subscriptions().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the edge's lease was not served");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let served = distributor.served_subscriptions();
+        assert_eq!(served.len(), 1, "{served:?}");
+        assert_eq!(served[0].child, edge_addr);
+
+        // Not a child of the flat node: a part written there is not pushed.
+        flat_cache
+            .add_for_stream_id(9, 0, Bytes::from(vec![9_u8; 64]))
+            .await
+            .unwrap();
+        assert_eq!(
+            chunks_arriving(&stranger, Duration::from_millis(150)).await,
+            Vec::<u64>::new()
+        );
+        // Not a parent of the flat node: its part is not applied.
+        let part = MeshFrame::chunk("stranger", 11, 0, Bytes::from(vec![11_u8; 64]))
+            .encode()
+            .unwrap();
+        sender.send(&stranger, flat_addr, &part).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(flat_cache.get_for_stream_id(11, 0).await.is_none());
+
+        // The same peer under a role that this build knows is both.
+        sender
+            .send(
+                &stranger,
+                flat_addr,
+                &hello_as(WireRole::Known(CacheMeshRole::Peer)),
+            )
+            .await
+            .unwrap();
+        assert!(chunks_arriving(&stranger, Duration::from_secs(1))
+            .await
+            .contains(&0));
+        sender.send(&stranger, flat_addr, &part).await.unwrap();
+        wait_for_slot(&flat_cache, 11, 0).await;
+
+        distributor.shutdown();
+        edge.shutdown();
+        flat.shutdown();
+    }
+
+    /// The extensions of a hello: the boot id, the build and the state
+    /// after the role byte, each as tag, length and value. A tag that this
+    /// build does not know is skipped, wherever it stands.
+    #[test]
+    fn hello_extensions_round_trip_and_unknown_tags_are_skipped() {
+        let full = MeshFrame::Hello {
+            node_id: "lon-dist-a".into(),
+            region: "london".into(),
+            role: WireRole::Known(CacheMeshRole::Distributor),
+            peers: Vec::new(),
+            draining: false,
+            boot_id: Some(1_763_924_000_123_456),
+            build: Some("3f2a9c1d77e0".into()),
+            state: Some(3),
+        };
+        let plain = MeshFrame::hello_with_role(
+            "lon-dist-a",
+            "london",
+            CacheMeshRole::Distributor,
+            Vec::new(),
+        );
+        let encoded = full.encode().unwrap();
+        let bare = plain.encode().unwrap();
+        // 3 bytes of tag and length for each, and 8, 12 and 1 of value.
+        assert_eq!(encoded.len(), bare.len() + 11 + 15 + 4);
+        assert_eq!(MeshFrame::decode(encoded.clone()).unwrap(), full);
+        assert_eq!(MeshFrame::decode(bare.clone()).unwrap(), plain);
+        // Each on its own.
+        for (boot_id, build, state) in [
+            (Some(7_u64), None, None),
+            (None, Some(String::from("b")), None),
+            (None, None, Some(0_u8)),
+        ] {
+            let mut one = plain.clone();
+            if let MeshFrame::Hello {
+                boot_id: boot,
+                build: named,
+                state: said,
+                ..
+            } = &mut one
+            {
+                (*boot, *named, *said) = (boot_id, build, state);
+            }
+            assert_eq!(MeshFrame::decode(one.encode().unwrap()).unwrap(), one);
+        }
+
+        // Unknown tags before, between and after the known ones.
+        let mut bytes = bare.to_vec();
+        bytes.extend_from_slice(&[FUTURE_HELLO_EXTENSION, 0, 3, 1, 2, 3]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BOOT_ID, 0, 8]);
+        bytes.extend_from_slice(&1_763_924_000_123_456_u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x50, 0, 0]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BUILD, 0, 12]);
+        bytes.extend_from_slice(b"3f2a9c1d77e0");
+        bytes.extend_from_slice(&[HELLO_EXTENSION_STATE, 0, 1, 3]);
+        bytes.extend_from_slice(&[0xee, 0, 2, 9, 9]);
+        assert_eq!(MeshFrame::decode(Bytes::from(bytes)).unwrap(), full);
+        // What a node that speaks like a later build appends is skipped.
+        let future = full.encode_as(FrameForm::Future).unwrap();
+        assert_eq!(future.len(), encoded.len() + 5);
+        assert_eq!(MeshFrame::decode(future).unwrap(), full);
+
+        // A value longer than this build reads: its first bytes.
+        let mut bytes = bare.to_vec();
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BOOT_ID, 0, 10]);
+        bytes.extend_from_slice(&7_u64.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_STATE, 0, 2, 4, 9]);
+        assert!(matches!(
+            MeshFrame::decode(Bytes::from(bytes)).unwrap(),
+            MeshFrame::Hello {
+                boot_id: Some(7),
+                state: Some(4),
+                build: None,
+                ..
+            }
+        ));
+        // A value that this build cannot read is skipped, and the hello
+        // stands: a boot id of four bytes, a build that is not UTF-8 or is
+        // longer than 64 bytes.
+        let mut bytes = bare.to_vec();
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BOOT_ID, 0, 4, 1, 2, 3, 4]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BUILD, 0, 2, 0xff, 0xfe]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_BUILD, 0, 65]);
+        bytes.extend_from_slice(&[b'a'; 65]);
+        bytes.extend_from_slice(&[HELLO_EXTENSION_STATE, 0, 1, 2]);
+        assert!(matches!(
+            MeshFrame::decode(Bytes::from(bytes)).unwrap(),
+            MeshFrame::Hello {
+                boot_id: None,
+                build: None,
+                state: Some(2),
+                ..
+            }
+        ));
+        // A node does not send a build id beyond the limit.
+        let mut long = full.clone();
+        if let MeshFrame::Hello { build, .. } = &mut long {
+            *build = Some("a".repeat(HELLO_BUILD_MAX_BYTES + 1));
+        }
+        assert!(long.encode().is_err());
+    }
+
+    /// An extension that is cut short ends the list without an error: the
+    /// hello stands with what came before it.
+    #[test]
+    fn a_truncated_extension_ends_the_list() {
+        let plain =
+            MeshFrame::hello_with_role("dist-c", "uk", CacheMeshRole::Distributor, Vec::new());
+        let bare = plain.encode().unwrap();
+        let mut booted = bare.to_vec();
+        booted.extend_from_slice(&[HELLO_EXTENSION_BOOT_ID, 0, 8]);
+        booted.extend_from_slice(&7_u64.to_be_bytes());
+        let with_boot_id = |frame: Bytes| {
+            let frame = MeshFrame::decode(frame).unwrap();
+            assert!(
+                matches!(
+                    &frame,
+                    MeshFrame::Hello {
+                        boot_id: Some(7),
+                        build: None,
+                        state: None,
+                        ..
+                    }
+                ),
+                "{frame:?}"
+            );
+        };
+        with_boot_id(Bytes::from(booted.clone()));
+        // A tag alone, a tag and half a length, a length beyond the frame.
+        with_boot_id(followed_by(&booted, &[HELLO_EXTENSION_STATE]));
+        with_boot_id(followed_by(&booted, &[HELLO_EXTENSION_STATE, 0]));
+        with_boot_id(followed_by(&booted, &[HELLO_EXTENSION_STATE, 0, 5, 1]));
+        // Nothing after the cut is read, even if it looks like an extension.
+        with_boot_id(followed_by(
+            &booted,
+            &[0x50, 0, 9, HELLO_EXTENSION_STATE, 0, 1, 4],
+        ));
+        // The first extension cut short: the hello of before.
+        for cut in 1..11 {
+            assert_eq!(
+                MeshFrame::decode(Bytes::from(booted[..bare.len() + cut].to_vec())).unwrap(),
+                plain,
+                "{cut} bytes of the boot id extension"
+            );
+        }
+    }
+
+    /// The prefix reader, which an edge's cut-through and a UDP client use
+    /// on the first symbol of a block, follows the same rule as the decoder.
+    #[test]
+    fn the_chunk_prefix_of_a_later_version_is_read() {
+        let payload = Bytes::from_static(b"media");
+        let chunk = MeshFrame::chunk("uk", 42, 7, payload.clone())
+            .encode()
+            .unwrap();
+        for version in [FRAME_VERSION, FRAME_VERSION + 1, 9, u8::MAX] {
+            let later = as_version(&chunk, version);
+            assert_eq!(chunk_frame_slot(&later), Some((42, 7)), "version {version}");
+            assert_eq!(
+                chunk_frame_payload(&later),
+                Some((42, 7, payload.clone())),
+                "version {version}"
+            );
+        }
+        // The head that the sync path of a later-speaking node writes.
+        let mut head = Vec::new();
+        chunk_frame_header(&mut head, FrameForm::Future, "uk", 42, 7, payload.len());
+        assert_eq!(head[FRAME_MAGIC.len()], FUTURE_FRAME_VERSION);
+        assert_eq!(chunk_frame_slot(&head), Some((42, 7)));
+        chunk_frame_header(&mut head, FrameForm::Current, "uk", 42, 7, payload.len());
+        assert_eq!(&head[..], &chunk[..head.len()]);
+        // An earlier version, and any other kind, are still not chunks.
+        assert_eq!(
+            chunk_frame_slot(&as_version(&chunk, FRAME_VERSION - 1)),
+            None
+        );
+        let hello = MeshFrame::hello_with_peers("uk", "uk", Vec::new())
+            .encode()
+            .unwrap();
+        assert_eq!(chunk_frame_slot(&as_version(&hello, 9)), None);
+        assert_eq!(chunk_frame_slot(&MeshFrame::of_unknown_kind()), None);
+    }
+
+    /// The mixed-build proof in one process: a node that speaks like a
+    /// later build (`with_test_future_frames`) and a node of this build
+    /// serve each other, as parent and as child, and the node of this build
+    /// counts the frames of the unknown kind and refuses nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_that_speaks_like_a_later_build_is_served_and_serves() {
+        for future_parent in [true, false] {
+            let parent_addr = loopback_addr();
+            let edge_addr = loopback_addr();
+            let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let parent = CacheMesh::new(
+                Arc::clone(&parent_cache),
+                demand_distributor("parent", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_test_future_frames(future_parent),
+            )
+            .start()
+            .await
+            .unwrap();
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_test_future_frames(!future_parent),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            parent_cache
+                .set_stream_initialization(7, Bytes::from_static(b"ftyp-moov"))
+                .await
+                .unwrap();
+            for slot in 0..4 {
+                parent_cache
+                    .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 64]))
+                    .await
+                    .unwrap();
+            }
+            // The warm-up window, the initialization, a live part and a
+            // hole repair, each way.
+            assert_eq!(edge.subscribe(7, 0, 16).await.unwrap(), vec![parent_addr]);
+            for slot in 0..4 {
+                wait_for_slot(&edge_cache, 7, slot).await;
+            }
+            assert_eq!(
+                edge_cache.stream_initialization(7).as_deref(),
+                Some(&b"ftyp-moov"[..])
+            );
+            parent_cache
+                .add_for_stream_id(7, 4, Bytes::from(vec![4_u8; 64]))
+                .await
+                .unwrap();
+            wait_for_slot(&edge_cache, 7, 4).await;
+            assert!(edge_cache.clear_for_stream_id(7, 2).await);
+            assert_eq!(edge.request_parts(7, 2, 1, 1).await.unwrap(), 1);
+            wait_for_slot(&edge_cache, 7, 2).await;
+            let served = parent.served_subscriptions();
+            assert_eq!(served.len(), 1);
+            assert_eq!(served[0].rank, Some(0));
+
+            let (current, later) = if future_parent {
+                (&edge, &parent)
+            } else {
+                (&parent, &edge)
+            };
+            timeout(Duration::from_secs(3), async {
+                while current.fec_stats().rx_unknown_kinds == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the node of this build counted no frame of an unknown kind");
+            assert_eq!(current.fec_stats().rx_invalid_frames, 0);
+            assert_eq!(current.fec_stats().rx_unknown_roles, 0);
+            assert_eq!(later.fec_stats().rx_invalid_frames, 0);
+            assert_eq!(later.fec_stats().rx_unknown_kinds, 0);
+            parent.shutdown();
+            edge.shutdown();
+        }
     }
 
     #[tokio::test]
@@ -7336,11 +8393,12 @@ mod tests {
             backfill_parts: 32,
             lease_ms: 5_000,
             rank: None,
+            boot_id: None,
         };
-        let old_form = frame.encode().unwrap();
-        assert_eq!(MeshFrame::decode(old_form.clone()).unwrap(), frame);
-        // The rank is one byte after the lease; a frame without it (a child
-        // from before) decodes with no rank.
+        let short = frame.encode().unwrap();
+        assert_eq!(MeshFrame::decode(short.clone()).unwrap(), frame);
+        // The rank is one byte after the lease, and the boot id eight bytes
+        // after the rank; a frame that ends before either decodes without it.
         let ranked = MeshFrame::Subscribe {
             node_id: "edge-1".into(),
             stream_id: 2001,
@@ -7348,10 +8406,38 @@ mod tests {
             backfill_parts: 32,
             lease_ms: 5_000,
             rank: Some(1),
+            boot_id: None,
         };
         let encoded = ranked.encode().unwrap();
-        assert_eq!(encoded.len(), old_form.len() + 1);
+        assert_eq!(encoded.len(), short.len() + 1);
         assert_eq!(MeshFrame::decode(encoded).unwrap(), ranked);
+        let booted = MeshFrame::Subscribe {
+            node_id: "edge-1".into(),
+            stream_id: 2001,
+            from_slot: 77,
+            backfill_parts: 32,
+            lease_ms: 5_000,
+            rank: Some(1),
+            boot_id: Some(1_763_924_000_123_456),
+        };
+        let encoded = booted.encode().unwrap();
+        assert_eq!(encoded.len(), short.len() + 9);
+        assert_eq!(MeshFrame::decode(encoded).unwrap(), booted);
+        // A child that gives no rank still gives its boot id: the rank byte
+        // is 255.
+        let unranked = MeshFrame::Subscribe {
+            node_id: "edge-1".into(),
+            stream_id: 2001,
+            from_slot: 77,
+            backfill_parts: 32,
+            lease_ms: 5_000,
+            rank: None,
+            boot_id: Some(9),
+        };
+        let encoded = unranked.encode().unwrap();
+        assert_eq!(encoded.len(), short.len() + 9);
+        assert_eq!(encoded[short.len()], SUBSCRIBE_RANK_NONE);
+        assert_eq!(MeshFrame::decode(encoded).unwrap(), unranked);
 
         let frame = MeshFrame::Unsubscribe {
             node_id: "edge-1".into(),
