@@ -1,4 +1,4 @@
-use crate::chunk_cache::{ChunkCache, StreamHandle};
+use crate::chunk_cache::{ChunkCache, RemoteWrite, StreamHandle};
 use crate::mesh_send::{
     call_time, BatchSender, Message, ObjectDatagrams, ObjectEncoder, MESSAGES_PER_CALL,
 };
@@ -593,6 +593,8 @@ pub struct CacheMeshConfig {
     send_observer: SendObserverSlot,
     /// Pairs whose live parts are not pushed (see `with_live_push_filter`).
     live_push_filter: LivePushFilterSlot,
+    /// Reads the origin's epoch from a part's bytes (see `with_slot_epoch`).
+    slot_epoch: Option<fn(&[u8]) -> Option<u64>>,
     /// Told of every received datagram and decoded block.
     receive_observer: ReceiveObserverSlot,
     /// Tests turn generic segmentation offload off to take the path of a
@@ -695,6 +697,7 @@ impl CacheMeshConfig {
             frame_form: FrameForm::Current,
             send_observer: SendObserverSlot(None),
             live_push_filter: LivePushFilterSlot(None),
+            slot_epoch: None,
             receive_observer: ReceiveObserverSlot(None),
             #[cfg(test)]
             gso: true,
@@ -931,6 +934,21 @@ impl CacheMeshConfig {
     /// leased pair.
     pub fn with_live_push_filter(mut self, filter: CacheMeshLivePushFilter) -> Self {
         self.live_push_filter = LivePushFilterSlot(Some(filter));
+        self
+    }
+
+    /// Read the epoch of the origin that made a part (its session) from the
+    /// part's bytes; `None` when the bytes do not say. With it, a part from
+    /// a parent is judged against the part that holds its slot: the same
+    /// epoch keeps the first copy of an id (`apply_conflicts`) and never
+    /// lets an older id replace a newer one, an older epoch is dropped
+    /// (`apply_stale`), a newer one replaces. Two origins that publish the
+    /// same parts then merge in every cache by first arrival. Without it, or
+    /// when either epoch is unknown, the part from a parent replaces what
+    /// its slot holds (a restarted origin numbers its parts from the start
+    /// again).
+    pub fn with_slot_epoch(mut self, epoch: fn(&[u8]) -> Option<u64>) -> Self {
+        self.slot_epoch = Some(epoch);
         self
     }
 
@@ -1709,6 +1727,13 @@ pub struct CacheMeshFecStats {
     /// Those of them released after `parent_release_after`, their
     /// replacement not confirmed.
     pub parents_released_unconfirmed: u64,
+    /// Parts from a parent refused because their slot held other bytes
+    /// under the same id and epoch: the first copy stays
+    /// (`CacheMeshConfig::with_slot_epoch`).
+    pub apply_conflicts: u64,
+    /// Parts from a parent refused because they were of an older epoch
+    /// than the part in their slot, or an older id of the same epoch.
+    pub apply_stale: u64,
 }
 
 impl CacheMeshFecStats {
@@ -1768,6 +1793,8 @@ impl CacheMeshFecStats {
             parents_released: self.parents_released + other.parents_released,
             parents_released_unconfirmed: self.parents_released_unconfirmed
                 + other.parents_released_unconfirmed,
+            apply_conflicts: self.apply_conflicts + other.apply_conflicts,
+            apply_stale: self.apply_stale + other.apply_stale,
         }
     }
 }
@@ -1817,6 +1844,8 @@ struct CacheMeshFecCounters {
     warm_capped_ticks: AtomicU64,
     parents_released: AtomicU64,
     parents_released_unconfirmed: AtomicU64,
+    apply_conflicts: AtomicU64,
+    apply_stale: AtomicU64,
 }
 
 impl CacheMeshFecCounters {
@@ -1867,6 +1896,8 @@ impl CacheMeshFecCounters {
             warm_capped_ticks: self.warm_capped_ticks.load(Ordering::Relaxed),
             parents_released: self.parents_released.load(Ordering::Relaxed),
             parents_released_unconfirmed: self.parents_released_unconfirmed.load(Ordering::Relaxed),
+            apply_conflicts: self.apply_conflicts.load(Ordering::Relaxed),
+            apply_stale: self.apply_stale.load(Ordering::Relaxed),
         }
     }
 }
@@ -5019,27 +5050,51 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 ),
                 None => false,
             };
-            // A peer's part may replace a newer id of the same generation: a
+            // With the origin's epoch known on both sides, the part is judged
+            // against what holds its slot: the first copy of an id stays, an
+            // older epoch or an older id of the epoch is refused. Otherwise a
+            // peer's part may replace a newer id of the same generation: a
             // restarted origin numbers its parts from the start again.
-            let written = handler
-                .cache
-                .add_remote_for_handle(handle, slot_id, payload)
-                .await;
-            if written.is_err() && marked {
+            let written = match handler.config.slot_epoch {
+                Some(epoch) => {
+                    handler
+                        .cache
+                        .add_remote_by_epoch_for_handle(handle, slot_id, payload, epoch)
+                        .await
+                }
+                None => handler
+                    .cache
+                    .add_remote_for_handle(handle, slot_id, payload)
+                    .await
+                    .map(|()| RemoteWrite::Written),
+            };
+            if marked && !matches!(written, Ok(RemoteWrite::Written)) {
                 if let Some(remote_slots) = remote_slots.as_mut() {
                     remote_slots.remove(&remote_key);
                 }
             }
             drop(remote_slots);
-            if let Err(err) = written {
-                warn!(
-                    node_id,
-                    stream_id,
-                    slot_id,
-                    error = err,
-                    "cache mesh write failed"
-                );
-                return;
+            match written {
+                Ok(RemoteWrite::Written) => {}
+                Ok(RemoteWrite::Duplicate) => return,
+                Ok(RemoteWrite::Conflict) => {
+                    handler.counters.apply_conflicts.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Ok(RemoteWrite::Stale) => {
+                    handler.counters.apply_stale.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        node_id,
+                        stream_id,
+                        slot_id,
+                        error = err,
+                        "cache mesh write failed"
+                    );
+                    return;
+                }
             }
             let committed_us = unix_micros();
             if let Some(applied_tx) = &handler.config.applied_tx {
@@ -10333,6 +10388,193 @@ mod tests {
         for edge in &edges {
             edge.shutdown();
         }
+    }
+
+    /// The epoch of a test part: its first eight bytes.
+    fn test_epoch(bytes: &[u8]) -> Option<u64> {
+        Some(u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?))
+    }
+
+    /// A test part of `epoch`, 64 bytes.
+    fn epoch_part(epoch: u64, fill: u8) -> Bytes {
+        let mut bytes = epoch.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[fill; 56]);
+        Bytes::from(bytes)
+    }
+
+    /// A PL1: two contributors publish the same parts, so two distributors
+    /// hold the same ids, each written by its own origin, and an edge takes
+    /// the playlist from both. Equal bytes are applied once a part. Unequal
+    /// bytes under one id and epoch keep the copy that came first and are
+    /// counted (`apply_conflicts`); the edge never flips between the two.
+    /// An older id of the epoch, from a parent that lags by the length of
+    /// the ring, does not replace the newer id in its slot, and an older
+    /// epoch is dropped (`apply_stale`); a newer epoch replaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_origins_of_one_epoch_merge_by_the_first_copy_at_an_edge() {
+        let dist_addrs = [loopback_addr(), loopback_addr()];
+        let edge_addr = loopback_addr();
+        let mut caches = Vec::new();
+        let mut distributors = Vec::new();
+        for (index, addr) in dist_addrs.iter().enumerate() {
+            let cache = Arc::new(ChunkCache::new(demand_options()));
+            // The playlist exists at both before the lease: it starts live.
+            cache.add_for_stream_id(7, 0, epoch_part(5, 0)).await.unwrap();
+            distributors.push(
+                CacheMesh::new(
+                    Arc::clone(&cache),
+                    demand_distributor(&format!("dist-{index}"), *addr)
+                        .with_peer(edge_addr)
+                        .with_subscription_lease(Duration::from_secs(10)),
+                )
+                .start()
+                .await
+                .unwrap(),
+            );
+            caches.push(cache);
+        }
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<AppliedSlot>();
+        let applied: Arc<StdMutex<Vec<usize>>> = Arc::default();
+        {
+            let applied = Arc::clone(&applied);
+            tokio::spawn(async move {
+                while let Some(event) = applied_rx.recv().await {
+                    lock(&applied).push(event.slot_id);
+                }
+            });
+        }
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peers(dist_addrs)
+                .with_max_parents(2)
+                .with_subscription_lease(Duration::from_secs(10))
+                .with_applied_tx(applied_tx)
+                .with_slot_epoch(test_epoch),
+        )
+        .start()
+        .await
+        .unwrap();
+        wait_for_hello(&edge, 2).await;
+        assert_eq!(edge.subscribe(7, 0, 0).await.unwrap().len(), 2);
+        timeout(Duration::from_secs(3), async {
+            while distributors
+                .iter()
+                .any(|distributor| distributor.served_subscriptions().is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both distributors serve the edge");
+        let wait_stats = |want: fn(&CacheMeshFecStats) -> bool| {
+            let edge = &edge;
+            async move {
+                timeout(Duration::from_secs(3), async {
+                    while !want(&edge.fec_stats()) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("stats {:?}", edge.fec_stats()));
+            }
+        };
+
+        // Equal bytes from both: each part is applied once.
+        for slot in 1..=20 {
+            for cache in &caches {
+                cache
+                    .add_for_stream_id(7, slot, epoch_part(5, slot as u8))
+                    .await
+                    .unwrap();
+            }
+        }
+        wait_for_slot(&edge_cache, 7, 20).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut once = lock(&applied).clone();
+        once.sort_unstable();
+        assert_eq!(once, (1..=20).collect::<Vec<_>>());
+
+        // Unequal bytes under the same ids and epoch: the first copy stays.
+        for slot in 21..=30 {
+            caches[0]
+                .add_for_stream_id(7, slot, epoch_part(5, 0xa0))
+                .await
+                .unwrap();
+        }
+        wait_for_slot(&edge_cache, 7, 30).await;
+        for slot in 21..=30 {
+            caches[1]
+                .add_for_stream_id(7, slot, epoch_part(5, 0xb0))
+                .await
+                .unwrap();
+        }
+        wait_stats(|stats| stats.apply_conflicts == 10).await;
+        for slot in 21..=30 {
+            assert_eq!(
+                edge_cache.get_for_stream_id(7, slot).await.unwrap().0,
+                epoch_part(5, 0xa0)
+            );
+        }
+
+        // A parent that lags by the length of the ring (64 parts): its older
+        // id of the epoch lands in the slot of the newer one, and is refused.
+        caches[0]
+            .add_for_stream_id(7, 100, epoch_part(5, 100))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 100).await;
+        caches[1]
+            .add_for_stream_id(7, 36, epoch_part(5, 36))
+            .await
+            .unwrap();
+        wait_stats(|stats| stats.apply_stale == 1).await;
+        assert_eq!(
+            edge_cache.get_for_stream_id(7, 100).await.unwrap().0,
+            epoch_part(5, 100)
+        );
+        assert!(edge_cache.get_for_stream_id(7, 36).await.is_none());
+
+        // An older epoch is dropped; a newer one replaces.
+        caches[0]
+            .add_for_stream_id(7, 101, epoch_part(6, 1))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 101).await;
+        caches[1]
+            .add_for_stream_id(7, 101, epoch_part(4, 1))
+            .await
+            .unwrap();
+        wait_stats(|stats| stats.apply_stale == 2).await;
+        assert_eq!(
+            edge_cache.get_for_stream_id(7, 101).await.unwrap().0,
+            epoch_part(6, 1)
+        );
+        caches[0]
+            .add_for_stream_id(7, 102, epoch_part(5, 2))
+            .await
+            .unwrap();
+        wait_for_slot(&edge_cache, 7, 102).await;
+        caches[1]
+            .add_for_stream_id(7, 102, epoch_part(7, 2))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while edge_cache.get_for_stream_id(7, 102).await.map(|(bytes, _)| bytes)
+                != Some(epoch_part(7, 2))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a part of a newer epoch replaces");
+        let stats = edge.fec_stats();
+        assert_eq!((stats.apply_conflicts, stats.apply_stale), (10, 2));
+        for distributor in &distributors {
+            distributor.shutdown();
+        }
+        edge.shutdown();
     }
 
     /// Wave 8 review: before any hello (a cold start, the slot not started)
