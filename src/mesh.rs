@@ -436,6 +436,14 @@ pub struct CacheMeshConfig {
     /// part takes at most one burst of debt), the children taking turns.
     /// Zero: no total limit.
     pub backfill_total_bytes_per_sec: u64,
+    /// The warm-up window of a new lease on a video playlist (see
+    /// `with_stream_classifier`) is at most this many parts; `None` (the
+    /// default): the window the child asks for, as for audio. A 4K playlist
+    /// warmed at an audio window's length is minutes of parts sent at the
+    /// warm-up rate, oldest last, each part in one burst (a 4K part of a few
+    /// MB fills the child's receive queue at once), long after its readers
+    /// started at the live part.
+    pub video_backfill_parts: Option<usize>,
     /// Subscribe frames carry the parent's place in this node's ranking of
     /// the playlist's parents (0: first), so a parent knows whether it is
     /// the child's first parent. Off sends the frame of before (a parent of
@@ -555,6 +563,7 @@ impl CacheMeshConfig {
             subscription_lease: DEFAULT_SUBSCRIPTION_LEASE,
             backfill_bytes_per_sec: 0,
             backfill_total_bytes_per_sec: 0,
+            video_backfill_parts: None,
             subscribe_rank: true,
             release_unranked_parents: true,
             warm_from_second_parent: true,
@@ -671,6 +680,13 @@ impl CacheMeshConfig {
     /// [`Self::backfill_total_bytes_per_sec`]).
     pub fn with_backfill_total_bytes_per_sec(mut self, bytes_per_sec: u64) -> Self {
         self.backfill_total_bytes_per_sec = bytes_per_sec;
+        self
+    }
+
+    /// Bound the warm-up window of video playlists (see
+    /// [`Self::video_backfill_parts`]).
+    pub fn with_video_backfill_parts(mut self, parts: Option<usize>) -> Self {
+        self.video_backfill_parts = parts;
         self
     }
 
@@ -5389,6 +5405,12 @@ async fn sync_task(
                 if let Some((from_slot, backfill_parts)) =
                     lane_children.pending_open.remove(&(*peer, stream_id))
                 {
+                    let backfill_parts = match config.video_backfill_parts {
+                        Some(most) if config.stream_class(stream_id) == StreamClass::Video => {
+                            backfill_parts.min(most)
+                        }
+                        _ => backfill_parts,
+                    };
                     // A new lease starts live at the next part. The
                     // parts already stored are the warm-up window.
                     let low = from_slot
@@ -10846,6 +10868,70 @@ mod tests {
             .err()
             .expect("refused");
         assert!(err.to_string().contains("beyond the last port"), "{err}");
+    }
+
+    /// A video playlist's new lease is warmed with at most
+    /// `video_backfill_parts` parts, newest first; an audio playlist's with
+    /// the window its child asks for; without the bound, video as audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_video_warm_up_window_is_bounded_on_its_own() {
+        for bound in [Some(2), None] {
+            let parent_addr = class_split_addr(TEST_CLASS_OFFSET);
+            let edge_addr = class_split_addr(TEST_CLASS_OFFSET);
+            let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let parent = CacheMesh::new(
+                Arc::clone(&parent_cache),
+                demand_distributor("parent", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_class_port_offset(TEST_CLASS_OFFSET)
+                    .with_stream_classifier(video_streams(&[9]))
+                    .with_video_backfill_parts(bound),
+            )
+            .start()
+            .await
+            .unwrap();
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_class_port_offset(TEST_CLASS_OFFSET)
+                    .with_stream_classifier(video_streams(&[9])),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            for slot in 0..20 {
+                for stream in [7, 9] {
+                    parent_cache
+                        .add_for_stream_id(stream, slot, Bytes::from(vec![slot as u8; 1_000]))
+                        .await
+                        .unwrap();
+                }
+            }
+            edge.subscribe(7, 0, 8).await.unwrap();
+            edge.subscribe(9, 0, 8).await.unwrap();
+            wait_for_slot(&edge_cache, 7, 12).await;
+            wait_for_slot(&edge_cache, 9, 18).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut held = [Vec::new(), Vec::new()];
+            for (index, stream) in [7_u64, 9].into_iter().enumerate() {
+                for slot in 0..20 {
+                    if edge_cache.get_for_stream_id(stream, slot).await.is_some() {
+                        held[index].push(slot);
+                    }
+                }
+            }
+            assert_eq!(held[0], (12..20).collect::<Vec<_>>(), "audio, bound {bound:?}");
+            let video: Vec<usize> = match bound {
+                Some(parts) => (20 - parts..20).collect(),
+                None => (12..20).collect(),
+            };
+            assert_eq!(held[1], video, "video, bound {bound:?}");
+            parent.shutdown();
+            edge.shutdown();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
