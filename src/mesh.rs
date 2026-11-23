@@ -2360,8 +2360,10 @@ impl CacheMeshHandle {
         self.parents_ranked(stream_id).await.0
     }
 
-    /// [`Self::parents_for`], and how many parents were ranked before the
-    /// list was cut to `max_parents`.
+    /// [`Self::parents_for`], and how many live parents were ranked before
+    /// the list was cut to `max_parents` (0 before the first hello, when
+    /// the configured parents are asked: a slot that has not started is
+    /// not counted).
     async fn parents_ranked(&self, stream_id: u64) -> (Vec<SocketAddr>, usize) {
         let mut peers = self.allowed_peers().await;
         let alive = {
@@ -2378,7 +2380,8 @@ impl CacheMeshHandle {
         };
         // Before the first hello arrives no parent is known to be alive. The
         // configured parents are then asked, so a cold start does not wait.
-        if !alive.is_empty() {
+        let live = !alive.is_empty();
+        if live {
             peers = alive;
         }
         rank_parents(&self.node_id, stream_id, &mut peers);
@@ -2390,7 +2393,7 @@ impl CacheMeshHandle {
                 peers.sort_by_key(|peer| draining.contains(peer));
             }
         }
-        let ranked = peers.len();
+        let ranked = if live { peers.len() } else { 0 };
         peers.truncate(self.max_parents.max(1));
         (peers, ranked)
     }
@@ -7787,6 +7790,31 @@ mod tests {
         for parent in &parents {
             parent.shutdown();
         }
+        edge.shutdown();
+    }
+
+    /// Wave 8 review: before any hello (a cold start, the slot not started)
+    /// the configured parents are asked (a mesh without the region filter)
+    /// but none counts as live, so a new copy is warmed by its first parent
+    /// alone.
+    #[tokio::test]
+    async fn a_cold_start_counts_no_live_parent_for_the_second_warm_up() {
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge = CacheMesh::new(
+            edge_cache,
+            demand_edge("edge", loopback_addr())
+                .with_peers([loopback_addr(), loopback_addr(), loopback_addr()])
+                // Without a region filter the configured parents are asked
+                // before their first hello.
+                .with_same_region_only(false)
+                .with_max_parents(2),
+        )
+        .start()
+        .await
+        .unwrap();
+        let (parents, live) = edge.parents_ranked(7).await;
+        assert_eq!(parents.len(), 2);
+        assert_eq!(live, 0);
         edge.shutdown();
     }
 
