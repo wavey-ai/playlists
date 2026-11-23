@@ -432,8 +432,9 @@ pub struct CacheMeshConfig {
     /// Rate limit for the warm-up windows of all children together, on top
     /// of each child's: when many edges warm at once (edges join, or the
     /// readers of a lost edge move) a distributor sends at most this many
-    /// warm-up bytes a second (burst: 100 ms of it), the children taking
-    /// turns. Zero: no total limit.
+    /// warm-up bytes a second on each lane (burst: 100 ms of it; a large
+    /// part takes at most one burst of debt), the children taking turns.
+    /// Zero: no total limit.
     pub backfill_total_bytes_per_sec: u64,
     /// Subscribe frames carry the parent's place in this node's ranking of
     /// the playlist's parents (0: first), so a parent knows whether it is
@@ -446,6 +447,12 @@ pub struct CacheMeshConfig {
     /// Rank a parent whose hello says it is draining after every live
     /// parent that is not.
     pub avoid_draining_parents: bool,
+    /// When more live parents than `max_parents` are ranked (a distributor
+    /// slot has joined), the second parent is asked for the warm-up window
+    /// too, not only the first: a slot ranked first holds a playlist only
+    /// from its own subscription on, and its window is nearly empty (wave 8
+    /// review). With two parents, only the first, as before.
+    pub warm_from_second_parent: bool,
     /// Requested size of the socket receive and send buffers. The kernel can
     /// clamp it. `None` keeps the system default.
     pub socket_buffer_bytes: Option<usize>,
@@ -550,6 +557,7 @@ impl CacheMeshConfig {
             backfill_total_bytes_per_sec: 0,
             subscribe_rank: true,
             release_unranked_parents: true,
+            warm_from_second_parent: true,
             avoid_draining_parents: true,
             socket_buffer_bytes: None,
             peer_timeout: DEFAULT_PEER_TIMEOUT,
@@ -673,6 +681,12 @@ impl CacheMeshConfig {
 
     pub fn with_release_unranked_parents(mut self, release: bool) -> Self {
         self.release_unranked_parents = release;
+        self
+    }
+
+    /// See [`Self::warm_from_second_parent`].
+    pub fn with_warm_from_second_parent(mut self, warm: bool) -> Self {
+        self.warm_from_second_parent = warm;
         self
     }
 
@@ -906,8 +920,12 @@ impl WarmBucket {
         self.tokens
     }
 
-    fn spend(&mut self, bytes: usize) {
-        self.tokens -= bytes as f64;
+    /// Take `bytes` sent: the debt is bounded at one burst, so that one
+    /// large part (a 4K part of several MB) does not hold every later
+    /// warm-up back for seconds (wave 8 review).
+    fn spend(&mut self, bytes: usize, rate: u64) {
+        let burst = rate as f64 * BACKFILL_BURST.as_secs_f64();
+        self.tokens = (self.tokens - bytes as f64).max(-burst);
     }
 }
 
@@ -1685,7 +1703,7 @@ impl CacheMesh {
             peer_draining: StdMutex::new(HashSet::new()),
             draining: AtomicBool::new(false),
             ranked_parents: StdMutex::new(HashMap::new()),
-            warm_total: StdMutex::new(WarmBucket::default()),
+            warm_total: Default::default(),
             remote_slots: RwLock::new(HashSet::new()),
             counters: Arc::new(CacheMeshFecCounters::default()),
             leases: Arc::new(StdMutex::new(HashMap::new())),
@@ -1846,6 +1864,7 @@ impl CacheMesh {
             subscribe_rank: self.config.subscribe_rank,
             release_unranked_parents: self.config.release_unranked_parents,
             avoid_draining_parents: self.config.avoid_draining_parents,
+            warm_from_second_parent: self.config.warm_from_second_parent,
         })
     }
 }
@@ -1888,9 +1907,11 @@ struct MeshShared {
     draining: AtomicBool,
     /// The ranked parents that this node last subscribed each playlist at.
     ranked_parents: StdMutex<HashMap<u64, Vec<SocketAddr>>>,
-    /// The node's total warm-up allowance, across its children and lanes
-    /// (`CacheMeshConfig::backfill_total_bytes_per_sec`).
-    warm_total: StdMutex<WarmBucket>,
+    /// The node's total warm-up allowance across its children, one for
+    /// each lane (`CacheMeshConfig::backfill_total_bytes_per_sec`): the
+    /// video lane's 4K warm-ups do not starve the audio lane's (wave 8
+    /// review), indexed by [`Lane::is_class`].
+    warm_total: [StdMutex<WarmBucket>; 2],
     /// Slots that came from a peer, by stream lifetime (the handle: stream,
     /// index and generation; a generation alone is per index) and slot.
     remote_slots: RwLock<HashSet<(StreamHandle, usize)>>,
@@ -2020,6 +2041,7 @@ pub struct CacheMeshHandle {
     subscribe_rank: bool,
     release_unranked_parents: bool,
     avoid_draining_parents: bool,
+    warm_from_second_parent: bool,
 }
 
 /// Packet loss on the links of this node to one peer, in parts per million.
@@ -2167,15 +2189,22 @@ impl CacheMeshHandle {
         backfill_parts: usize,
     ) -> Result<Vec<SocketAddr>, MeshError> {
         lock(&self.shared.wanted).insert(stream_id);
-        let peers = self.parents_for(stream_id).await;
+        let (peers, ranked) = self.parents_ranked(stream_id).await;
         if peers.is_empty() {
             return Ok(peers);
         }
         let lease_ms = u32::try_from(self.subscription_lease.as_millis()).unwrap_or(u32::MAX);
         // Every parent pushes the live parts. Only the first parent sends the
-        // warm-up window, so a new copy is not warmed twice over.
+        // warm-up window, so a new copy is not warmed twice over; with more
+        // live parents than are asked (a slot joined, and may be the first
+        // with a nearly empty window), the second one too.
+        let warm_parents = if self.warm_from_second_parent && ranked > peers.len() {
+            2
+        } else {
+            1
+        };
         for (index, peer) in peers.iter().enumerate() {
-            let backfill_parts = if index == 0 { backfill_parts } else { 0 };
+            let backfill_parts = if index < warm_parents { backfill_parts } else { 0 };
             let frame = MeshFrame::Subscribe {
                 node_id: self.node_id.clone(),
                 stream_id,
@@ -2328,6 +2357,12 @@ impl CacheMeshHandle {
     /// The parents that this node uses for one playlist: allowed, alive, and
     /// ranked for this node and playlist, at most `max_parents` of them.
     pub async fn parents_for(&self, stream_id: u64) -> Vec<SocketAddr> {
+        self.parents_ranked(stream_id).await.0
+    }
+
+    /// [`Self::parents_for`], and how many parents were ranked before the
+    /// list was cut to `max_parents`.
+    async fn parents_ranked(&self, stream_id: u64) -> (Vec<SocketAddr>, usize) {
         let mut peers = self.allowed_peers().await;
         let alive = {
             let seen = lock(&self.shared.peer_seen);
@@ -2355,8 +2390,9 @@ impl CacheMeshHandle {
                 peers.sort_by_key(|peer| draining.contains(peer));
             }
         }
+        let ranked = peers.len();
         peers.truncate(self.max_parents.max(1));
-        peers
+        (peers, ranked)
     }
 
     async fn send_control(&self, peers: &[SocketAddr], frame: &[u8]) -> Result<usize, MeshError> {
@@ -5530,7 +5566,7 @@ async fn sync_task(
                         break;
                     }
                     if total_limited
-                        && lock(&shared.warm_total)
+                        && lock(&shared.warm_total[usize::from(lane.is_class())])
                             .available(config.backfill_total_bytes_per_sec, Instant::now())
                             <= 0.0
                     {
@@ -5588,7 +5624,8 @@ async fn sync_task(
                         }
                     }
                     if total_limited {
-                        lock(&shared.warm_total).spend(bytes);
+                        lock(&shared.warm_total[usize::from(lane.is_class())])
+                            .spend(bytes, config.backfill_total_bytes_per_sec);
                     }
                     pass_warm_bytes = pass_warm_bytes.saturating_add(bytes as u64);
                     let counters = shared.counters_of(lane);
@@ -7751,6 +7788,98 @@ mod tests {
             parent.shutdown();
         }
         edge.shutdown();
+    }
+
+    /// Wave 8 review: with three live distributors (a slot joined) the
+    /// first ranked parent may hold nothing of a new playlist yet: the
+    /// second parent sends the warm-up window too. Without the setting
+    /// (before) the window stays empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slot_ranked_first_does_not_leave_the_warm_up_window_empty() {
+        for warm_second in [true, false] {
+            let addrs = [loopback_addr(), loopback_addr(), loopback_addr()];
+            let edge_addr = loopback_addr();
+            let mut caches = Vec::new();
+            let mut parents = Vec::new();
+            for (index, addr) in addrs.iter().enumerate() {
+                let cache = Arc::new(ChunkCache::new(demand_options()));
+                let parent = CacheMesh::new(
+                    Arc::clone(&cache),
+                    demand_distributor(&format!("dist-{index}"), *addr)
+                        .with_peer(edge_addr)
+                        .with_subscription_lease(Duration::from_secs(5)),
+                )
+                .start()
+                .await
+                .unwrap();
+                caches.push(cache);
+                parents.push(parent);
+            }
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peers(addrs)
+                    .with_max_parents(2)
+                    .with_warm_from_second_parent(warm_second)
+                    .with_subscription_lease(Duration::from_secs(5)),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 3).await;
+            let ranked = edge.parents_for(7).await;
+            // The first parent (the slot) holds nothing; the others 0..20.
+            for (index, addr) in addrs.iter().enumerate() {
+                if *addr == ranked[0] {
+                    continue;
+                }
+                for slot in 0..20 {
+                    caches[index]
+                        .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 100]))
+                        .await
+                        .unwrap();
+                }
+            }
+            edge.subscribe(7, 0, 8).await.unwrap();
+            let arrived = timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut have = 0;
+                    for slot in 12..20 {
+                        if edge_cache.get_for_stream_id(7, slot).await.is_some() {
+                            have += 1;
+                        }
+                    }
+                    if have == 8 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert_eq!(arrived, warm_second, "warm from the second parent: {warm_second}");
+            for parent in &parents {
+                parent.shutdown();
+            }
+            edge.shutdown();
+        }
+    }
+
+    /// Wave 8 review: one large warm-up part (a 4K part of 2 MB) takes at
+    /// most one burst of debt from the total bucket, so warm-ups go on
+    /// within 200 ms, not seconds later; each lane has its own bucket.
+    #[test]
+    fn a_large_part_takes_at_most_one_burst_of_warm_up_debt() {
+        let rate = 40_000_u64;
+        let start = std::time::Instant::now();
+        let mut buckets: [WarmBucket; 2] = Default::default();
+        assert_eq!(buckets[1].available(rate, start), 4_000.0);
+        buckets[1].spend(2_000_000, rate);
+        assert_eq!(buckets[1].available(rate, start), -4_000.0);
+        assert!(buckets[1].available(rate, start + Duration::from_millis(201)) > 0.0);
+        // The audio lane's bucket is untouched.
+        assert_eq!(buckets[0].available(rate, start), 4_000.0);
     }
 
     /// Wave 8 stage 5 (AM 13): eight children that warm at once share the
