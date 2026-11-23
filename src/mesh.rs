@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -546,8 +546,11 @@ pub struct CacheMeshConfig {
     /// the child's first parent. Off, the rank byte says that the child
     /// gives none.
     pub subscribe_rank: bool,
-    /// A renewal that finds the ranked parents of a playlist changed
-    /// releases (Unsubscribe) the parents that left the set, at once.
+    /// A parent that left the ranked set of a playlist is released
+    /// (Unsubscribe), make before break: it is kept and its lease renewed
+    /// until its replacement is confirmed, or for `parent_release_after`
+    /// (see [`CacheMeshHandle::release_pending`]). Off: a parent that left is
+    /// neither renewed nor released, and its lease lapses.
     pub release_unranked_parents: bool,
     /// Rank a parent whose hello says it is draining after every live
     /// parent that is not.
@@ -572,9 +575,18 @@ pub struct CacheMeshConfig {
     /// Offset of the first block id of each lane. `start` sets it.
     block_id_offset: u32,
     /// What this node's hellos and subscribes give as its boot id: the
-    /// start of the process in Unix microseconds. Zero until `start` sets it
-    /// to the time of the start.
+    /// start of the process in Unix microseconds (`with_boot_id`). Zero
+    /// until `start` sets it to the time of the start.
     boot_id: u64,
+    /// The build id in this node's hellos (`with_build`).
+    build: Option<String>,
+    /// The state in this node's hellos, read for each hello
+    /// (`with_hello_state`).
+    hello_state: Option<Arc<AtomicU8>>,
+    /// How long a parent that left a playlist's ranked set is kept while
+    /// its replacement is not confirmed (`with_parent_release_after`).
+    /// `None`: two thirds of the subscription lease.
+    parent_release_after: Option<Duration>,
     /// The form of the frames that this node writes.
     frame_form: FrameForm,
     /// Told when the first datagram of each part leaves for a child.
@@ -677,6 +689,9 @@ impl CacheMeshConfig {
             receive_loss_ppm: 0,
             block_id_offset: 0,
             boot_id: 0,
+            build: None,
+            hello_state: None,
+            parent_release_after: None,
             frame_form: FrameForm::Current,
             send_observer: SendObserverSlot(None),
             live_push_filter: LivePushFilterSlot(None),
@@ -836,6 +851,49 @@ impl CacheMeshConfig {
 
     pub fn with_receive_loss_ppm(mut self, receive_loss_ppm: u32) -> Self {
         self.receive_loss_ppm = receive_loss_ppm.min(1_000_000);
+        self
+    }
+
+    /// The boot id of this node: the start of its process in Unix
+    /// microseconds. Its hellos and its subscribes carry it. A parent whose
+    /// boot id changes has restarted and holds no lease
+    /// ([`CacheMeshHandle::parents_changed`]); a child whose boot id changes
+    /// has restarted and gets a new lease, with its warm-up window and the
+    /// initialization. Without this call it is the time of
+    /// [`CacheMesh::start`]. Zero is not a boot id.
+    pub fn with_boot_id(mut self, boot_id: u64) -> Self {
+        self.boot_id = boot_id;
+        self
+    }
+
+    /// The build id that this node's hellos give, for a peer to show
+    /// ([`CacheMeshHandle::peer_statuses`]); it changes nothing else. At
+    /// most 64 bytes of it are sent.
+    pub fn with_build(mut self, build: String) -> Self {
+        let mut end = build.len().min(HELLO_BUILD_MAX_BYTES);
+        while !build.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.build = Some(build[..end].to_string());
+        self
+    }
+
+    /// The state that this node's hellos give, read from `state` for each
+    /// hello: 0 starting, 1 ready, 2 degraded, 3 draining, 4 stopping. A
+    /// peer shows it ([`CacheMeshHandle::peer_statuses`]); ranking reads
+    /// only [`CacheMeshHandle::set_draining`].
+    pub fn with_hello_state(mut self, state: Arc<AtomicU8>) -> Self {
+        self.hello_state = Some(state);
+        self
+    }
+
+    /// How long a parent that left a playlist's ranked set is kept, its
+    /// lease renewed, while its replacement is not confirmed (see
+    /// [`CacheMeshHandle::release_pending`]). The default is two thirds of
+    /// the subscription lease: two renewal periods of a child that renews
+    /// at a third of its lease.
+    pub fn with_parent_release_after(mut self, after: Duration) -> Self {
+        self.parent_release_after = Some(after);
         self
     }
 
@@ -1029,6 +1087,58 @@ struct Lease {
     /// This node's place in the child's ranking of the playlist's parents,
     /// from its newest Subscribe (None: the child did not say).
     rank: Option<u8>,
+    /// The boot id of the child's process that opened the lease. A
+    /// Subscribe with another one comes from a restarted child, and opens
+    /// the lease again.
+    child_boot: Option<u64>,
+    /// Which opening of a lease this is, of all that this node has served:
+    /// a sync task that finds another number than it last saw for the child
+    /// and playlist forgets what it sent the child before.
+    generation: u32,
+}
+
+/// What a peer's newest hello said, and when it came.
+#[derive(Debug, Clone)]
+struct PeerHello {
+    boot_id: Option<u64>,
+    build: Option<String>,
+    state: Option<u8>,
+    draining: bool,
+    at: Instant,
+}
+
+/// The parents of one playlist that this node subscribes to.
+#[derive(Debug, Default)]
+struct StreamParents {
+    /// The ranked parents that the last subscribe asked.
+    ranked: Vec<SocketAddr>,
+    /// Parents that left the ranked set and are not released yet, and when
+    /// each left: they keep feeding this node until their replacement is
+    /// confirmed (see [`CacheMeshHandle::release_pending`]).
+    pending: Vec<(SocketAddr, Instant)>,
+}
+
+/// A peer of this node as its newest hello described it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheMeshPeer {
+    pub peer: SocketAddr,
+    /// `None` before the peer's first hello, and for a role that this build
+    /// does not know.
+    pub role: Option<CacheMeshRole>,
+    /// The start of the peer's process in Unix microseconds.
+    pub boot_id: Option<u64>,
+    /// The peer's build id.
+    pub build: Option<String>,
+    /// The peer's state: 0 starting, 1 ready, 2 degraded, 3 draining,
+    /// 4 stopping.
+    pub state: Option<u8>,
+    /// The peer's hello says that it is draining.
+    pub draining: bool,
+    /// Whether this node may take playlists from the peer.
+    pub parent: bool,
+    /// How long ago this node last heard anything from the peer; `None`
+    /// when it never did.
+    pub heard: Option<Duration>,
 }
 
 /// A token bucket of warm-up bytes that refills from the clock it is read
@@ -1596,6 +1706,9 @@ pub struct CacheMeshFecStats {
     pub warm_capped_ticks: u64,
     /// Parents released because they left a playlist's ranked set.
     pub parents_released: u64,
+    /// Those of them released after `parent_release_after`, their
+    /// replacement not confirmed.
+    pub parents_released_unconfirmed: u64,
 }
 
 impl CacheMeshFecStats {
@@ -1653,6 +1766,8 @@ impl CacheMeshFecStats {
             warm_starved_ticks: self.warm_starved_ticks + other.warm_starved_ticks,
             warm_capped_ticks: self.warm_capped_ticks + other.warm_capped_ticks,
             parents_released: self.parents_released + other.parents_released,
+            parents_released_unconfirmed: self.parents_released_unconfirmed
+                + other.parents_released_unconfirmed,
         }
     }
 }
@@ -1701,6 +1816,7 @@ struct CacheMeshFecCounters {
     warm_starved_ticks: AtomicU64,
     warm_capped_ticks: AtomicU64,
     parents_released: AtomicU64,
+    parents_released_unconfirmed: AtomicU64,
 }
 
 impl CacheMeshFecCounters {
@@ -1750,6 +1866,7 @@ impl CacheMeshFecCounters {
             warm_starved_ticks: self.warm_starved_ticks.load(Ordering::Relaxed),
             warm_capped_ticks: self.warm_capped_ticks.load(Ordering::Relaxed),
             parents_released: self.parents_released.load(Ordering::Relaxed),
+            parents_released_unconfirmed: self.parents_released_unconfirmed.load(Ordering::Relaxed),
         }
     }
 }
@@ -1859,18 +1976,24 @@ impl CacheMesh {
                 role: self.config.role,
                 same_region_only: self.config.same_region_only,
                 boot_id: self.config.boot_id,
+                build: self.config.build.clone(),
+                state: self.config.hello_state.clone(),
             },
             peers: RwLock::new(initial_peers),
             allowed_peers: ArcSwap::from_pointee(self.config.allowed_peers.clone()),
             peer_regions: RwLock::new(HashMap::new()),
             peer_roles: RwLock::new(HashMap::new()),
             peer_draining: StdMutex::new(HashSet::new()),
+            peer_hellos: StdMutex::new(HashMap::new()),
+            parents_changed: watch::channel(0).0,
             draining: AtomicBool::new(false),
-            ranked_parents: StdMutex::new(HashMap::new()),
+            subscribed: StdMutex::new(HashMap::new()),
+            subscribe_order: tokio::sync::Mutex::new(()),
             warm_total: Default::default(),
             remote_slots: RwLock::new(HashSet::new()),
             counters: Arc::new(CacheMeshFecCounters::default()),
             leases: Arc::new(StdMutex::new(HashMap::new())),
+            lease_generation: AtomicU32::new(0),
             served: Arc::new(StdMutex::new(Vec::new())),
             served_changed: watch::channel(0).0,
             peer_seen: Arc::new(StdMutex::new(HashMap::new())),
@@ -2030,6 +2153,10 @@ impl CacheMesh {
             avoid_draining_parents: self.config.avoid_draining_parents,
             warm_from_second_parent: self.config.warm_from_second_parent,
             boot_id: self.config.boot_id,
+            parent_release_after: self
+                .config
+                .parent_release_after
+                .unwrap_or(self.config.subscription_lease * 2 / 3),
             frame_form: self.config.frame_form,
         })
     }
@@ -2068,6 +2195,8 @@ struct HelloIdentity {
     role: CacheMeshRole,
     same_region_only: bool,
     boot_id: u64,
+    build: Option<String>,
+    state: Option<Arc<AtomicU8>>,
 }
 
 /// State that the tasks of one mesh node and its handle share.
@@ -2080,10 +2209,22 @@ struct MeshShared {
     peer_roles: RwLock<HashMap<SocketAddr, WireRole>>,
     /// Peers whose newest hello says that they are draining.
     peer_draining: StdMutex<HashSet<SocketAddr>>,
+    /// The newest hello of each peer in the peer table.
+    peer_hellos: StdMutex<HashMap<SocketAddr, PeerHello>>,
+    /// A count that goes up when a peer that this node may take playlists
+    /// from is new, has restarted, returns from a silence or changes
+    /// whether it drains (`CacheMeshHandle::parents_changed`).
+    parents_changed: watch::Sender<u64>,
     /// This node is draining: its hellos say so (`CacheMeshHandle::set_draining`).
     draining: AtomicBool,
-    /// The ranked parents that this node last subscribed each playlist at.
-    ranked_parents: StdMutex<HashMap<u64, Vec<SocketAddr>>>,
+    /// The parents of each playlist that this node subscribes to: those
+    /// that its last subscribe ranked, and those waiting to be released.
+    subscribed: StdMutex<HashMap<u64, StreamParents>>,
+    /// Held by a subscribe, an unsubscribe and a release of pending parents
+    /// from their first look at `subscribed` to their last frame, so that
+    /// the frames of two of them never cross: a parent that one call ranks
+    /// again is not told to stop by another that saw it pending.
+    subscribe_order: tokio::sync::Mutex<()>,
     /// The node's total warm-up allowance across its children, one for
     /// each lane (`CacheMeshConfig::backfill_total_bytes_per_sec`): the
     /// video lane's 4K warm-ups do not starve the audio lane's (wave 8
@@ -2094,6 +2235,8 @@ struct MeshShared {
     remote_slots: RwLock<HashSet<(StreamHandle, usize)>>,
     counters: Arc<CacheMeshFecCounters>,
     leases: LeaseTable,
+    /// The generation of the next lease that this node opens.
+    lease_generation: AtomicU32,
     served: ServedTable,
     /// A count that goes up whenever the leases that either lane serves
     /// change (a child or a playlist comes or goes), so that a consumer of
@@ -2168,8 +2311,11 @@ impl MeshShared {
             peers,
             draining: self.draining.load(Ordering::Relaxed),
             boot_id: Some(identity.boot_id),
-            build: None,
-            state: None,
+            build: identity.build.clone(),
+            state: identity
+                .state
+                .as_ref()
+                .map(|state| state.load(Ordering::Relaxed)),
         }
     }
 
@@ -2252,6 +2398,7 @@ pub struct CacheMeshHandle {
     avoid_draining_parents: bool,
     warm_from_second_parent: bool,
     boot_id: u64,
+    parent_release_after: Duration,
     frame_form: FrameForm,
 }
 
@@ -2392,13 +2539,22 @@ impl CacheMeshHandle {
     /// the lease is current, so call this again within the lease. A new lease
     /// first receives a warm-up window of at most `backfill_parts` parts that
     /// ends at the newest part and does not start before `from_slot`.
-    /// Returns the parents that were asked.
+    /// Returns the ranked parents, which were asked.
+    ///
+    /// A change of parents is make before break. A parent that has left the
+    /// playlist's ranked set (a parent that ranks above it joined, or it is
+    /// draining) is not told to stop here: it waits to be released, and
+    /// each call renews its lease, without a warm-up window and with a rank
+    /// after the ranked parents, so that it keeps feeding this node.
+    /// [`Self::release_pending`] releases it. A waiting parent that is
+    /// ranked again waits no longer.
     pub async fn subscribe(
         &self,
         stream_id: u64,
         from_slot: usize,
         backfill_parts: usize,
     ) -> Result<Vec<SocketAddr>, MeshError> {
+        let _order = self.shared.subscribe_order.lock().await;
         lock(&self.shared.wanted).insert(stream_id);
         let (peers, ranked) = self.parents_ranked(stream_id).await;
         if peers.is_empty() {
@@ -2414,8 +2570,34 @@ impl CacheMeshHandle {
         } else {
             1
         };
-        for (index, peer) in peers.iter().enumerate() {
-            let backfill_parts = if index < warm_parents {
+        // The parents that left the ranked set wait to be released; those
+        // that wait and are not overdue are asked to go on.
+        let now = Instant::now();
+        let waiting = {
+            let mut subscribed = lock(&self.shared.subscribed);
+            let parents = subscribed.entry(stream_id).or_default();
+            let previous = std::mem::replace(&mut parents.ranked, peers.clone());
+            parents.pending.retain(|(peer, _)| !peers.contains(peer));
+            if self.release_unranked_parents {
+                for peer in previous {
+                    if !peers.contains(&peer)
+                        && !parents.pending.iter().any(|(waiting, _)| *waiting == peer)
+                    {
+                        parents.pending.push((peer, now));
+                    }
+                }
+            }
+            // An overdue parent is not renewed: if nothing releases it, its
+            // lease lapses.
+            parents
+                .pending
+                .iter()
+                .filter(|(_, since)| now.duration_since(*since) < self.parent_release_after)
+                .map(|(peer, _)| *peer)
+                .collect::<Vec<_>>()
+        };
+        for (index, peer) in peers.iter().chain(&waiting).enumerate() {
+            let backfill_parts = if index < warm_parents.min(peers.len()) {
                 backfill_parts
             } else {
                 0
@@ -2435,41 +2617,178 @@ impl CacheMeshHandle {
             self.send_control(std::slice::from_ref(peer), &frame)
                 .await?;
         }
-        // A parent that has left the playlist's ranked set (a parent that
-        // ranks above it joined, or it is draining) is released at once,
-        // not when its lease lapses: it stops feeding this node now.
-        let left = {
-            let mut ranked = lock(&self.shared.ranked_parents);
-            let previous = ranked.insert(stream_id, peers.clone()).unwrap_or_default();
-            previous
-                .into_iter()
-                .filter(|peer| !peers.contains(peer))
+        Ok(peers)
+    }
+
+    /// Release the parents that wait for it (see [`Self::subscribe`]): tell
+    /// each to stop (Unsubscribe).
+    ///
+    /// A waiting parent of a playlist is released when `confirmed(stream_id,
+    /// parent)` is true of every ranked parent of the playlist (each is
+    /// seen delivering it, so the one that left is no longer needed), or
+    /// when it has waited for `parent_release_after`
+    /// ([`CacheMeshConfig::with_parent_release_after`]): a parent must be
+    /// left in the end, whether or not its replacement delivers. Call it
+    /// often (every 100 ms); a node that cannot tell whether a parent
+    /// delivers passes `&|_, _| false` and gets the timed release.
+    ///
+    /// Returns the playlist and address of each parent released, and
+    /// whether its replacement was confirmed. `parents_released` counts
+    /// them all, `parents_released_unconfirmed` those released on time
+    /// alone.
+    pub async fn release_pending(
+        &self,
+        confirmed: &(dyn Fn(u64, SocketAddr) -> bool + Send + Sync),
+    ) -> Vec<(u64, SocketAddr, bool)> {
+        let _order = self.shared.subscribe_order.lock().await;
+        // What waits, read under the lock; `confirmed` runs outside it.
+        let waiting = {
+            let subscribed = lock(&self.shared.subscribed);
+            subscribed
+                .iter()
+                .filter(|(_, parents)| !parents.pending.is_empty())
+                .map(|(stream_id, parents)| {
+                    (*stream_id, parents.ranked.clone(), parents.pending.clone())
+                })
                 .collect::<Vec<_>>()
         };
-        if self.release_unranked_parents && !left.is_empty() {
-            let frame = MeshFrame::Unsubscribe {
+        let now = Instant::now();
+        let mut released = Vec::new();
+        for (stream_id, ranked, pending) in waiting {
+            let replaced = !ranked.is_empty()
+                && ranked
+                    .iter()
+                    .all(|parent| confirmed(stream_id, *parent));
+            let due = pending
+                .into_iter()
+                .filter(|(_, since)| {
+                    replaced || now.duration_since(*since) >= self.parent_release_after
+                })
+                .map(|(parent, _)| parent)
+                .collect::<Vec<_>>();
+            if due.is_empty() {
+                continue;
+            }
+            let frame = match (MeshFrame::Unsubscribe {
                 node_id: self.node_id.clone(),
                 stream_id,
+            })
+            .encode_as(self.frame_form)
+            {
+                Ok(frame) => frame,
+                Err(err) => {
+                    debug!(stream_id, error = %err, "cache mesh unsubscribe encode failed");
+                    continue;
+                }
+            };
+            for parent in due {
+                // A parent that could not be told keeps waiting.
+                if let Err(err) = self
+                    .send_control(std::slice::from_ref(&parent), &frame)
+                    .await
+                {
+                    debug!(peer = %parent, stream_id, error = %err, "cache mesh parent release failed");
+                    continue;
+                }
+                if let Some(parents) = lock(&self.shared.subscribed).get_mut(&stream_id) {
+                    parents.pending.retain(|(waiting, _)| *waiting != parent);
+                }
+                let counters = &self.shared.counters;
+                counters.parents_released.fetch_add(1, Ordering::Relaxed);
+                if !replaced {
+                    counters
+                        .parents_released_unconfirmed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                released.push((stream_id, parent, replaced));
             }
-            .encode_as(self.frame_form)?;
-            self.send_control(&left, &frame).await?;
-            self.shared
-                .counters
-                .parents_released
-                .fetch_add(left.len() as u64, Ordering::Relaxed);
         }
-        Ok(peers)
+        released
+    }
+
+    /// The parents that left a playlist's ranked set and are not released
+    /// yet: the playlist and the parent's address, sorted.
+    pub fn pending_parents(&self) -> Vec<(u64, SocketAddr)> {
+        let mut pending = lock(&self.shared.subscribed)
+            .iter()
+            .flat_map(|(stream_id, parents)| {
+                parents.pending.iter().map(|(parent, _)| (*stream_id, *parent))
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable();
+        pending
+    }
+
+    /// A watch that changes when a peer that this node may take playlists
+    /// from is new, has restarted (the boot id in its hello changed), is
+    /// heard again after more than `peer_timeout` without a hello, or
+    /// changes whether it is draining. Such a parent holds no lease of this
+    /// node, or should hold none: greet the parents
+    /// ([`Self::greet_parents`]) and subscribe every playlist again now,
+    /// not at the next renewal. The value is a count with no other
+    /// meaning.
+    pub fn parents_changed(&self) -> watch::Receiver<u64> {
+        self.shared.parents_changed.subscribe()
+    }
+
+    /// Send this node's hello now to every peer that it may take playlists
+    /// from, and return how many were sent. A parent that has just started
+    /// knows no region for this node until a hello of it arrives, and one
+    /// that keeps to its region drops a Subscribe from a peer of unknown
+    /// region without a word: greet first, then subscribe. The hello goes
+    /// out on the socket and in the order of the subscribes that follow.
+    pub async fn greet_parents(&self) -> Result<usize, MeshError> {
+        let peers = self.allowed_peers().await;
+        if peers.is_empty() {
+            return Ok(0);
+        }
+        let frame = self.shared.hello().await.encode_as(self.frame_form)?;
+        self.send_control(&peers, &frame).await
+    }
+
+    /// The peers of this node, each as its newest hello described it,
+    /// sorted by address.
+    pub async fn peer_statuses(&self) -> Vec<CacheMeshPeer> {
+        let mut peers = self.peers().await;
+        peers.sort_unstable();
+        let parents = self.allowed_peers().await;
+        let roles = self.shared.peer_roles.read().await.clone();
+        let hellos = lock(&self.shared.peer_hellos);
+        let draining = lock(&self.shared.peer_draining);
+        let seen = lock(&self.shared.peer_seen);
+        let now = Instant::now();
+        peers
+            .into_iter()
+            .map(|peer| {
+                let hello = hellos.get(&peer);
+                CacheMeshPeer {
+                    peer,
+                    role: match roles.get(&peer) {
+                        Some(WireRole::Known(role)) => Some(*role),
+                        Some(WireRole::Other(_)) | None => None,
+                    },
+                    boot_id: hello.and_then(|hello| hello.boot_id),
+                    build: hello.and_then(|hello| hello.build.clone()),
+                    state: hello.and_then(|hello| hello.state),
+                    draining: draining.contains(&peer),
+                    parent: parents.binary_search(&peer).is_ok(),
+                    heard: seen.get(&peer).map(|last| now.duration_since(*last)),
+                }
+            })
+            .collect()
     }
 
     /// End the subscription to one playlist. Parents stop pushing it, and
     /// this node no longer accepts its parts.
     pub async fn unsubscribe(&self, stream_id: u64) -> Result<usize, MeshError> {
+        let _order = self.shared.subscribe_order.lock().await;
         if !lock(&self.shared.wanted).remove(&stream_id) {
             return Ok(0);
         }
-        lock(&self.shared.ranked_parents).remove(&stream_id);
-        // Every allowed parent is told, because the parents of the playlist
-        // can have changed since the subscription was made.
+        // With it go the parents that waited to be released: every allowed
+        // parent is told, because the parents of the playlist can have
+        // changed since the subscription was made.
+        lock(&self.shared.subscribed).remove(&stream_id);
         let peers = self.allowed_peers().await;
         if peers.is_empty() {
             return Ok(0);
@@ -4551,7 +4870,9 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             role,
             peers,
             draining,
-            ..
+            boot_id,
+            build,
+            state,
         } => {
             if matches!(role, WireRole::Other(_)) {
                 handler
@@ -4563,6 +4884,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                 handler.shared.peers.write().await.remove(&peer);
                 handler.shared.peer_regions.write().await.remove(&peer);
                 handler.shared.peer_roles.write().await.remove(&peer);
+                lock(&handler.shared.peer_hellos).remove(&peer);
                 debug!(node_id, region, peer = %peer, "ignored cache mesh peer from another region");
                 return;
             }
@@ -4597,11 +4919,39 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             drop(peer_regions);
             if peer_admitted {
                 handler.shared.peer_roles.write().await.insert(peer, role);
-                let mut peer_draining = lock(&handler.shared.peer_draining);
-                if draining {
-                    peer_draining.insert(peer);
-                } else {
-                    peer_draining.remove(&peer);
+                {
+                    let mut peer_draining = lock(&handler.shared.peer_draining);
+                    if draining {
+                        peer_draining.insert(peer);
+                    } else {
+                        peer_draining.remove(&peer);
+                    }
+                }
+                let now = Instant::now();
+                let previous = lock(&handler.shared.peer_hellos).insert(
+                    peer,
+                    PeerHello {
+                        boot_id,
+                        build,
+                        state,
+                        draining,
+                        at: now,
+                    },
+                );
+                // A parent that is new, has restarted, returns from a
+                // silence or changes whether it drains: its children greet
+                // it, rank again and ask now, not at their next renewal.
+                if WireRole::may_be_parent(Some(role), handler.config.role)
+                    && previous.is_none_or(|previous| {
+                        previous.boot_id != boot_id
+                            || previous.draining != draining
+                            || now.duration_since(previous.at) > handler.config.peer_timeout
+                    })
+                {
+                    handler
+                        .shared
+                        .parents_changed
+                        .send_modify(|count| *count = count.wrapping_add(1));
                 }
             }
             debug!(node_id, region, peer = %peer, discovered, "cache mesh peer discovered");
@@ -4794,7 +5144,7 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             backfill_parts,
             lease_ms,
             rank,
-            ..
+            boot_id,
         } => {
             if !peer_is_allowed(peer, &handler).await || handler.config.role == CacheMeshRole::Edge
             {
@@ -4816,13 +5166,24 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
             );
             let now = Instant::now();
             let mut leases = lock(&handler.shared.leases);
-            let current = leases
+            // A renewal comes from the process that holds the lease. A
+            // Subscribe with another boot id comes from a child that has
+            // restarted inside its lease: it holds nothing of the playlist,
+            // and its lease is opened again. The boot id is in the
+            // Subscribe, not only in the hello, because a Subscribe that
+            // overtakes the first hello of the new process would otherwise
+            // renew the lease of the dead one.
+            let renewed = leases
                 .get_mut(&(peer, stream_id))
-                .filter(|lease| lease.expires > now);
-            if let Some(current) = current {
-                current.expires = now + lease;
-                current.rank = rank;
-            } else {
+                .filter(|current| {
+                    current.expires > now && (boot_id.is_none() || current.child_boot == boot_id)
+                })
+                .map(|current| {
+                    current.expires = now + lease;
+                    current.rank = rank;
+                })
+                .is_some();
+            if !renewed {
                 let from_slot = usize::try_from(from_slot).unwrap_or(usize::MAX);
                 let backfill_parts = usize::try_from(backfill_parts).unwrap_or(usize::MAX);
                 leases.insert(
@@ -4831,6 +5192,11 @@ async fn handle_frame(frame: MeshFrame, peer: SocketAddr, handler: FrameHandler<
                         expires: now + lease,
                         open: Some((from_slot, backfill_parts)),
                         rank,
+                        child_boot: boot_id,
+                        generation: handler
+                            .shared
+                            .lease_generation
+                            .fetch_add(1, Ordering::Relaxed),
                     },
                 );
                 debug!(
@@ -5379,6 +5745,8 @@ async fn sync_task(
     let mut active: HashSet<(SocketAddr, u64)> = HashSet::new();
     // The rank that each lease's child gave this node, as the tick read it.
     let mut lease_ranks: HashMap<(SocketAddr, u64), Option<u8>> = HashMap::new();
+    // The generation of each lease when this lane last looked.
+    let mut lease_generations: HashMap<(SocketAddr, u64), u32> = HashMap::new();
     let mut backfill_tokens: HashMap<SocketAddr, f64> = HashMap::new();
     // Which child of a stream takes warm-up parts first this tick: it turns
     // each tick, so that under the total cap no child is always last.
@@ -5442,12 +5810,27 @@ async fn sync_task(
             if demand {
                 let mut current = HashSet::new();
                 lease_ranks.clear();
+                // Leases opened again since this lane last looked.
+                let mut reopened: Vec<(SocketAddr, u64)> = Vec::new();
                 {
                     let mut leases = lock(&shared.leases);
                     leases.retain(|_, lease| lease.expires > now);
                     for (key, lease) in leases.iter_mut() {
                         current.insert(*key);
                         lease_ranks.insert(*key, lease.rank);
+                        // A lease of another generation is a new lease: its
+                        // child restarted, or the lease ended and came back
+                        // between two ticks. What the old one was sent is
+                        // forgotten before the new window is taken, so the
+                        // child gets the initialization and its warm-up
+                        // window again.
+                        if lease_generations
+                            .insert(*key, lease.generation)
+                            .is_some_and(|seen| seen != lease.generation)
+                        {
+                            lane_children.forget_lease(key.0, key.1);
+                            reopened.push(*key);
+                        }
                         // The lane of the playlist's class starts its
                         // warm-up window.
                         if lease.open.is_some() && lane.carries(&config, key.1) {
@@ -5455,6 +5838,14 @@ async fn sync_task(
                                 lane_children.pending_open.insert(*key, open);
                             }
                         }
+                    }
+                }
+                if lease_generations.len() > current.len() {
+                    lease_generations.retain(|key, _| current.contains(key));
+                }
+                if lane.split() {
+                    for (peer, stream_id) in &reopened {
+                        forget_child_in_transit(handover, *stream_id, peer);
                     }
                 }
                 for (peer, stream_id) in active.difference(&current) {
@@ -6598,23 +6989,46 @@ mod tests {
         mesh.shutdown();
     }
 
-    /// The datagrams that arrive at `socket` within `wait` and start a chunk
-    /// frame: the slot of each.
-    async fn chunks_arriving(socket: &UdpSocket, wait: Duration) -> Vec<u64> {
-        let mut slots = Vec::new();
+    /// The kind of a frame and, for a chunk, its slot, from the datagram
+    /// that carries the first source symbol of the frame's block. `None`
+    /// for any other datagram.
+    fn frame_start(datagram: &[u8]) -> Option<(u8, Option<u64>)> {
+        if datagram.len() < HEADER_LEN + 4 + FRAME_MAGIC.len() + 2
+            || DatagramFecHeader::decode(datagram).is_err()
+            || datagram[HEADER_LEN + 1..HEADER_LEN + 4] != [0, 0, 0]
+        {
+            return None;
+        }
+        let frame = &datagram[HEADER_LEN + 4..];
+        (&frame[..FRAME_MAGIC.len()] == FRAME_MAGIC).then(|| {
+            (
+                frame[FRAME_MAGIC.len() + 1],
+                chunk_frame_slot(frame).map(|(_, slot_id)| slot_id),
+            )
+        })
+    }
+
+    /// The frames that start to arrive at `socket` within `wait` (see
+    /// [`frame_start`]).
+    async fn frames_arriving(socket: &UdpSocket, wait: Duration) -> Vec<(u8, Option<u64>)> {
+        let mut frames = Vec::new();
         let mut buf = vec![0_u8; 65_536];
         let end = Instant::now() + wait;
         while let Ok(Ok((len, _))) = tokio::time::timeout_at(end, socket.recv_from(&mut buf)).await
         {
-            let datagram = &buf[..len];
-            if len < HEADER_LEN + 4 || DatagramFecHeader::decode(datagram).is_err() {
-                continue;
-            }
-            if let Some((_, slot_id)) = chunk_frame_slot(&datagram[HEADER_LEN + 4..]) {
-                slots.push(slot_id);
-            }
+            frames.extend(frame_start(&buf[..len]));
         }
-        slots
+        frames
+    }
+
+    /// The slots of the chunk frames that start to arrive at `socket`
+    /// within `wait`.
+    async fn chunks_arriving(socket: &UdpSocket, wait: Duration) -> Vec<u64> {
+        frames_arriving(socket, wait)
+            .await
+            .into_iter()
+            .filter_map(|(_, slot_id)| slot_id)
+            .collect()
     }
 
     /// A peer whose hello gives a role that this build does not know (a
@@ -8801,7 +9215,9 @@ mod tests {
     /// ranking of a playlist's parents (the fast plane feeds the first
     /// parent's children video in full), a draining parent is ranked after
     /// the live ones, and a parent that leaves the ranked set is released
-    /// at once rather than when its lease lapses.
+    /// rather than left until its lease lapses: not by the renewal that
+    /// ranks it out, which keeps it with a rank after the ranked parents,
+    /// but when its replacement is confirmed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parents_learn_their_rank_and_a_draining_parent_is_left() {
         let addrs = [loopback_addr(), loopback_addr(), loopback_addr()];
@@ -8876,8 +9292,8 @@ mod tests {
         assert_eq!(served_rank(third, 7), None);
 
         // The first parent drains: once its hello says so, the renewal ranks
-        // it out of the set (three parents, two wanted), and it is told to
-        // stop at once.
+        // it out of the set (three parents, two wanted). It is kept, after
+        // the two ranked parents, until they are confirmed.
         parents[first].set_draining(true);
         timeout(Duration::from_secs(3), async {
             while !edge.draining_peers().contains(&addrs[first]) {
@@ -8890,15 +9306,1033 @@ mod tests {
         assert!(!ranked.contains(&addrs[first]), "{ranked:?}");
         assert_eq!(index_of(ranked[0]), second, "the second parent moves up");
         let mut want = vec![None; 3];
+        want[first] = Some(Some(2));
         want[second] = Some(Some(0));
         want[third] = Some(Some(1));
+        wait_ranks(7, want.clone()).await;
+        assert_eq!(edge.pending_parents(), vec![(7, addrs[first])]);
+        assert_eq!(edge.fec_stats().parents_released, 0);
+        // Its replacement confirmed, it is told to stop.
+        assert_eq!(
+            edge.release_pending(&|_, _| true).await,
+            vec![(7, addrs[first], true)]
+        );
+        want[first] = None;
         wait_ranks(7, want).await;
+        assert_eq!(edge.pending_parents(), Vec::new());
         assert_eq!(edge.fec_stats().parents_released, 1);
+        assert_eq!(edge.fec_stats().parents_released_unconfirmed, 0);
 
         for parent in &parents {
             parent.shutdown();
         }
         edge.shutdown();
+    }
+
+    /// Three distributors that replicate on demand, and one edge that asks
+    /// two of them for a playlist.
+    struct ThreeParents {
+        addrs: [SocketAddr; 3],
+        caches: Vec<Arc<ChunkCache>>,
+        parents: Vec<CacheMeshHandle>,
+        edge: CacheMeshHandle,
+        edge_cache: Arc<ChunkCache>,
+    }
+
+    impl ThreeParents {
+        /// Start them, every node with a subscription lease of `lease`.
+        /// Every distributor holds part 0 of playlist 7, so that a lease of
+        /// it starts live at part 1. (A lease opened on a playlist that a
+        /// parent does not hold yet starts after the first part that it
+        /// stores.)
+        async fn start(lease: Duration) -> Self {
+            let addrs = [loopback_addr(), loopback_addr(), loopback_addr()];
+            let edge_addr = loopback_addr();
+            let mut caches = Vec::new();
+            let mut parents = Vec::new();
+            for (index, addr) in addrs.iter().enumerate() {
+                let cache = Arc::new(ChunkCache::new(demand_options()));
+                cache
+                    .add_for_stream_id(7, 0, Bytes::from(vec![0_u8; 64]))
+                    .await
+                    .unwrap();
+                let parent = CacheMesh::new(
+                    Arc::clone(&cache),
+                    demand_distributor(&format!("dist-{index}"), *addr)
+                        .with_peer(edge_addr)
+                        .with_subscription_lease(lease),
+                )
+                .start()
+                .await
+                .unwrap();
+                caches.push(cache);
+                parents.push(parent);
+            }
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peers(addrs)
+                    .with_max_parents(2)
+                    .with_subscription_lease(lease),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 3).await;
+            Self {
+                addrs,
+                caches,
+                parents,
+                edge,
+                edge_cache,
+            }
+        }
+
+        fn index_of(&self, peer: SocketAddr) -> usize {
+            self.addrs.iter().position(|addr| *addr == peer).unwrap()
+        }
+
+        /// The rank of the edge's lease of a playlist at each distributor;
+        /// `None` at one that serves the edge no lease of it.
+        fn ranks(&self, stream_id: u64) -> [Option<Option<u8>>; 3] {
+            std::array::from_fn(|index| {
+                self.parents[index]
+                    .served_subscriptions()
+                    .iter()
+                    .find(|served| served.stream_id == stream_id)
+                    .map(|served| served.rank)
+            })
+        }
+
+        async fn wait_ranks(&self, stream_id: u64, want: [Option<Option<u8>>; 3]) {
+            timeout(Duration::from_secs(3), async {
+                while self.ranks(stream_id) != want {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "ranks of stream {stream_id} are {:?}, not {want:?}",
+                    self.ranks(stream_id)
+                )
+            });
+        }
+
+        /// Make a distributor drain (or stop draining), and wait until the
+        /// edge has its hello.
+        async fn set_draining(&self, index: usize, draining: bool) {
+            self.parents[index].set_draining(draining);
+            timeout(Duration::from_secs(3), async {
+                while self.edge.draining_peers().contains(&self.addrs[index]) != draining {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the hello of the distributor did not arrive");
+        }
+
+        /// The edge subscribes to playlist 7; its first parent then drains,
+        /// and a second subscribe ranks it out of the set (three live
+        /// parents, two asked): it waits to be released. Returns the index
+        /// of the parent that left, of the two ranked now in their order,
+        /// and a time just before the parent left.
+        async fn first_parent_leaves(&self) -> (usize, usize, usize, Instant) {
+            let ranked = self.edge.subscribe(7, 0, 0).await.unwrap();
+            assert_eq!(ranked.len(), 2);
+            let left = self.index_of(ranked[0]);
+            let second = self.index_of(ranked[1]);
+            let third = 3 - left - second;
+            let mut want = [None; 3];
+            want[left] = Some(Some(0));
+            want[second] = Some(Some(1));
+            self.wait_ranks(7, want).await;
+            self.set_draining(left, true).await;
+            let before = Instant::now();
+            let ranked = self.edge.subscribe(7, 0, 0).await.unwrap();
+            assert_eq!(ranked, vec![self.addrs[second], self.addrs[third]]);
+            want[left] = Some(Some(2));
+            want[second] = Some(Some(0));
+            want[third] = Some(Some(1));
+            self.wait_ranks(7, want).await;
+            assert_eq!(self.edge.pending_parents(), vec![(7, self.addrs[left])]);
+            (left, second, third, before)
+        }
+
+        fn shutdown(&self) {
+            for parent in &self.parents {
+                parent.shutdown();
+            }
+            self.edge.shutdown();
+        }
+    }
+
+    /// A node calls `subscribe` for a playlist from several places, so the
+    /// call after the one that ranked a parent out can come a millisecond
+    /// later. It releases nothing: the parent that left keeps its lease,
+    /// keeps feeding, and waits; ranked again, it waits no longer. Before,
+    /// the call that ranked a parent out told it to stop at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_subscribe_call_does_not_release_a_pending_parent() {
+        let mesh = ThreeParents::start(Duration::from_secs(5)).await;
+        let (left, second, third, _) = mesh.first_parent_leaves().await;
+        for _ in 0..5 {
+            assert_eq!(
+                mesh.edge.subscribe(7, 0, 0).await.unwrap(),
+                vec![mesh.addrs[second], mesh.addrs[third]]
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mesh.edge.pending_parents(), vec![(7, mesh.addrs[left])]);
+        assert_eq!(mesh.edge.fec_stats().parents_released, 0);
+        assert_eq!(mesh.ranks(7)[left], Some(Some(2)));
+        // It still feeds the edge: a part that it alone holds arrives.
+        mesh.caches[left]
+            .add_for_stream_id(7, 1, Bytes::from(vec![1_u8; 64]))
+            .await
+            .unwrap();
+        wait_for_slot(&mesh.edge_cache, 7, 1).await;
+
+        // It drains no longer and is ranked first again: it waits no longer,
+        // was never told to stop, and the third parent waits in its place.
+        mesh.set_draining(left, false).await;
+        assert_eq!(
+            mesh.edge.subscribe(7, 0, 0).await.unwrap(),
+            vec![mesh.addrs[left], mesh.addrs[second]]
+        );
+        assert_eq!(mesh.edge.pending_parents(), vec![(7, mesh.addrs[third])]);
+        let mut want = [None; 3];
+        want[left] = Some(Some(0));
+        want[second] = Some(Some(1));
+        want[third] = Some(Some(2));
+        mesh.wait_ranks(7, want).await;
+        assert_eq!(mesh.edge.fec_stats().parents_released, 0);
+        mesh.shutdown();
+    }
+
+    /// A parent that left a playlist's ranked set is told to stop when
+    /// every ranked parent of the playlist is confirmed, and not while one
+    /// of them is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pending_parent_is_released_when_its_replacement_is_confirmed() {
+        let mesh = ThreeParents::start(Duration::from_secs(5)).await;
+        let (left, second, third, _) = mesh.first_parent_leaves().await;
+        // Nothing is confirmed, and the limit (two thirds of 5 s) is far.
+        assert_eq!(mesh.edge.release_pending(&|_, _| false).await, Vec::new());
+        // One of the two ranked parents delivers: not yet.
+        let one = mesh.addrs[second];
+        assert_eq!(
+            mesh.edge
+                .release_pending(&|stream_id, parent| stream_id == 7 && parent == one)
+                .await,
+            Vec::new()
+        );
+        assert_eq!(mesh.ranks(7)[left], Some(Some(2)));
+        assert_eq!(mesh.edge.fec_stats().parents_released, 0);
+        // Both do. It is asked of the ranked parents of the playlist only.
+        let asked = StdMutex::new(Vec::new());
+        assert_eq!(
+            mesh.edge
+                .release_pending(&|stream_id, parent| {
+                    lock(&asked).push((stream_id, parent));
+                    true
+                })
+                .await,
+            vec![(7, mesh.addrs[left], true)]
+        );
+        let mut asked = asked.into_inner().unwrap();
+        asked.sort_unstable();
+        let mut ranked = vec![(7, mesh.addrs[second]), (7, mesh.addrs[third])];
+        ranked.sort_unstable();
+        assert_eq!(asked, ranked);
+        let mut want = [None; 3];
+        want[second] = Some(Some(0));
+        want[third] = Some(Some(1));
+        mesh.wait_ranks(7, want).await;
+        assert_eq!(mesh.edge.pending_parents(), Vec::new());
+        let stats = mesh.edge.fec_stats();
+        assert_eq!(
+            (stats.parents_released, stats.parents_released_unconfirmed),
+            (1, 0)
+        );
+        // Nothing waits now.
+        assert_eq!(mesh.edge.release_pending(&|_, _| true).await, Vec::new());
+        mesh.shutdown();
+    }
+
+    /// A ranked parent must be left in the end, whether or not its
+    /// replacement delivers: a parent that left the ranked set is kept, its
+    /// lease renewed, for two renewal periods (two thirds of the lease) and
+    /// then told to stop, and that release is counted apart. A parent that
+    /// nothing releases is not renewed beyond that time either: its lease
+    /// lapses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unconfirmed_replacement_releases_after_two_renewals_and_is_counted() {
+        let lease = Duration::from_millis(600);
+        let renewal = lease / 3;
+        let mesh = ThreeParents::start(lease).await;
+        assert_eq!(mesh.edge.parent_release_after, renewal * 2);
+        let (left, second, third, left_at) = mesh.first_parent_leaves().await;
+        // The edge renews at a third of its lease and looks every 20 ms for
+        // a parent to release; no replacement is ever confirmed.
+        let mut next_renewal = left_at + renewal;
+        let released = loop {
+            assert!(left_at.elapsed() < Duration::from_secs(3), "never released");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if Instant::now() >= next_renewal {
+                next_renewal += renewal;
+                mesh.edge.subscribe(7, 0, 0).await.unwrap();
+            }
+            let held = mesh.ranks(7)[left];
+            let waited = left_at.elapsed();
+            let released = mesh.edge.release_pending(&|_, _| false).await;
+            if !released.is_empty() {
+                break released;
+            }
+            // While it waits it holds its lease.
+            assert_eq!(held, Some(Some(2)), "after {waited:?}");
+        };
+        let waited = left_at.elapsed();
+        assert_eq!(released, vec![(7, mesh.addrs[left], false)]);
+        assert!(waited >= renewal * 2, "released after {waited:?}");
+        let mut want = [None; 3];
+        want[second] = Some(Some(0));
+        want[third] = Some(Some(1));
+        mesh.wait_ranks(7, want).await;
+        let stats = mesh.edge.fec_stats();
+        assert_eq!(
+            (stats.parents_released, stats.parents_released_unconfirmed),
+            (1, 1)
+        );
+
+        // The second parent drains too and leaves the set (the first, which
+        // drains as well, ranks above it). Nothing looks for a parent to
+        // release: the renewals go on, the lease of the parent that left is
+        // renewed for the two periods only, and it lapses.
+        mesh.set_draining(second, true).await;
+        let left_at = Instant::now();
+        assert_eq!(
+            mesh.edge.subscribe(7, 0, 0).await.unwrap(),
+            vec![mesh.addrs[third], mesh.addrs[left]]
+        );
+        assert_eq!(mesh.edge.pending_parents(), vec![(7, mesh.addrs[second])]);
+        while mesh.ranks(7)[second].is_some() {
+            assert!(
+                left_at.elapsed() < renewal * 2 + lease + Duration::from_secs(2),
+                "the lease of a parent that nothing released never lapsed"
+            );
+            tokio::time::sleep(renewal / 2).await;
+            mesh.edge.subscribe(7, 0, 0).await.unwrap();
+        }
+        assert!(left_at.elapsed() >= lease, "{:?}", left_at.elapsed());
+        assert_eq!(mesh.edge.pending_parents(), vec![(7, mesh.addrs[second])]);
+        assert_eq!(mesh.edge.fec_stats().parents_released, 1);
+        mesh.shutdown();
+    }
+
+    /// A parent that starts or stops draining is ranked anew by its
+    /// children at once: the change of the bit in its hello ticks
+    /// `parents_changed`. A hello that changes nothing does not, and a
+    /// child's hello never does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_draining_bit_change_ticks_parents_changed() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_distributor("parent", parent_addr).with_peer(edge_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let parent_changed = parent.parents_changed();
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_edge("edge", edge_addr).with_peer(parent_addr),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mut changed = edge.parents_changed();
+        // The parent's first hello: a parent is new.
+        timeout(Duration::from_secs(2), changed.changed())
+            .await
+            .expect("the first hello of a parent did not tick")
+            .unwrap();
+        // Hellos every 100 ms that say the same do not tick.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!changed.has_changed().unwrap());
+        for draining in [true, false] {
+            parent.set_draining(draining);
+            timeout(Duration::from_secs(2), changed.changed())
+                .await
+                .unwrap_or_else(|_| panic!("draining {draining} did not tick"))
+                .unwrap();
+            assert_eq!(edge.draining_peers().contains(&parent_addr), draining);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(!changed.has_changed().unwrap(), "draining {draining}");
+        }
+        // An edge is no parent of a distributor: its hellos, and its
+        // draining bit, tick nothing there.
+        edge.set_draining(true);
+        timeout(Duration::from_secs(2), async {
+            while !parent.draining_peers().contains(&edge_addr) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the edge's draining hello did not arrive");
+        assert!(!parent_changed.has_changed().unwrap());
+        let statuses = parent.peer_statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].draining && !statuses[0].parent);
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    /// A parent that restarts at the same address holds no lease, and its
+    /// children knew of it only at their next renewal. Its hello now gives
+    /// its boot id: the first hello of the new process ticks
+    /// `parents_changed` at each child, which greets it and subscribes
+    /// again, so the parent has its leases back within one hello of its
+    /// start. Nothing renews the lease in this test: only the tick does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_parent_is_told_within_one_hello() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let lease = Duration::from_secs(5);
+        let parent_config = |boot_id: u64| {
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_subscription_lease(lease)
+                .with_boot_id(boot_id)
+                .with_build("3f2a9c1d77e0".into())
+                .with_hello_state(Arc::new(AtomicU8::new(1)))
+        };
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            parent_config(1_000),
+        )
+        .start()
+        .await
+        .unwrap();
+        let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+        let edge = CacheMesh::new(
+            Arc::clone(&edge_cache),
+            demand_edge("edge", edge_addr)
+                .with_peer(parent_addr)
+                .with_subscription_lease(lease),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mut changed = edge.parents_changed();
+        wait_for_hello(&edge, 1).await;
+        changed.borrow_and_update();
+        let served = |parent: &CacheMeshHandle| {
+            parent
+                .served_subscriptions()
+                .iter()
+                .any(|served| (served.child, served.stream_id) == (edge_addr, 7))
+        };
+        edge.subscribe(7, 0, 4).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !served(&parent) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the lease was not served");
+        // What the edge knows of its parent comes from the hello.
+        let status = edge.peer_statuses().await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(
+            (
+                status[0].peer,
+                status[0].role,
+                status[0].boot_id,
+                status[0].build.as_deref(),
+                status[0].state,
+                status[0].draining,
+                status[0].parent
+            ),
+            (
+                parent_addr,
+                Some(CacheMeshRole::Distributor),
+                Some(1_000),
+                Some("3f2a9c1d77e0"),
+                Some(1),
+                false,
+                true
+            )
+        );
+        assert!(status[0].heard.is_some_and(|heard| heard < Duration::from_secs(1)));
+
+        // The parent is killed and starts again 150 ms later: far inside
+        // the two seconds for which a silent parent counts as alive.
+        parent.shutdown();
+        drop(parent);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!changed.has_changed().unwrap());
+        let started = Instant::now();
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            parent_config(2_000),
+        )
+        .start()
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), changed.changed())
+            .await
+            .expect("the restart of the parent was not noticed")
+            .unwrap();
+        let noticed = started.elapsed();
+        assert_eq!(edge.peer_statuses().await[0].boot_id, Some(2_000));
+        // What a node does on the tick.
+        assert_eq!(edge.greet_parents().await.unwrap(), 1);
+        assert_eq!(edge.subscribe(7, 0, 4).await.unwrap(), vec![parent_addr]);
+        timeout(Duration::from_secs(2), async {
+            while !served(&parent) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the restarted parent did not get its lease back");
+        let back = started.elapsed();
+        // The first hello goes out as the mesh starts. One hello interval
+        // is 100 ms here; the next renewal of a node is up to 2.2 s away.
+        assert!(
+            noticed < Duration::from_millis(500) && back < Duration::from_millis(700),
+            "noticed after {noticed:?}, lease back after {back:?}"
+        );
+        // The hellos that follow say the same and tick nothing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!changed.has_changed().unwrap());
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    /// A parent that keeps to its region takes a Subscribe only from a
+    /// peer whose region it knows, and a parent that has just started
+    /// knows no peer: a Subscribe sent on its first hello is dropped
+    /// without a word, and the child's next hello may be far. The child
+    /// greets first: its hello, then its Subscribe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscribe_sent_on_a_parents_first_hello_is_not_lost() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let lease = Duration::from_secs(5);
+        let parent_config = || {
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_subscription_lease(lease)
+        };
+        assert!(parent_config().same_region_only);
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            parent_config(),
+        )
+        .start()
+        .await
+        .unwrap();
+        // The edge's own hellos are a minute apart: after the one that it
+        // sends as it starts, none comes by itself in this test.
+        let edge = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            demand_edge("edge", edge_addr)
+                .with_peer(parent_addr)
+                .with_subscription_lease(lease)
+                .with_announce_interval(Duration::from_secs(60)),
+        )
+        .start()
+        .await
+        .unwrap();
+        let mut changed = edge.parents_changed();
+        wait_for_hello(&edge, 1).await;
+        changed.borrow_and_update();
+        parent.shutdown();
+        drop(parent);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let parent = CacheMesh::new(
+            Arc::new(ChunkCache::new(demand_options())),
+            parent_config(),
+        )
+        .start()
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), changed.changed())
+            .await
+            .expect("the restart of the parent was not noticed")
+            .unwrap();
+        // A Subscribe alone, on the parent's first hello, is lost.
+        assert_eq!(edge.subscribe(7, 0, 4).await.unwrap(), vec![parent_addr]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(parent.served_subscriptions(), Vec::new());
+        assert_eq!(parent.peer_statuses().await[0].role, None);
+        // The hello first, then the Subscribe.
+        assert_eq!(edge.greet_parents().await.unwrap(), 1);
+        assert_eq!(edge.subscribe(7, 0, 4).await.unwrap(), vec![parent_addr]);
+        timeout(Duration::from_secs(2), async {
+            while parent.served_subscriptions().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Subscribe that followed the hello was lost");
+        assert_eq!(
+            parent.peer_statuses().await[0].role,
+            Some(CacheMeshRole::Edge)
+        );
+        parent.shutdown();
+        edge.shutdown();
+    }
+
+    /// A child that is killed and starts again inside its lease holds
+    /// nothing of the playlist. Its Subscribe was taken for a renewal: no
+    /// warm-up window, and no initialization, which the parent had sent
+    /// the process before. The Subscribe gives the boot id of its process:
+    /// another one than the lease's opens the lease again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_child_gets_a_new_lease_its_window_and_its_initialization() {
+        let parent_addr = loopback_addr();
+        let edge_addr = loopback_addr();
+        let lease = Duration::from_secs(5);
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr)
+                .with_peer(edge_addr)
+                .with_subscription_lease(lease),
+        )
+        .start()
+        .await
+        .unwrap();
+        parent_cache
+            .set_stream_initialization(7, Bytes::from_static(b"ftyp-moov"))
+            .await
+            .unwrap();
+        for slot in 0..8 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 64]))
+                .await
+                .unwrap();
+        }
+        // Two processes of the child, at the same address. The first is
+        // killed: it sends no Unsubscribe, and its lease of 5 s is current
+        // when the second subscribes.
+        for process in 1..=2_u64 {
+            let edge_cache = Arc::new(ChunkCache::new(demand_options()));
+            let edge = CacheMesh::new(
+                Arc::clone(&edge_cache),
+                demand_edge("edge", edge_addr)
+                    .with_peer(parent_addr)
+                    .with_subscription_lease(lease)
+                    .with_boot_id(process),
+            )
+            .start()
+            .await
+            .unwrap();
+            wait_for_hello(&edge, 1).await;
+            edge.subscribe(7, 0, 4).await.unwrap();
+            for slot in 4..8 {
+                wait_for_slot(&edge_cache, 7, slot).await;
+            }
+            timeout(Duration::from_secs(2), async {
+                while edge_cache.stream_initialization(7).is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("process {process} did not get the initialization"));
+            assert_eq!(parent.fec_stats().warm_parts_sent, 4 * process);
+            // A renewal by the same process opens nothing.
+            edge.subscribe(7, 0, 4).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(parent.fec_stats().warm_parts_sent, 4 * process);
+            assert!(edge_cache.get_for_stream_id(7, 3).await.is_none());
+            assert_eq!(parent.served_subscriptions().len(), 1);
+            edge.shutdown();
+            drop(edge);
+            // The socket of the stopped child must be free for the next one.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        parent.shutdown();
+    }
+
+    /// The boot id is in the Subscribe, not only in the hello: the
+    /// Subscribe of a restarted child that overtakes its first hello opens
+    /// a new lease all the same. (The parent still knows the child's region
+    /// from the process before.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscribe_that_overtakes_the_hello_still_opens_a_new_lease() {
+        let parent_addr = loopback_addr();
+        let child_addr = loopback_addr();
+        let parent_cache = Arc::new(ChunkCache::new(demand_options()));
+        let parent = CacheMesh::new(
+            Arc::clone(&parent_cache),
+            demand_distributor("parent", parent_addr)
+                .with_peer(child_addr)
+                .with_subscription_lease(Duration::from_secs(5)),
+        )
+        .start()
+        .await
+        .unwrap();
+        parent_cache
+            .set_stream_initialization(7, Bytes::from_static(b"ftyp-moov"))
+            .await
+            .unwrap();
+        for slot in 0..8 {
+            parent_cache
+                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 64]))
+                .await
+                .unwrap();
+        }
+        // The child is a socket: the test sends its frames in the order it
+        // wants, and sees what the parent sends it.
+        let child = UdpSocket::bind(child_addr).await.unwrap();
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        let subscribe_of = |boot_id: u64| {
+            MeshFrame::Subscribe {
+                node_id: "child".into(),
+                stream_id: 7,
+                from_slot: 0,
+                backfill_parts: 4,
+                lease_ms: 5_000,
+                rank: Some(0),
+                boot_id: Some(boot_id),
+            }
+            .encode()
+            .unwrap()
+        };
+        // What the parent sent of the playlist: its initialization, and
+        // the slots of its parts, sorted.
+        let sent_of_the_playlist = |frames: Vec<(u8, Option<u64>)>| {
+            let initializations = frames
+                .iter()
+                .filter(|(kind, _)| *kind == FRAME_INITIALIZATION)
+                .count();
+            let mut slots = frames
+                .iter()
+                .filter_map(|(_, slot_id)| *slot_id)
+                .collect::<Vec<_>>();
+            slots.sort_unstable();
+            (initializations, slots)
+        };
+        let hello = MeshFrame::Hello {
+            node_id: "child".into(),
+            region: "uk".into(),
+            role: WireRole::Known(CacheMeshRole::Edge),
+            peers: Vec::new(),
+            draining: false,
+            boot_id: Some(1),
+            build: None,
+            state: None,
+        }
+        .encode()
+        .unwrap();
+        sender.send(&child, parent_addr, &hello).await.unwrap();
+        sender
+            .send(&child, parent_addr, &subscribe_of(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_of_the_playlist(frames_arriving(&child, Duration::from_millis(300)).await),
+            (1, vec![4, 5, 6, 7])
+        );
+        // A renewal of the same process: nothing.
+        sender
+            .send(&child, parent_addr, &subscribe_of(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_of_the_playlist(frames_arriving(&child, Duration::from_millis(150)).await),
+            (0, Vec::new())
+        );
+        // The process after it subscribes before it has said hello.
+        sender
+            .send(&child, parent_addr, &subscribe_of(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_of_the_playlist(frames_arriving(&child, Duration::from_millis(300)).await),
+            (1, vec![4, 5, 6, 7])
+        );
+        assert_eq!(parent.served_subscriptions().len(), 1);
+        assert_eq!(parent.fec_stats().warm_parts_sent, 8);
+        parent.shutdown();
+    }
+
+    /// A rolling restart of the forwarder tier under load. Three
+    /// distributors carry one playlist at 1,000 parts a second, each written
+    /// by the source as it comes; four edges each take it from two of them.
+    /// Each distributor in turn drains (its edges leave it make before
+    /// break), is killed, and starts again at its address with a new boot
+    /// id and an empty cache. Each edge does what av-mesh does: on a tick of
+    /// `parents_changed` it greets its parents and subscribes, again 100 and
+    /// 300 ms later; it renews every third of its lease; and every 100 ms
+    /// it releases the parents that wait, a ranked parent counting as
+    /// confirmed while it holds the edge's lease with its warm-up window
+    /// sent (the fast plane's view, here read from the parent). Every part
+    /// written during the roll reaches every edge, and no tick of a
+    /// distributor sends more warm-up bytes than its total allows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_distributors_drain_kill_and_start_under_load_lose_no_slot() {
+        const EDGES: usize = 4;
+        const PART: usize = 64;
+        const WARM_TOTAL: u64 = 64_000;
+        type Distributor = (Arc<ChunkCache>, Arc<CacheMeshHandle>);
+        let lease = Duration::from_millis(600);
+        let renewal = lease / 3;
+        let options = Options {
+            num_playlists: 2,
+            max_segments: 1,
+            max_parts_per_segment: 1_024,
+            buffer_size_kb: 1,
+            ..Options::default()
+        };
+        let dist_addrs = [loopback_addr(), loopback_addr(), loopback_addr()];
+        let edge_addrs = (0..EDGES).map(|_| loopback_addr()).collect::<Vec<_>>();
+        let start_distributor = |index: usize, boot_id: u64| {
+            let edge_addrs = edge_addrs.clone();
+            async move {
+                let cache = Arc::new(ChunkCache::new(options));
+                let handle = CacheMesh::new(
+                    Arc::clone(&cache),
+                    demand_distributor(&format!("dist-{index}"), dist_addrs[index])
+                        .with_peers(edge_addrs)
+                        .with_max_children(EDGES)
+                        .with_subscription_lease(lease)
+                        .with_backfill_bytes_per_sec(100_000)
+                        .with_backfill_total_bytes_per_sec(WARM_TOTAL)
+                        .with_boot_id(boot_id),
+                )
+                .start()
+                .await
+                .unwrap();
+                (cache, Arc::new(handle))
+            }
+        };
+        let distributors: Arc<StdMutex<Vec<Option<Distributor>>>> = Arc::default();
+        for index in 0..3 {
+            let started = start_distributor(index, 1 + index as u64).await;
+            lock(&distributors).push(Some(started));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The source: part after part, to every distributor that is up.
+        let next_slot = Arc::new(AtomicU64::new(0));
+        let source = {
+            let (distributors, next_slot, stop) =
+                (Arc::clone(&distributors), Arc::clone(&next_slot), Arc::clone(&stop));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(1));
+                while !stop.load(Ordering::Relaxed) {
+                    tick.tick().await;
+                    let slot = next_slot.load(Ordering::Relaxed);
+                    let caches = lock(&distributors)
+                        .iter()
+                        .flatten()
+                        .map(|(cache, _)| Arc::clone(cache))
+                        .collect::<Vec<_>>();
+                    for cache in caches {
+                        cache
+                            .add_for_stream_id(7, slot as usize, Bytes::from(vec![slot as u8; PART]))
+                            .await
+                            .unwrap();
+                    }
+                    next_slot.store(slot + 1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        // The edges, each with the parts it applied and a driver.
+        let mut edges = Vec::new();
+        let mut arrived = Vec::new();
+        let mut drivers = Vec::new();
+        for (index, edge_addr) in edge_addrs.iter().copied().enumerate() {
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<AppliedSlot>();
+            let slots: Arc<StdMutex<HashSet<usize>>> = Arc::default();
+            {
+                let slots = Arc::clone(&slots);
+                tokio::spawn(async move {
+                    while let Some(applied) = applied_rx.recv().await {
+                        lock(&slots).insert(applied.slot_id);
+                    }
+                });
+            }
+            let edge = Arc::new(
+                CacheMesh::new(
+                    Arc::new(ChunkCache::new(options)),
+                    demand_edge(&format!("edge-{index}"), edge_addr)
+                        .with_peers(dist_addrs)
+                        .with_max_parents(2)
+                        .with_subscription_lease(lease)
+                        .with_applied_tx(applied_tx),
+                )
+                .start()
+                .await
+                .unwrap(),
+            );
+            let confirmed = {
+                let distributors = Arc::clone(&distributors);
+                move |stream_id: u64, parent: SocketAddr| {
+                    let Some(index) = dist_addrs.iter().position(|addr| *addr == parent) else {
+                        return false;
+                    };
+                    lock(&distributors)[index]
+                        .as_ref()
+                        .is_some_and(|(_, handle)| {
+                            handle.served_subscriptions().iter().any(|served| {
+                                served.child == edge_addr
+                                    && served.stream_id == stream_id
+                                    && served.backfill_parts_pending == 0
+                            })
+                        })
+                }
+            };
+            let driver = {
+                let (edge, stop) = (Arc::clone(&edge), Arc::clone(&stop));
+                tokio::spawn(async move {
+                    let mut changed = edge.parents_changed();
+                    let mut next_renewal = Instant::now();
+                    let mut early: VecDeque<Instant> = VecDeque::new();
+                    let mut next_release = Instant::now();
+                    while !stop.load(Ordering::Relaxed) {
+                        let now = Instant::now();
+                        let mut ask = now >= next_renewal;
+                        if changed.has_changed().unwrap_or(false) {
+                            changed.borrow_and_update();
+                            edge.greet_parents().await.unwrap();
+                            early = [now + Duration::from_millis(100), now + Duration::from_millis(300)]
+                                .into();
+                            ask = true;
+                        }
+                        if early.front().is_some_and(|at| now >= *at) {
+                            early.pop_front();
+                            ask = true;
+                        }
+                        if ask {
+                            edge.subscribe(7, 0, 32).await.unwrap();
+                            next_renewal = now + renewal;
+                        }
+                        if now >= next_release {
+                            edge.release_pending(&confirmed).await;
+                            next_release = now + Duration::from_millis(100);
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+            };
+            edges.push(edge);
+            arrived.push(slots);
+            drivers.push(driver);
+        }
+        for edge in &edges {
+            wait_for_hello(edge, 3).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let first = next_slot.load(Ordering::Relaxed) as usize;
+
+        let mut warm_tick_max = Vec::new();
+        let mut boot_id = 10;
+        for index in 0..3 {
+            // Drain: every edge leaves it, make before break.
+            let draining = Arc::clone(&lock(&distributors)[index].as_ref().unwrap().1);
+            draining.set_draining(true);
+            timeout(Duration::from_secs(5), async {
+                while !draining.served_subscriptions().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("dist-{index} kept a lease while it drained"));
+            // Kill it.
+            lock(&distributors)[index] = None;
+            warm_tick_max.push(draining.fec_stats().warm_tick_max_bytes);
+            draining.shutdown();
+            drop(draining);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            // Start it again, empty, with a new boot id.
+            boot_id += 1;
+            let started = start_distributor(index, boot_id).await;
+            lock(&distributors)[index] = Some(started);
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let mut known = 0;
+                    for edge in &edges {
+                        known += edge.peer_statuses().await.iter().any(|peer| {
+                            peer.peer == dist_addrs[index]
+                                && peer.boot_id == Some(boot_id)
+                                && !peer.draining
+                        }) as usize;
+                    }
+                    if known == EDGES {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the edges did not hear dist-{index} start again"));
+            // Its edges settle: nothing waits to be released.
+            timeout(Duration::from_secs(3), async {
+                while edges.iter().any(|edge| !edge.pending_parents().is_empty()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a parent that left was never released");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let last = next_slot.load(Ordering::Relaxed) as usize - 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.store(true, Ordering::Relaxed);
+        source.await.unwrap();
+        for driver in drivers {
+            driver.await.unwrap();
+        }
+
+        assert!(last - first >= 3_000, "{} parts written", last - first);
+        for (index, slots) in arrived.iter().enumerate() {
+            let slots = lock(slots);
+            let missing = (first..=last)
+                .filter(|slot| !slots.contains(slot))
+                .collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "edge-{index} lost {} of {} parts: {:?}",
+                missing.len(),
+                last - first + 1,
+                &missing[..missing.len().min(20)]
+            );
+        }
+        let distributors = std::mem::take(&mut *lock(&distributors));
+        for (_, handle) in distributors.iter().flatten() {
+            warm_tick_max.push(handle.fec_stats().warm_tick_max_bytes);
+            handle.shutdown();
+        }
+        let burst = (WARM_TOTAL as f64 * BACKFILL_BURST.as_secs_f64()) as u64;
+        assert!(
+            warm_tick_max.iter().all(|bytes| *bytes <= burst + PART as u64),
+            "largest warm-up tick of each distributor {warm_tick_max:?}, the cap {burst}"
+        );
+        let (released, unconfirmed) = edges.iter().fold((0, 0), |(all, timed), edge| {
+            let stats = edge.fec_stats();
+            (
+                all + stats.parents_released,
+                timed + stats.parents_released_unconfirmed,
+            )
+        });
+        assert!(
+            released > unconfirmed,
+            "{released} parents released, {unconfirmed} of them unconfirmed"
+        );
+        for edge in &edges {
+            edge.shutdown();
+        }
     }
 
     /// Wave 8 review: before any hello (a cold start, the slot not started)
