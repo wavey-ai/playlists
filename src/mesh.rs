@@ -2016,6 +2016,7 @@ impl CacheMesh {
             peer_roles: RwLock::new(HashMap::new()),
             peer_draining: StdMutex::new(HashSet::new()),
             peer_hellos: StdMutex::new(HashMap::new()),
+            invalid_frame_warnings: StdMutex::default(),
             parents_changed: watch::channel(0).0,
             draining: AtomicBool::new(false),
             subscribed: StdMutex::new(HashMap::new()),
@@ -2242,6 +2243,11 @@ struct MeshShared {
     peer_draining: StdMutex<HashSet<SocketAddr>>,
     /// The newest hello of each peer in the peer table.
     peer_hellos: StdMutex<HashMap<SocketAddr, PeerHello>>,
+    /// When each peer was last named for a frame that did not decode, on
+    /// either socket: a peer is named once in
+    /// [`INVALID_FRAME_WARN_INTERVAL`] however many lanes hear it. Taken
+    /// only on a decode error.
+    invalid_frame_warnings: StdMutex<InvalidFrameWarnings>,
     /// A count that goes up when a peer that this node may take playlists
     /// from is new, has restarted, returns from a silence or changes
     /// whether it drains (`CacheMeshHandle::parents_changed`).
@@ -4565,8 +4571,8 @@ impl PeerHeard {
     }
 }
 
-/// A receive task's record of when it last warned of a frame from each peer
-/// that did not decode. Every such frame is counted (`rx_invalid_frames`);
+/// The mesh's record of when it last warned of a frame from each peer that
+/// did not decode, shared by the receive tasks of both lanes. Every such frame is counted (`rx_invalid_frames`);
 /// a peer that sends many is named once in
 /// [`INVALID_FRAME_WARN_INTERVAL`].
 #[derive(Default)]
@@ -4626,7 +4632,6 @@ async fn receive_task(
     .with_measured_loss(Arc::clone(shared.measured_loss_of(lane)));
     let mut buf = vec![0u8; 65_536];
     let mut heard = PeerHeard::default();
-    let mut invalid_frames = InvalidFrameWarnings::default();
     // xorshift64 state for the test-only loss injection.
     let mut loss_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4730,7 +4735,7 @@ async fn receive_task(
                     }
                     Err(err) => {
                         counters.rx_invalid_frames.fetch_add(1, Ordering::Relaxed);
-                        if invalid_frames.due(peer) {
+                        if lock(&shared.invalid_frame_warnings).due(peer) {
                             warn!(peer = %peer, error = %err, "cache mesh frame decode failed");
                         }
                     }
@@ -7041,6 +7046,66 @@ mod tests {
         .expect("the invalid frames were not counted");
         assert_eq!(warnings.load(Ordering::Relaxed), 1);
         assert_eq!(mesh.fec_stats().rx_unknown_kinds, 3);
+        mesh.shutdown();
+    }
+
+    /// On a mesh split by class, as av-mesh runs it, a peer whose frames do
+    /// not decode on both sockets is still named in one warning in ten
+    /// seconds: the two receive tasks share one record. The class lane runs
+    /// on a thread of its own, so its warning is not seen here; the main
+    /// lane's would be (as the test above shows), and is not made when the
+    /// class lane has named the peer first.
+    #[tokio::test]
+    async fn a_peer_s_invalid_frames_on_both_sockets_make_one_warning() {
+        let warnings = Arc::new(AtomicU64::new(0));
+        // The main lane's tasks run on this thread: the runtime is
+        // current-thread.
+        let _subscriber = tracing::subscriber::set_default(WarningCounter(Arc::clone(&warnings)));
+        let class_of =
+            |addr: SocketAddr| SocketAddr::new(addr.ip(), addr.port() + TEST_CLASS_OFFSET);
+        let bind_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let peer_addr = class_split_addr(TEST_CLASS_OFFSET);
+        let mesh = CacheMesh::new(
+            Arc::new(ChunkCache::new(Options::default())),
+            CacheMeshConfig::new("node", "uk", bind_addr)
+                .with_peer(peer_addr)
+                .with_class_port_offset(TEST_CLASS_OFFSET),
+        )
+        .start()
+        .await
+        .unwrap();
+        let main = UdpSocket::bind(peer_addr).await.unwrap();
+        let class = UdpSocket::bind(class_of(peer_addr)).await.unwrap();
+        let hello = MeshFrame::hello_with_peers("peer", "uk", Vec::new())
+            .encode()
+            .unwrap();
+        let invalid = hello.slice(..hello.len() - 1);
+        let mut sender = FecSender::new(0, DEFAULT_SYMBOL_SIZE);
+        for _ in 0..3 {
+            sender
+                .send(&class, class_of(bind_addr), &invalid)
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while mesh.class_fec_stats().unwrap().rx_invalid_frames < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the class lane did not count the invalid frames");
+        for _ in 0..3 {
+            sender.send(&main, bind_addr, &invalid).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while mesh.fec_stats().rx_invalid_frames < 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the main lane did not count the invalid frames");
+        assert_eq!(warnings.load(Ordering::Relaxed), 0);
+        assert_eq!(lock(&mesh.shared.invalid_frame_warnings).0.len(), 1);
         mesh.shutdown();
     }
 
