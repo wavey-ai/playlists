@@ -10016,29 +10016,72 @@ mod tests {
     /// another one than the lease's opens the lease again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_restarted_child_gets_a_new_lease_its_window_and_its_initialization() {
-        let parent_addr = loopback_addr();
-        let edge_addr = loopback_addr();
+        restarted_child_gets_its_window_and_initialization(false).await;
+    }
+
+    /// The same on a mesh split by class, as av-mesh runs it: a video
+    /// playlist's lease is taken on the main socket and served by the class
+    /// lane, whose sync task must see the new generation and send the
+    /// window and the initialization again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_child_on_a_split_mesh_gets_its_video_window_again() {
+        restarted_child_gets_its_window_and_initialization(true).await;
+    }
+
+    /// Two processes of a child, one after the other at one address, each
+    /// subscribe to a playlist inside the first one's lease. With `split`,
+    /// the mesh is split by class and the playlist is video.
+    async fn restarted_child_gets_its_window_and_initialization(split: bool) {
+        let (stream_id, split_by_class): (u64, fn(CacheMeshConfig) -> CacheMeshConfig) = if split {
+            (9, |config: CacheMeshConfig| {
+                config
+                    .with_class_port_offset(TEST_CLASS_OFFSET)
+                    .with_stream_classifier(video_streams(&[9]))
+            })
+        } else {
+            (7, |config: CacheMeshConfig| config)
+        };
+        let (parent_addr, edge_addr) = if split {
+            (
+                class_split_addr(TEST_CLASS_OFFSET),
+                class_split_addr(TEST_CLASS_OFFSET),
+            )
+        } else {
+            (loopback_addr(), loopback_addr())
+        };
         let lease = Duration::from_secs(5);
         let parent_cache = Arc::new(ChunkCache::new(demand_options()));
         let parent = CacheMesh::new(
             Arc::clone(&parent_cache),
-            demand_distributor("parent", parent_addr)
-                .with_peer(edge_addr)
-                .with_subscription_lease(lease),
+            split_by_class(
+                demand_distributor("parent", parent_addr)
+                    .with_peer(edge_addr)
+                    .with_subscription_lease(lease),
+            ),
         )
         .start()
         .await
         .unwrap();
         parent_cache
-            .set_stream_initialization(7, Bytes::from_static(b"ftyp-moov"))
+            .set_stream_initialization(stream_id, Bytes::from_static(b"ftyp-moov"))
             .await
             .unwrap();
         for slot in 0..8 {
             parent_cache
-                .add_for_stream_id(7, slot, Bytes::from(vec![slot as u8; 64]))
+                .add_for_stream_id(stream_id, slot, Bytes::from(vec![slot as u8; 64]))
                 .await
                 .unwrap();
         }
+        // The warm-up parts that the lane of the playlist sent.
+        let warm_parts_sent = |parent: &CacheMeshHandle| {
+            if split {
+                let class = parent.class_fec_stats().unwrap().warm_parts_sent;
+                assert_eq!(parent.fec_stats().warm_parts_sent, class);
+                class
+            } else {
+                parent.fec_stats().warm_parts_sent
+            }
+        };
         // Two processes of the child, at the same address. The first is
         // killed: it sends no Unsubscribe, and its lease of 5 s is current
         // when the second subscribes.
@@ -10046,36 +10089,43 @@ mod tests {
             let edge_cache = Arc::new(ChunkCache::new(demand_options()));
             let edge = CacheMesh::new(
                 Arc::clone(&edge_cache),
-                demand_edge("edge", edge_addr)
-                    .with_peer(parent_addr)
-                    .with_subscription_lease(lease)
-                    .with_boot_id(process),
+                split_by_class(
+                    demand_edge("edge", edge_addr)
+                        .with_peer(parent_addr)
+                        .with_subscription_lease(lease)
+                        .with_boot_id(process),
+                ),
             )
             .start()
             .await
             .unwrap();
             wait_for_hello(&edge, 1).await;
-            edge.subscribe(7, 0, 4).await.unwrap();
+            edge.subscribe(stream_id, 0, 4).await.unwrap();
             for slot in 4..8 {
-                wait_for_slot(&edge_cache, 7, slot).await;
+                wait_for_slot(&edge_cache, stream_id, slot).await;
             }
             timeout(Duration::from_secs(2), async {
-                while edge_cache.stream_initialization(7).is_none() {
+                while edge_cache.stream_initialization(stream_id).is_none() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
             .unwrap_or_else(|_| panic!("process {process} did not get the initialization"));
-            assert_eq!(parent.fec_stats().warm_parts_sent, 4 * process);
+            assert_eq!(warm_parts_sent(&parent), 4 * process);
+            if split {
+                // Parts and the initialization came on the class socket.
+                let class = edge.class_fec_stats().unwrap();
+                assert!(class.rx_decoded_objects >= 5, "{class:?}");
+            }
             // A renewal by the same process opens nothing.
-            edge.subscribe(7, 0, 4).await.unwrap();
+            edge.subscribe(stream_id, 0, 4).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_eq!(parent.fec_stats().warm_parts_sent, 4 * process);
-            assert!(edge_cache.get_for_stream_id(7, 3).await.is_none());
+            assert_eq!(warm_parts_sent(&parent), 4 * process);
+            assert!(edge_cache.get_for_stream_id(stream_id, 3).await.is_none());
             assert_eq!(parent.served_subscriptions().len(), 1);
             edge.shutdown();
             drop(edge);
-            // The socket of the stopped child must be free for the next one.
+            // The sockets of the stopped child must be free for the next one.
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         parent.shutdown();
@@ -10189,19 +10239,55 @@ mod tests {
     /// by the source as it comes; four edges each take it from two of them.
     /// Each distributor in turn drains (its edges leave it make before
     /// break), is killed, and starts again at its address with a new boot
-    /// id and an empty cache. Each edge does what av-mesh does: on a tick of
-    /// `parents_changed` it greets its parents and subscribes, again 100 and
-    /// 300 ms later; it renews every third of its lease; and every 100 ms
-    /// it releases the parents that wait, a ranked parent counting as
-    /// confirmed while it holds the edge's lease with its warm-up window
-    /// sent (the fast plane's view, here read from the parent). Every part
-    /// written during the roll reaches every edge, and no tick of a
-    /// distributor sends more warm-up bytes than its total allows.
+    /// id and an empty cache. Every part written during the roll reaches
+    /// every edge, and no tick of a distributor sends more warm-up bytes
+    /// than its total allows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_distributors_drain_kill_and_start_under_load_lose_no_slot() {
+        let (released, unconfirmed) = roll_three_distributors_under_load(2, 32).await;
+        assert!(
+            released > unconfirmed,
+            "{released} parents released, {unconfirmed} of them unconfirmed"
+        );
+    }
+
+    /// The same roll with one parent an edge: each change moves an edge's
+    /// whole feed, and the parent that joins is asked for no warm-up
+    /// window, so nothing but the parent that leaves covers the parts
+    /// written before the joiner's first one. Every edge moves twice (off
+    /// its first parent when it drains, back when it starts again), and
+    /// each move releases the parent that left only once the joiner is
+    /// seen delivering. (With the parent released in the call that asks
+    /// its replacement, as before this build, the edges lose parts here.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_roll_that_moves_an_edge_s_only_parent_loses_no_slot() {
+        let (released, unconfirmed) = roll_three_distributors_under_load(1, 0).await;
+        assert!(
+            released - unconfirmed >= 2 * 4,
+            "{released} parents released, {unconfirmed} of them unconfirmed"
+        );
+    }
+
+    /// The roll of the two tests above, with `max_parents` parents an edge
+    /// and a warm-up window of `backfill_parts` for a new lease. Each edge
+    /// does what av-mesh does: on a tick of `parents_changed` it greets its
+    /// parents and subscribes, again 100 and 300 ms later; it renews every
+    /// third of its lease; and every 100 ms it releases the parents that
+    /// wait, a ranked parent counting as confirmed while the edge has
+    /// applied a part from it within the last 100 ms (the fast plane's
+    /// view in av-mesh). The source writes each part to the distributors in
+    /// turn, a different one first each part, so that every feeding parent
+    /// delivers some first copies. Asserts that no part was lost and the
+    /// warm-up cap held; returns the parents released and how many of them
+    /// unconfirmed.
+    async fn roll_three_distributors_under_load(
+        max_parents: usize,
+        backfill_parts: usize,
+    ) -> (u64, u64) {
         const EDGES: usize = 4;
         const PART: usize = 64;
         const WARM_TOTAL: u64 = 64_000;
+        const PARTS: usize = 3_000;
         type Distributor = (Arc<ChunkCache>, Arc<CacheMeshHandle>);
         let lease = Duration::from_millis(600);
         let renewal = lease / 3;
@@ -10251,11 +10337,15 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     tick.tick().await;
                     let slot = next_slot.load(Ordering::Relaxed);
-                    let caches = lock(&distributors)
+                    let mut caches = lock(&distributors)
                         .iter()
                         .flatten()
                         .map(|(cache, _)| Arc::clone(cache))
                         .collect::<Vec<_>>();
+                    if !caches.is_empty() {
+                        let first = slot as usize % caches.len();
+                        caches.rotate_left(first);
+                    }
                     for cache in caches {
                         cache
                             .add_for_stream_id(7, slot as usize, Bytes::from(vec![slot as u8; PART]))
@@ -10267,18 +10357,21 @@ mod tests {
             })
         };
 
-        // The edges, each with the parts it applied and a driver.
+        // The edges, each with the parts it applied, when it last applied
+        // one from each parent, and a driver.
         let mut edges = Vec::new();
         let mut arrived = Vec::new();
         let mut drivers = Vec::new();
         for (index, edge_addr) in edge_addrs.iter().copied().enumerate() {
             let (applied_tx, mut applied_rx) = mpsc::unbounded_channel::<AppliedSlot>();
             let slots: Arc<StdMutex<HashSet<usize>>> = Arc::default();
+            let delivered: Arc<StdMutex<HashMap<SocketAddr, Instant>>> = Arc::default();
             {
-                let slots = Arc::clone(&slots);
+                let (slots, delivered) = (Arc::clone(&slots), Arc::clone(&delivered));
                 tokio::spawn(async move {
                     while let Some(applied) = applied_rx.recv().await {
                         lock(&slots).insert(applied.slot_id);
+                        lock(&delivered).insert(applied.parent, Instant::now());
                     }
                 });
             }
@@ -10287,7 +10380,7 @@ mod tests {
                     Arc::new(ChunkCache::new(options)),
                     demand_edge(&format!("edge-{index}"), edge_addr)
                         .with_peers(dist_addrs)
-                        .with_max_parents(2)
+                        .with_max_parents(max_parents)
                         .with_subscription_lease(lease)
                         .with_applied_tx(applied_tx),
                 )
@@ -10295,22 +10388,10 @@ mod tests {
                 .await
                 .unwrap(),
             );
-            let confirmed = {
-                let distributors = Arc::clone(&distributors);
-                move |stream_id: u64, parent: SocketAddr| {
-                    let Some(index) = dist_addrs.iter().position(|addr| *addr == parent) else {
-                        return false;
-                    };
-                    lock(&distributors)[index]
-                        .as_ref()
-                        .is_some_and(|(_, handle)| {
-                            handle.served_subscriptions().iter().any(|served| {
-                                served.child == edge_addr
-                                    && served.stream_id == stream_id
-                                    && served.backfill_parts_pending == 0
-                            })
-                        })
-                }
+            let confirmed = move |_stream_id: u64, parent: SocketAddr| {
+                lock(&delivered)
+                    .get(&parent)
+                    .is_some_and(|at| at.elapsed() <= Duration::from_millis(100))
             };
             let driver = {
                 let (edge, stop) = (Arc::clone(&edge), Arc::clone(&stop));
@@ -10334,7 +10415,7 @@ mod tests {
                             ask = true;
                         }
                         if ask {
-                            edge.subscribe(7, 0, 32).await.unwrap();
+                            edge.subscribe(7, 0, backfill_parts).await.unwrap();
                             next_renewal = now + renewal;
                         }
                         if now >= next_release {
@@ -10406,7 +10487,15 @@ mod tests {
             .expect("a parent that left was never released");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // At least PARTS parts written across the roll, at 1,000 a second
+        // however long its waits took.
+        timeout(Duration::from_secs(10), async {
+            while (next_slot.load(Ordering::Relaxed) as usize) <= first + PARTS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the source stalled");
         let last = next_slot.load(Ordering::Relaxed) as usize - 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
         stop.store(true, Ordering::Relaxed);
@@ -10415,7 +10504,6 @@ mod tests {
             driver.await.unwrap();
         }
 
-        assert!(last - first >= 3_000, "{} parts written", last - first);
         for (index, slots) in arrived.iter().enumerate() {
             let slots = lock(slots);
             let missing = (first..=last)
@@ -10439,20 +10527,17 @@ mod tests {
             warm_tick_max.iter().all(|bytes| *bytes <= burst + PART as u64),
             "largest warm-up tick of each distributor {warm_tick_max:?}, the cap {burst}"
         );
-        let (released, unconfirmed) = edges.iter().fold((0, 0), |(all, timed), edge| {
+        let counts = edges.iter().fold((0, 0), |(all, timed), edge| {
             let stats = edge.fec_stats();
             (
                 all + stats.parents_released,
                 timed + stats.parents_released_unconfirmed,
             )
         });
-        assert!(
-            released > unconfirmed,
-            "{released} parents released, {unconfirmed} of them unconfirmed"
-        );
         for edge in &edges {
             edge.shutdown();
         }
+        counts
     }
 
     /// The epoch of a test part: its first eight bytes.
