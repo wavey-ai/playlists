@@ -263,6 +263,22 @@ enum OlderId {
     Replace,
 }
 
+/// What [`ChunkCache::add_remote_by_epoch_for_handle`] did with a part.
+#[cfg_attr(not(feature = "mesh"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteWrite {
+    /// Stored.
+    Written,
+    /// The slot holds the same bytes under the same id; nothing was written.
+    Duplicate,
+    /// The slot holds other bytes under the same id and epoch: the first
+    /// copy stays.
+    Conflict,
+    /// The part is of an older epoch than the slot's, or an older id of the
+    /// same epoch: refused.
+    Stale,
+}
+
 pub struct ChunkCache {
     buffer: Vec<RwLock<ChunkSlot>>,
     slot_tags: Vec<SlotTag>,
@@ -456,6 +472,65 @@ impl ChunkCache {
     ) -> Result<(), &'static str> {
         self.write_for_handle(handle, id, data_bytes, OlderId::Replace)
             .await
+    }
+
+    /// Store a part received from a mesh peer, judged against the part that
+    /// occupies its physical slot by the epoch that `epoch` reads from the
+    /// bytes of each (the session of the origin that made it). With both
+    /// epochs known: an older epoch is refused (`Stale`); the same epoch
+    /// keeps the first copy of an id (`Conflict`) and refuses an older id
+    /// (`Stale`); a newer epoch replaces. When either epoch is unknown the
+    /// write is that of [`Self::add_remote_for_handle`]. The same bytes
+    /// under the same id are not written again (`Duplicate`).
+    #[cfg_attr(not(feature = "mesh"), allow(dead_code))]
+    pub(crate) async fn add_remote_by_epoch_for_handle(
+        &self,
+        handle: StreamHandle,
+        id: usize,
+        data_bytes: Bytes,
+        epoch: fn(&[u8]) -> Option<u64>,
+    ) -> Result<RemoteWrite, &'static str> {
+        self.validate_payload(&data_bytes)?;
+        let idx = self.slot_index(handle.index(), id)?;
+        let hash = xxh3_64(&data_bytes);
+        let mut slot = self.buffer[idx].write().await;
+        let (outcome, advanced) = self
+            .registry
+            .with_validated(handle.0, || {
+                let stored = slot.id.filter(|_| slot.generation == handle.generation());
+                let outcome = match stored {
+                    Some(stored) if stored == id && slot.bytes == data_bytes => {
+                        RemoteWrite::Duplicate
+                    }
+                    Some(stored) => match (epoch(&data_bytes), epoch(&slot.bytes)) {
+                        (Some(new), Some(old)) if new < old => RemoteWrite::Stale,
+                        (Some(new), Some(old)) if new == old && stored == id => {
+                            RemoteWrite::Conflict
+                        }
+                        (Some(new), Some(old)) if new == old && stored > id => RemoteWrite::Stale,
+                        _ => RemoteWrite::Written,
+                    },
+                    None => RemoteWrite::Written,
+                };
+                if outcome != RemoteWrite::Written {
+                    return (outcome, false);
+                }
+                self.store_slot(idx, &mut slot, id, handle.generation(), hash, data_bytes);
+                (
+                    outcome,
+                    self.update_state_after_slot(handle.index(), id, true, true),
+                )
+            })
+            .ok_or("Stale stream handle")?;
+        drop(slot);
+        if outcome == RemoteWrite::Written {
+            if advanced {
+                self.signal_publication(handle.index());
+            }
+            self.notify_exact_part_waiters(handle.stream_id(), id);
+            self.notify_stream_update(handle.index());
+        }
+        Ok(outcome)
     }
 
     async fn write_for_handle(
@@ -1813,6 +1888,71 @@ mod tests {
         assert!(cache.written_unix_us_for_handle(handle, 1).is_some());
         assert!(cache.written_unix_us_for_handle(handle, 5).is_none());
         assert_eq!(cache.last_for_handle(handle), Some(7));
+    }
+
+    /// A PL1: a mesh write judged by the origin's epoch. The first copy of
+    /// an id stays; an older id of the epoch, or an older epoch, is refused
+    /// and leaves the slot, the watermark and the readers alone; a newer
+    /// epoch replaces, and a part whose epoch is unknown is written as by
+    /// `add_remote_for_handle`.
+    #[tokio::test]
+    async fn a_remote_write_by_epoch_keeps_the_first_copy_and_refuses_the_stale() {
+        fn epoch(bytes: &[u8]) -> Option<u64> {
+            bytes.first().filter(|epoch| **epoch != 0).map(|epoch| u64::from(*epoch))
+        }
+        let part = |epoch: u8, fill: u8| Bytes::from(vec![epoch, fill, fill, fill]);
+        let cache = ChunkCache::new(Options {
+            num_playlists: 1,
+            max_segments: 1,
+            max_parts_per_segment: 4,
+            ..Options::default()
+        });
+        let handle = cache.resolve_or_create_stream(13).await;
+        let write = |id: usize, bytes: Bytes| {
+            let cache = &cache;
+            async move {
+                cache
+                    .add_remote_by_epoch_for_handle(handle, id, bytes, epoch)
+                    .await
+                    .unwrap()
+            }
+        };
+        let held = |id: usize| {
+            let cache = &cache;
+            async move { cache.get_for_handle(handle, id).await.map(|(bytes, _)| bytes) }
+        };
+        assert_eq!(write(5, part(2, 1)).await, RemoteWrite::Written);
+        assert_eq!(cache.last_for_handle(handle), Some(5));
+        assert_eq!(write(5, part(2, 1)).await, RemoteWrite::Duplicate);
+
+        let notified = cache.publication_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let version = cache.version_for_handle(handle);
+        // The same id and epoch, other bytes: the first copy stays.
+        assert_eq!(write(5, part(2, 9)).await, RemoteWrite::Conflict);
+        // An older id of the epoch in the same physical slot.
+        assert_eq!(write(1, part(2, 1)).await, RemoteWrite::Stale);
+        // An older epoch, under the same id and under a newer one.
+        assert_eq!(write(5, part(1, 1)).await, RemoteWrite::Stale);
+        assert_eq!(write(9, part(1, 1)).await, RemoteWrite::Stale);
+        assert_eq!(held(5).await, Some(part(2, 1)));
+        assert_eq!(cache.last_for_handle(handle), Some(5));
+        assert_eq!(cache.version_for_handle(handle), version);
+        assert!(!fired(&mut notified), "a refused part wakes no one");
+
+        // A newer id of the epoch takes the slot, as does a newer epoch with
+        // an older id (an origin that restarted and numbers from the start).
+        assert_eq!(write(9, part(2, 2)).await, RemoteWrite::Written);
+        assert_eq!(held(9).await, Some(part(2, 2)));
+        assert_eq!(write(1, part(3, 3)).await, RemoteWrite::Written);
+        assert_eq!(held(1).await, Some(part(3, 3)));
+        assert_eq!(write(1, part(3, 4)).await, RemoteWrite::Conflict);
+        // An unknown epoch on either side: the part from a parent replaces.
+        assert_eq!(write(1, part(0, 5)).await, RemoteWrite::Written);
+        assert_eq!(held(1).await, Some(part(0, 5)));
+        assert_eq!(write(1, part(3, 6)).await, RemoteWrite::Written);
+        assert_eq!(held(1).await, Some(part(3, 6)));
     }
 
     #[tokio::test]
