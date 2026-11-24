@@ -583,6 +583,9 @@ pub struct CacheMeshConfig {
     /// The state in this node's hellos, read for each hello
     /// (`with_hello_state`).
     hello_state: Option<Arc<AtomicU8>>,
+    /// Whether this node's hellos say draining from the first one
+    /// (`with_draining`).
+    draining: bool,
     /// How long a parent that left a playlist's ranked set is kept while
     /// its replacement is not confirmed (`with_parent_release_after`).
     /// `None`: two thirds of the subscription lease.
@@ -693,6 +696,7 @@ impl CacheMeshConfig {
             boot_id: 0,
             build: None,
             hello_state: None,
+            draining: false,
             parent_release_after: None,
             frame_form: FrameForm::Current,
             send_observer: SendObserverSlot(None),
@@ -887,6 +891,18 @@ impl CacheMeshConfig {
     /// only [`CacheMeshHandle::set_draining`].
     pub fn with_hello_state(mut self, state: Arc<AtomicU8>) -> Self {
         self.hello_state = Some(state);
+        self
+    }
+
+    /// Whether this node starts draining: its first hello, and every one
+    /// until [`CacheMeshHandle::set_draining`] says otherwise, carries the
+    /// draining bit. A node that starts drained (av-mesh starts `starting`
+    /// until it is warm) must say so in its first hello, or its children
+    /// rank it as a live parent for one hello interval and subscribe to it
+    /// (C-operations 2.1 b; av-mesh cr68 finding 6). Without this call a
+    /// node starts not draining.
+    pub fn with_draining(mut self, draining: bool) -> Self {
+        self.draining = draining;
         self
     }
 
@@ -2018,7 +2034,7 @@ impl CacheMesh {
             peer_hellos: StdMutex::new(HashMap::new()),
             invalid_frame_warnings: StdMutex::default(),
             parents_changed: watch::channel(0).0,
-            draining: AtomicBool::new(false),
+            draining: AtomicBool::new(self.config.draining),
             subscribed: StdMutex::new(HashMap::new()),
             subscribe_order: tokio::sync::Mutex::new(()),
             warm_total: Default::default(),
@@ -9809,6 +9825,53 @@ mod tests {
         assert!(statuses[0].draining && !statuses[0].parent);
         parent.shutdown();
         edge.shutdown();
+    }
+
+    /// A node built `with_draining(true)` says so in its first hello: a
+    /// child that hears it for the first time already ranks it draining
+    /// (cr68 finding 6: the bit was set only after `start` returned, and
+    /// the first hello went out without it). Without the call, it starts
+    /// not draining.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_that_starts_drained_says_so_in_its_first_hello() {
+        for draining in [true, false] {
+            let parent_addr = loopback_addr();
+            let edge_addr = loopback_addr();
+            let edge = CacheMesh::new(
+                Arc::new(ChunkCache::new(demand_options())),
+                demand_edge("edge", edge_addr).with_peer(parent_addr),
+            )
+            .start()
+            .await
+            .unwrap();
+            let mut changed = edge.parents_changed();
+            changed.borrow_and_update();
+            let mut config = demand_distributor("parent", parent_addr).with_peer(edge_addr);
+            if draining {
+                config = config.with_draining(true);
+            }
+            let parent = CacheMesh::new(Arc::new(ChunkCache::new(demand_options())), config)
+                .start()
+                .await
+                .unwrap();
+            assert_eq!(parent.is_draining(), draining);
+            // The first hello the edge hears ticks `parents_changed` (a new
+            // parent); the next comes 100 ms later.
+            timeout(Duration::from_secs(2), changed.changed())
+                .await
+                .expect("the parent's first hello did not tick")
+                .unwrap();
+            let first = edge.draining_peers().contains(&parent_addr);
+            let heard = edge.peer_statuses().await;
+            assert_eq!(heard.len(), 1);
+            assert_eq!(
+                (first, heard[0].draining),
+                (draining, draining),
+                "with_draining({draining}): {heard:?}"
+            );
+            parent.shutdown();
+            edge.shutdown();
+        }
     }
 
     /// A parent that restarts at the same address holds no lease, and its
