@@ -3,7 +3,7 @@ use crate::{CacheError, Options};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use tokio::sync::{Notify, RwLock};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -295,6 +295,13 @@ pub struct ChunkCache {
     /// Payload bytes the slots hold now, hidden streams' included: the
     /// cache's resident media, kept as slots are written and cleared.
     held_bytes: AtomicU64,
+    /// The oldest source epoch each stream still takes
+    /// ([`Self::raise_epoch_floor`]), by stream id: it outlives the stream's
+    /// index, so that a late copy of a replaced session is refused whatever
+    /// slot it lands on, the new session's empty ones included.
+    epoch_floors: StdRwLock<HashMap<u64, u64>>,
+    /// Reads a part's source epoch from its bytes ([`Self::set_epoch_reader`]).
+    epoch_reader: OnceLock<fn(&[u8]) -> Option<u64>>,
     pub options: Options,
 }
 
@@ -336,6 +343,8 @@ impl ChunkCache {
             published: Notify::new(),
             publication_sets: StdRwLock::new(Vec::new()),
             held_bytes: AtomicU64::new(0),
+            epoch_floors: StdRwLock::new(HashMap::new()),
+            epoch_reader: OnceLock::new(),
             options,
         })
     }
@@ -501,6 +510,9 @@ impl ChunkCache {
         let (outcome, advanced) = self
             .registry
             .with_validated(handle.0, || {
+                if self.below_epoch_floor(handle.stream_id(), &data_bytes) {
+                    return (RemoteWrite::Stale, false);
+                }
                 let stored = slot.id.filter(|_| slot.generation == handle.generation());
                 let outcome = match stored {
                     Some(stored) if stored == id && slot.bytes == data_bytes => {
@@ -1377,6 +1389,54 @@ impl ChunkCache {
         }
     }
 
+    /// How the cache reads a part's source epoch from its bytes, for the
+    /// epoch floors. Set once (the first call wins); without it no part is
+    /// judged by a floor.
+    pub fn set_epoch_reader(&self, epoch: fn(&[u8]) -> Option<u64>) {
+        let _ = self.epoch_reader.set(epoch);
+    }
+
+    /// From now on refuse every part of `stream_id` whose source epoch is
+    /// older than `epoch`, at every write (mesh copies, local commits), into
+    /// any slot, whatever stream generation holds the id: a stream that
+    /// starts a new session raises its floor BEFORE it hides the old
+    /// session's slots, so that a late copy of the old session can neither
+    /// land in the old slots between the hide and their release nor in the
+    /// new session's (stuck4k: such copies lifted the watermark, blocked the
+    /// new session's own parts at those numbers and were served to LL-HLS
+    /// readers). A floor never goes down. Parts whose epoch cannot be read
+    /// are not judged.
+    pub fn raise_epoch_floor(&self, stream_id: u64, epoch: u64) {
+        let mut floors = self
+            .epoch_floors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let floor = floors.entry(stream_id).or_insert(epoch);
+        *floor = (*floor).max(epoch);
+    }
+
+    /// The floor of a stream, if one was raised.
+    pub fn epoch_floor(&self, stream_id: u64) -> Option<u64> {
+        self.epoch_floors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stream_id)
+            .copied()
+    }
+
+    /// Whether a part of `stream_id` is of an epoch older than the stream's
+    /// floor. Called under the slot's lock and the index's owner read lock,
+    /// which the hide of a stream waits for.
+    fn below_epoch_floor(&self, stream_id: u64, bytes: &[u8]) -> bool {
+        let Some(reader) = self.epoch_reader.get() else {
+            return false;
+        };
+        let Some(floor) = self.epoch_floor(stream_id) else {
+            return false;
+        };
+        reader(bytes).is_some_and(|epoch| epoch < floor)
+    }
+
     /// Payload bytes that the slots hold now, those of hidden streams
     /// ([`Self::zero_stream_id`], [`Self::hide_stream_id`]) included. Kept
     /// as slots are written and cleared: no scan.
@@ -1398,6 +1458,9 @@ impl ChunkCache {
         let mut slot = self.buffer[idx].write().await;
         self.registry
             .with_validated(handle.0, || {
+                if self.below_epoch_floor(handle.stream_id(), &data) {
+                    return Err("Part of a replaced source epoch");
+                }
                 if older == OlderId::Reject
                     && slot.generation == handle.generation()
                     && slot.id.is_some_and(|stored| stored > id)
@@ -1424,7 +1487,11 @@ impl ChunkCache {
         let mut slot = self.buffer[idx].write().await;
         self.registry
             .with_validated(handle.0, || {
-                let result = if slot.id == Some(id) && slot.generation == handle.generation() {
+                // A part of a replaced session takes no slot (as a newer
+                // ring position would not let it).
+                let result = if self.below_epoch_floor(handle.stream_id(), &data) {
+                    PutIfAbsentResult::Superseded
+                } else if slot.id == Some(id) && slot.generation == handle.generation() {
                     if slot.bytes == data {
                         PutIfAbsentResult::AlreadyPresent
                     } else {
@@ -1939,6 +2006,141 @@ mod tests {
     /// and leaves the slot, the watermark and the readers alone; a newer
     /// epoch replaces, and a part whose epoch is unknown is written as by
     /// `add_remote_for_handle`.
+    /// stuck4k, integration 5: a stream that starts a new session raises
+    /// its epoch floor and hides the old session; late copies of the old
+    /// session, in any order and on any write path, before or after the
+    /// restart, leave only the new session's bytes in the cache, never lift
+    /// its watermark, and never block the new session's parts at the same
+    /// numbers.
+    #[tokio::test]
+    async fn two_sessions_written_in_any_order_leave_only_the_newer_one() {
+        fn epoch(bytes: &[u8]) -> Option<u64> {
+            bytes.first().filter(|epoch| **epoch != 0).map(|epoch| u64::from(*epoch))
+        }
+        let part = |epoch: u8, id: usize| Bytes::from(vec![epoch, id as u8, 7, 7]);
+        const STREAM: u64 = 13;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300 {
+            let cache = ChunkCache::new(Options {
+                num_playlists: 2,
+                max_segments: 1,
+                max_parts_per_segment: 64,
+                ..Options::default()
+            });
+            cache.set_epoch_reader(epoch);
+            // The old session's late copies (20..40) and the new one's own
+            // parts (0..30), overlapping at 20..30; the restart comes at a
+            // random place among the old copies, the new parts after it.
+            let mut old: Vec<usize> = (20..40).collect();
+            for index in (1..old.len()).rev() {
+                old.swap(index, (next() % (index as u64 + 1)) as usize);
+            }
+            let restart_at = (next() % (old.len() as u64 + 1)) as usize;
+            let mut after: Vec<(u8, usize)> = old[restart_at..].iter().map(|id| (1, *id)).collect();
+            after.extend((0..30).map(|id| (2, id)));
+            for index in (1..after.len()).rev() {
+                after.swap(index, (next() % (index as u64 + 1)) as usize);
+            }
+            let write = |epoch_of: u8, id: usize, path: u64| {
+                let cache = &cache;
+                async move {
+                    let bytes = part(epoch_of, id);
+                    match path {
+                        0 => {
+                            let handle = cache.resolve_or_create_stream(STREAM).await;
+                            let _ = cache
+                                .add_remote_by_epoch_for_handle(handle, id, bytes, epoch)
+                                .await;
+                        }
+                        1 => {
+                            let _ = cache.put_if_absent_for_stream_id(STREAM, id, bytes).await;
+                        }
+                        _ => {
+                            let _ = cache.add_for_stream_id(STREAM, id, bytes).await;
+                        }
+                    }
+                }
+            };
+            cache.resolve_or_create_stream(STREAM).await;
+            for id in &old[..restart_at] {
+                write(1, *id, next() % 3).await;
+            }
+            // The new session: the floor first, then the hide, the bytes
+            // given back off the path.
+            cache.raise_epoch_floor(STREAM, 2);
+            let hidden = cache.hide_stream_id(STREAM);
+            for (epoch_of, id) in &after {
+                write(*epoch_of, *id, next() % 3).await;
+            }
+            if let Some(hidden) = hidden {
+                cache.release_hidden(hidden).await;
+            }
+            for id in 0..40 {
+                let held = cache.get_for_stream_id(STREAM, id).await.map(|(bytes, _)| bytes);
+                if id < 30 {
+                    assert_eq!(held, Some(part(2, id)), "round {round}, part {id}");
+                } else {
+                    assert_eq!(held, None, "round {round}, part {id}");
+                }
+            }
+            let handle = cache.resolve_stream(STREAM).unwrap();
+            assert_eq!(cache.last_for_handle(handle), Some(29), "round {round}");
+            assert_eq!(cache.held_bytes(), 30 * 4, "round {round}");
+        }
+    }
+
+    /// The floor holds against a writer racing the restart: whatever the
+    /// interleaving, no old-session part survives the release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_copy_racing_the_restart_never_survives_it() {
+        fn epoch(bytes: &[u8]) -> Option<u64> {
+            bytes.first().filter(|epoch| **epoch != 0).map(|epoch| u64::from(*epoch))
+        }
+        for round in 0..50 {
+            let cache = Arc::new(ChunkCache::new(Options {
+                num_playlists: 2,
+                max_segments: 1,
+                max_parts_per_segment: 64,
+                ..Options::default()
+            }));
+            cache.set_epoch_reader(epoch);
+            cache.resolve_or_create_stream(13).await;
+            let writer = {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    for pass in 0..20 {
+                        for id in 0..64 {
+                            let handle = cache.resolve_or_create_stream(13).await;
+                            let bytes = Bytes::from(vec![1, id as u8, pass]);
+                            let _ = cache
+                                .add_remote_by_epoch_for_handle(handle, id, bytes, epoch)
+                                .await;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            tokio::task::yield_now().await;
+            cache.raise_epoch_floor(13, 2);
+            let hidden = cache.hide_stream_id(13);
+            if let Some(hidden) = hidden {
+                cache.release_hidden(hidden).await;
+            }
+            writer.await.unwrap();
+            for id in 0..64 {
+                let held = cache.get_for_stream_id(13, id).await;
+                assert!(held.is_none(), "round {round}: part {id} of the old session kept");
+            }
+            assert_eq!(cache.held_bytes(), 0, "round {round}");
+        }
+    }
+
     #[tokio::test]
     async fn a_remote_write_by_epoch_keeps_the_first_copy_and_refuses_the_stale() {
         fn epoch(bytes: &[u8]) -> Option<u64> {
