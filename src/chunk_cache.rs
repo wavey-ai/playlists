@@ -292,6 +292,9 @@ pub struct ChunkCache {
     published: Notify,
     /// Told which stream advanced, before `published` is signalled.
     publication_sets: StdRwLock<Vec<Weak<PublishedStreams>>>,
+    /// Payload bytes the slots hold now, hidden streams' included: the
+    /// cache's resident media, kept as slots are written and cleared.
+    held_bytes: AtomicU64,
     pub options: Options,
 }
 
@@ -332,6 +335,7 @@ impl ChunkCache {
                 .collect(),
             published: Notify::new(),
             publication_sets: StdRwLock::new(Vec::new()),
+            held_bytes: AtomicU64::new(0),
             options,
         })
     }
@@ -1017,6 +1021,27 @@ impl ChunkCache {
         }
     }
 
+    /// Remove a stream as [`Self::zero_stream_id`] does, at once and without
+    /// waiting on a slot, and return the removed generation, whose bytes the
+    /// caller then gives back with [`Self::release_hidden`] off its own path.
+    /// The bytes of a hidden stream otherwise stay until the index's ring is
+    /// overwritten: the free indices are taken in turn, so a 4K stream that
+    /// changes epoch leaves its window behind once per index (cmpd7: every
+    /// 40 s step of the sweep left 0.15-0.9 GB, until the node was killed).
+    pub fn hide_stream_id(&self, stream_id: u64) -> Option<StreamHandle> {
+        self.registry
+            .remove_stream(stream_id, |index, generation| {
+                self.reset_index_state(index, generation);
+            })
+            .map(StreamHandle)
+    }
+
+    /// Give back the bytes of a generation that [`Self::hide_stream_id`]
+    /// removed. A stream that took the index since keeps what it wrote.
+    pub async fn release_hidden(&self, hidden: StreamHandle) {
+        self.release_slots_of(hidden.0).await;
+    }
+
     /// Remove a stream. Its parts and initialization are hidden at once and
     /// the index becomes free; the bytes stay until overwritten (see
     /// [`Self::release_stream_id`]).
@@ -1330,6 +1355,7 @@ impl ChunkCache {
         slot.id = Some(id);
         slot.generation = generation;
         slot.hash = hash;
+        self.account(slot.bytes.len(), bytes.len());
         slot.bytes = bytes;
     }
 
@@ -1337,7 +1363,25 @@ impl ChunkCache {
         self.slot_tags[idx].clear();
         slot.id = None;
         slot.hash = 0;
+        self.account(slot.bytes.len(), 0);
         slot.bytes = Bytes::new();
+    }
+
+    fn account(&self, removed: usize, added: usize) {
+        if added >= removed {
+            self.held_bytes
+                .fetch_add((added - removed) as u64, Ordering::Relaxed);
+        } else {
+            self.held_bytes
+                .fetch_sub((removed - added) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Payload bytes that the slots hold now, those of hidden streams
+    /// ([`Self::zero_stream_id`], [`Self::hide_stream_id`]) included. Kept
+    /// as slots are written and cleared: no scan.
+    pub fn held_bytes(&self) -> u64 {
+        self.held_bytes.load(Ordering::Relaxed)
     }
 
     /// Returns whether the watermark advanced.
@@ -2145,6 +2189,47 @@ mod tests {
             cache.get_for_stream_id(2, 0).await.unwrap().0,
             Bytes::from_static(b"second")
         );
+    }
+
+    #[tokio::test]
+    async fn a_hidden_stream_gives_its_bytes_back_and_the_held_bytes_follow() {
+        let options = Options {
+            num_playlists: 4,
+            max_segments: 1,
+            max_parts_per_segment: 8,
+            buffer_size_kb: 64,
+            ..Options::default()
+        };
+        let cache = ChunkCache::new(options);
+        // A new epoch of a stream takes the next free index, so the old one's
+        // bytes are not overwritten by the new epoch.
+        for id in 0..8 {
+            cache
+                .add_for_stream_id(9, id, Bytes::from(vec![1_u8; 1000]))
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.held_bytes(), 8_000);
+        // Overwriting a slot replaces its bytes in the count.
+        cache
+            .add_for_stream_id(9, 8, Bytes::from(vec![1_u8; 10]))
+            .await
+            .unwrap();
+        assert_eq!(cache.held_bytes(), 7_010);
+        let hidden = cache.hide_stream_id(9).expect("stream 9 existed");
+        assert!(cache.get_for_stream_id(9, 8).await.is_none());
+        assert_eq!(cache.held_bytes(), 7_010, "hidden, not yet given back");
+        // The new epoch writes into another index.
+        cache
+            .add_for_stream_id(9, 0, Bytes::from(vec![2_u8; 500]))
+            .await
+            .unwrap();
+        assert_ne!(cache.resolve_stream(9).unwrap().index(), hidden.index());
+        cache.release_hidden(hidden).await;
+        assert_eq!(cache.held_bytes(), 500);
+        assert_eq!(cache.memory_stats().await.chunk_bytes, 500);
+        cache.clear_for_stream_id(9, 0).await;
+        assert_eq!(cache.held_bytes(), 0);
     }
 
     #[tokio::test]
