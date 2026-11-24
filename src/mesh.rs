@@ -2052,6 +2052,7 @@ impl CacheMesh {
             // served leases; the handle adds them to the main lane's.
             class: class_local_addr.map(|local_addr| ClassLaneShared {
                 local_addr,
+                socket: class_socket.clone(),
                 counters: Arc::new(CacheMeshFecCounters::default()),
                 measured_loss: Arc::new(StdMutex::new(HashMap::new())),
                 served: Arc::new(StdMutex::new(Vec::new())),
@@ -2314,6 +2315,8 @@ struct MeshShared {
 /// handle adds them to the main lane's.
 struct ClassLaneShared {
     local_addr: SocketAddr,
+    /// The class socket, for `CacheMeshHandle::receive_sockets`.
+    socket: Option<Arc<UdpSocket>>,
     counters: Arc<CacheMeshFecCounters>,
     measured_loss: MeasuredLossTable,
     served: ServedTable,
@@ -2559,6 +2562,28 @@ impl CacheMeshHandle {
     }
 
     /// The address of the class socket, when the mesh is split by class.
+    /// The mesh's receive sockets, each with the wire bytes it has received
+    /// so far: the main socket (`"main"`) and, on a mesh split by class,
+    /// the class (video) socket (`"class"`). For a caller that sizes their
+    /// receive buffers to their traffic (av-mesh, integration 4).
+    pub fn receive_sockets(&self) -> Vec<(&'static str, Arc<UdpSocket>, u64)> {
+        let mut sockets = vec![(
+            "main",
+            Arc::clone(&self.socket),
+            self.shared.counters.snapshot().rx_wire_bytes,
+        )];
+        if let Some(class) = &self.shared.class {
+            if let Some(socket) = &class.socket {
+                sockets.push((
+                    "class",
+                    Arc::clone(socket),
+                    class.counters.snapshot().rx_wire_bytes,
+                ));
+            }
+        }
+        sockets
+    }
+
     pub fn class_local_addr(&self) -> Option<SocketAddr> {
         self.shared.class.as_ref().map(|class| class.local_addr)
     }
@@ -14007,6 +14032,18 @@ mod tests {
         let mut class = lock(&class_chunks.0).clone();
         class.sort_unstable();
         assert_eq!(class, (0..6).map(|slot| (9, slot)).collect::<Vec<_>>());
+
+        // Each receive socket with its own wire bytes (integration 4: the
+        // caller sizes their buffers to them).
+        let sockets = edge.receive_sockets();
+        assert_eq!(
+            sockets.iter().map(|(lane, socket, _)| (*lane, socket.local_addr().unwrap()))
+                .collect::<Vec<_>>(),
+            [("main", edge.local_addr()), ("class", edge.class_local_addr().unwrap())]
+        );
+        assert!(sockets[1].2 >= class_received.rx_wire_bytes);
+        assert!(sockets[1].2 > 6 * 20_000, "{sockets:?}");
+        assert!(sockets[0].2 > 0 && sockets[0].2 + sockets[1].2 <= edge.fec_stats().rx_wire_bytes);
 
         // The send observer names the child by its main address.
         timeout(Duration::from_secs(1), async {
