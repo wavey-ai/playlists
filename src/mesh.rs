@@ -2521,6 +2521,33 @@ impl CacheMeshHandle {
         self.send_control(&peers, &frame).await
     }
 
+    /// Ask the parent of rank `rank` (0: the first of [`Self::parents_for`])
+    /// alone for `count` parts from `from_slot`: an edge asks one parent for
+    /// a hole, and the next only once the first has had the time to answer
+    /// (av-mesh send240: holes asked of both parents at once doubled the
+    /// pulls of a node already short of processor time). Returns 0 when the
+    /// playlist has no parent of that rank.
+    pub async fn request_parts_from_rank(
+        &self,
+        stream_id: u64,
+        from_slot: usize,
+        count: u32,
+        rank: usize,
+    ) -> Result<usize, MeshError> {
+        let peers = self.parents_for(stream_id).await;
+        let Some(peer) = peers.get(rank).copied() else {
+            return Ok(0);
+        };
+        let frame = MeshFrame::ReplicaRequest {
+            node_id: self.node_id.clone(),
+            stream_id,
+            from_slot: from_slot as u64,
+            count,
+        }
+        .encode_as(self.frame_form)?;
+        self.send_control(&[peer], &frame).await
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -9284,6 +9311,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(edge_cache.get_for_stream_id(7, 1).await.is_none());
         assert!(edge_cache.get_for_stream_id(7, 3).await.is_none());
+        // A hole asked of the parent of one rank alone (av-mesh send240):
+        // there is no second parent here.
+        assert_eq!(edge.request_parts_from_rank(7, 1, 1, 1).await.unwrap(), 0);
+        assert_eq!(edge.request_parts_from_rank(7, 1, 1, 0).await.unwrap(), 1);
+        wait_for_slot(&edge_cache, 7, 1).await;
 
         parent.shutdown();
         edge.shutdown();
